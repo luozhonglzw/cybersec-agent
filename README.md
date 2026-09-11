@@ -25,16 +25,24 @@ Client → FastAPI → LangGraph → Tools / Knowledge / Security → SQLite / C
 ## Current Status
 
 - [x] Phase 0：项目架构设计（architecture.md）
-- [ ] Phase 1 ~ 10：尚未开始
+- [x] Phase 1 · Step 1：项目基础 + LLM Client + 最小 SecurityAgent
+- [ ] Phase 1 · Step 2+ 及 Phase 2 ~ 10：尚未开始
 
-> **Phase 0 completed. Implementation not started yet.**
+> **Phase 0 completed. Phase 1 in progress (Step 1 done).**
+
+### 已实现（Phase 1 · Step 1）
+
+- 配置系统：`app/core/config.py`（pydantic-settings，API Key 用 SecretStr 保护）
+- LLM Client：`app/core/llm.py`（OpenAI-compatible 统一封装，可切换 DeepSeek / Qwen / OpenAI）
+- 最小 SecurityAgent：`app/core/agent.py`（User → LLM → Response，单轮对话）
+- 单元测试：`tests/`（完全离线，mock LLM，不需要真实 API Key）
 
 ## Roadmap
 
 | Phase | 内容 | 状态 |
 |---|---|---|
 | 0 | Architecture | ✅ 完成 |
-| 1 | Minimal Security Agent（LLM API + FastAPI） | Planned |
+| 1 | Minimal Security Agent（LLM API + FastAPI） | 🚧 Step 1 完成 |
 | 2 | Security Logs（结构化日志） | Planned |
 | 3 | Tool Calling + 手写 ReAct | Planned |
 | 4 | LangGraph 迁移 | Planned |
@@ -66,9 +74,14 @@ Client → FastAPI → LangGraph → Tools / Knowledge / Security → SQLite / C
 
 ## Development
 
-环境要求：Python 3.12+、uv
+环境要求：Python 3.12+（uv 可自动管理）、[uv](https://docs.astral.sh/uv/)
 
-> Phase 1 开始后补充安装与运行步骤。
+```bash
+uv sync          # 创建虚拟环境并安装依赖（含项目本身，editable 模式）
+uv run pytest -v # 运行测试（不需要真实 LLM API Key）
+```
+
+配置：复制 `.env.example` 为 `.env`，填入 `LLM_MODEL` / `LLM_BASE_URL` / `LLM_API_KEY`（`.env` 不会进入 Git）。
 
 ## License
 

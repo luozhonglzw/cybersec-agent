@@ -367,5 +367,29 @@ ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，�
 | # | 事项 | 说明 |
 |---|---|---|
 | 1 | LLM provider | DeepSeek（推荐，便宜、OpenAI 兼容）/ Qwen / OpenAI / 本地 Ollama；代码不变，只改 .env |
-| 2 | GitHub 仓库名与可见性 | 建议 `cybersec-agent`；public / private 待定 |
+| 2 | GitHub 仓库名与可见性 | 已定：`cybersec-agent`（private，求职展示时可改 public） |
 | 3 | License | 待定（Phase 10 前确定） |
+
+## 14. Phase 1 实现进度（随开发更新）
+
+> 2026-09-11 · Step 1 完成
+
+当前实际实现（以代码为准）：
+
+```
+User
+ ↓
+SecurityAgent（app/core/agent.py：system prompt + 用户消息，一次 LLM 往返）
+ ↓
+LLMClient（app/core/llm.py：ChatOpenAI 统一封装，provider 由 .env 决定）
+ ↓
+OpenAI-compatible LLM
+```
+
+- Tools：Not implemented yet（Phase 3，先手写 ReAct 循环）
+- LangGraph：Not implemented yet（Phase 4，原因见 §9.2）
+- RAG：Not implemented yet（Phase 5）
+- MCP：Not implemented yet（Phase 6）
+- Risk Analyzer / Response Planner：Not implemented yet（Phase 7）
+- HITL：Not implemented yet（Phase 8）
+- Observability / Evaluation：Not implemented yet（Phase 9）
