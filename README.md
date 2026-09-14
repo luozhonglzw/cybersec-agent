@@ -28,7 +28,8 @@ Client → FastAPI → LangGraph → Tools / Knowledge / Security → SQLite / C
 - [x] Phase 1 · Step 1：项目基础 + LLM Client + 最小 SecurityAgent
 - [x] Phase 1 · Step 2：FastAPI `/chat` API
 - [x] Phase 2：结构化模拟安全日志
-- [ ] Phase 3 ~ 10：尚未开始
+- [ ] Phase 3：Tool Calling + 手写 ReAct（🚧 Step 1 完成：查询工具）
+- [ ] Phase 4 ~ 10：尚未开始
 
 ### 已实现
 
