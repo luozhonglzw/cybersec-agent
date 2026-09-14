@@ -8,22 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.api.main import create_app
 from app.core.agent import SecurityAgent
-from app.core.llm import LLMInvocationError
-
-
-class FakeLLMClient:
-    """返回预设回复的假 LLM;raise_error 时抛 LLMInvocationError。"""
-
-    def __init__(self, reply: str = "模拟分析结果", raise_error: bool = False) -> None:
-        self.reply = reply
-        self.raise_error = raise_error
-        self.last_message: str | None = None
-
-    async def chat(self, messages):
-        self.last_message = messages[-1].content
-        if self.raise_error:
-            raise LLMInvocationError("LLM 调用失败(模拟)")
-        return self.reply
+from app.core.llm import LLMInvocationError, FakeLLMClient
 
 
 def make_client(fake) -> TestClient:

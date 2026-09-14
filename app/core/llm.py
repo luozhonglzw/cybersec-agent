@@ -12,7 +12,7 @@ import time
 from typing import List, Optional
 
 import structlog
-from langchain_core.messages import AIMessage, BaseMessage, ToolCall
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolCall
 from langchain_openai import ChatOpenAI
 
 from app.core.config import Settings, get_settings
@@ -21,7 +21,21 @@ logger = structlog.get_logger(__name__)
 
 
 class FakeChatModel:
-    """模拟 ChatOpenAI,控制工具调用行为。"""
+    """测试专用的 LLM 行为模拟器。
+    
+    重要说明：此类仅用于测试 SecurityAgent 的 ReAct 控制流，
+    不模拟真实的 ChatOpenAI.bind_tools() 工具选择机制。
+    
+    职责：
+    1. 生成预设的 AIMessage 响应
+    2. 根据预设响应生成 tool_calls 
+    3. 返回预设的工具执行结果
+    
+    不负责：
+    - 真实的工具绑定和选择
+    - 参数类型验证
+    - 工具路由逻辑
+    """
     
     def __init__(self, responses: list[str], tool_results: list[dict] = None):
         self.responses = responses
@@ -30,6 +44,14 @@ class FakeChatModel:
         self.messages_history: list = []
     
     async def ainvoke(self, messages: list):
+        """模拟 LLM 调用，返回 AIMessage。
+        
+        Args:
+            messages: 消息历史（仅用于调试，不参与工具选择）
+            
+        Returns:
+            AIMessage: 可能包含 tool_calls 的响应消息
+        """
         self.call_count += 1
         self.messages_history = messages
         
@@ -37,25 +59,28 @@ class FakeChatModel:
             return AIMessage(content="没有预设响应")
         
         response = self.responses.pop(0)
-        
-        # 模拟工具调用 - 检查是否包含查询日志的关键词
-        if any(keyword in response for keyword in ["查询安全日志", "query_security_logs", "需要查询"]):
-            if not self.tool_results:
-                raise ValueError("没有预设工具结果")
-            
+
+        # 模拟工具调用:只要还有预设的工具结果,当前轮次就触发一次工具调用。
+        # 这是简化的测试模拟:按顺序消耗预设的响应与工具结果,
+        # 不反映真实的 bind_tools 工具选择逻辑。
+        if self.tool_results:
             tool_result = self.tool_results.pop(0)
             tool_call = ToolCall(
                 name="query_security_logs_tool",
                 args=tool_result.get("args", {}),
-                id=f"tool_call_{self.call_count}"
+                id=f"tool_call_{self.call_count}"  # 测试用的自生成 ID
             )
             return AIMessage(content="", tool_calls=[tool_call])
-        
+
         return AIMessage(content=response)
     
     def bind_tools(self, tools):
-        """绑定工具的模拟方法。"""
-        # 直接返回 self，因为我们在测试中不需要真实的工具绑定
+        """测试用的 bind_tools 模拟。
+        
+        重要：此方法仅用于测试兼容性，
+        不实现真实的工具绑定逻辑。
+        """
+        # 直接返回 self，因为测试中不需要真实的工具绑定
         return self
 
 
@@ -131,8 +156,10 @@ class FakeLLMClient:
     为什么不用 MagicMock:显式的 Fake 可读性更好,
     断言"收到了什么"一眼就能看懂,不需要 mock 框架知识。
     """
-    def __init__(self, reply: str = "收到,正在分析。") -> None:
+    def __init__(self, reply: str = "收到,正在分析。", raise_error: bool = False) -> None:
         self.reply = reply
+        self.raise_error = raise_error
+        self.last_message: str | None = None
         self.last_messages: list = []
         # 为了兼容 SecurityAgent,添加一个假的 settings
         class FakeSettings:
@@ -140,9 +167,25 @@ class FakeLLMClient:
             llm_base_url = "https://api.openai.com/v1"
             llm_api_key = type('APIKey', (), {'get_secret_value': lambda self: "fake-key"})()
         self._settings = FakeSettings()
-        # 为了兼容 SecurityAgent,添加一个假的 _model
-        self._model = FakeChatModel([self.reply])
+        # 为了兼容 SecurityAgent,添加 _model 属性指向自己
+        self._model = self
 
+    async def ainvoke(self, messages):
+        """兼容 SecurityAgent 的 ainvoke 调用。"""
+        self.last_messages = messages
+        if self.raise_error:
+            raise LLMInvocationError("LLM 调用失败(模拟异常)")
+        # 记录最后一条用户消息,供 API 层测试断言透传
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                self.last_message = msg.content
+                break
+        return AIMessage(content=self.reply)
+    
+    def bind_tools(self, tools):
+        """兼容 SecurityAgent 的 bind_tools 调用。"""
+        return self
+    
     async def chat(self, messages):
         self.last_messages = messages
         return self.reply

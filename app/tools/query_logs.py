@@ -136,7 +136,6 @@ def _create_tool_wrapper():
         min_severity: str | None = None,
         limit: int = DEFAULT_LIMIT,
         data_path: str = str(DEFAULT_DATA_PATH),
-        **kwargs
     ) -> str:
         """查询安全日志的详细描述。
         
@@ -173,7 +172,7 @@ def _create_tool_wrapper():
             # 结构化结果
             result = {
                 "count": len(events),
-                "events": [event.model_dump() for event in events]
+                "events": [event.model_dump(mode="json") for event in events]
             }
             
             return json.dumps(result)

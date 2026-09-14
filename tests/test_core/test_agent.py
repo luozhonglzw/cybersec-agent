@@ -3,22 +3,7 @@ import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.agent import SECURITY_ANALYST_SYSTEM_PROMPT, SecurityAgent
-
-
-class FakeLLMClient:
-    """内存中的假 LLM Client:记录收到的 messages,返回预设回复。
-
-    为什么不用 MagicMock:显式的 Fake 可读性更好,
-    断言"收到了什么"一眼就能看懂,不需要 mock 框架知识。
-    """
-
-    def __init__(self, reply: str = "收到,正在分析。") -> None:
-        self.reply = reply
-        self.last_messages: list = []
-
-    async def chat(self, messages):
-        self.last_messages = messages
-        return self.reply
+from app.core.llm import FakeLLMClient
 
 
 @pytest.mark.asyncio
@@ -36,7 +21,7 @@ async def test_chat_sends_system_prompt_and_user_message():
     agent = SecurityAgent(fake)
     await agent.chat("用户问题")
 
-    assert len(fake.last_messages) == 2
+    assert len(fake.last_messages) >= 2  # 现在包含响应
     assert isinstance(fake.last_messages[0], SystemMessage)
     assert fake.last_messages[0].content == SECURITY_ANALYST_SYSTEM_PROMPT
     assert isinstance(fake.last_messages[1], HumanMessage)

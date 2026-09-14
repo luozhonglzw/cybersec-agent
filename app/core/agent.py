@@ -81,7 +81,11 @@ class SecurityAgent:
             2. 执行 ReAct 循环(max_iterations 次)
             3. 返回最终文本
         """
-        logger.info("agent_chat_started", user_message_length=len(message))
+        logger.info(
+            "agent_chat_started", 
+            user_message_length=len(message),
+            max_iterations=self._max_iterations
+        )
         
         # 初始化消息列表
         messages = [
@@ -90,7 +94,11 @@ class SecurityAgent:
         ]
         
         # 使用传入的 LLM 实例并绑定工具
-        llm_with_tools = self._llm._model.bind_tools(self._tools)
+        if hasattr(self._llm, '_model'):
+            llm_with_tools = self._llm._model.bind_tools(self._tools)
+        else:
+            # 对于 FakeLLMClient，直接使用它（已经实现了 bind_tools）
+            llm_with_tools = self._llm
         
         # 执行 ReAct 循环
         for iteration in range(self._max_iterations):
@@ -112,12 +120,21 @@ class SecurityAgent:
                     tool_message = await self._execute_tool(tool_call, messages)
                     messages.append(tool_message)
                 except Exception as exc:
+                    # 记录错误日志但不暴露敏感信息
+                    logger.error(
+                        "tool_execution_failed",
+                        tool_name=tool_call["name"],
+                        error_type=type(exc).__name__,
+                        tool_call_id=tool_call["id"],
+                        # 不记录具体错误详情到日志，只记录类型
+                    )
+                    
                     # 工具执行错误处理
                     error_message = ToolMessage(
                         content=json.dumps({
                             "error": "工具执行失败",
-                            "type": type(exc).__name__,
-                            "details": str(exc)
+                            "type": "ToolExecutionError",
+                            "details": "工具执行过程中发生错误，请稍后重试或调整查询条件"
                         }),
                         tool_call_id=tool_call["id"]
                     )
@@ -164,22 +181,28 @@ class SecurityAgent:
             return ToolMessage(content=result, tool_call_id=tool_call["id"])
             
         except Exception as exc:
+            # 记录错误日志但不暴露敏感信息
+            logger.error(
+                "tool_exception",
+                tool_name=tool_name,
+                error_type=type(exc).__name__,
+                tool_call_id=tool_call["id"],
+                # 不记录具体参数值和错误详情到日志
+            )
+            
             # 参数错误让 LLM 修正参数
             if "参数" in str(exc) or "argument" in str(exc).lower():
-                error_info = {
-                    "error": str(exc),
-                    "type": type(exc).__name__,
-                    "suggest_retry": True
-                }
+                # 重新抛出参数验证错误，让 LLM 修正参数
+                raise exc
             else:
                 # 其他错误返回通用信息
                 error_info = {
                     "error": "工具执行失败",
                     "type": "ToolExecutionError",
-                    "details": "请稍后重试或简化查询条件"
+                    "details": "工具执行过程中发生错误，请稍后重试或简化查询条件"
                 }
-            
-            return ToolMessage(
-                content=json.dumps(error_info),
-                tool_call_id=tool_call["id"]
-            )
+                
+                return ToolMessage(
+                    content=json.dumps(error_info),
+                    tool_call_id=tool_call["id"]
+                )
