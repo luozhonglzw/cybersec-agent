@@ -27,7 +27,8 @@ Client → FastAPI → LangGraph → Tools / Knowledge / Security → SQLite / C
 - [x] Phase 0：项目架构设计（architecture.md）
 - [x] Phase 1 · Step 1：项目基础 + LLM Client + 最小 SecurityAgent
 - [x] Phase 1 · Step 2：FastAPI `/chat` API
-- [ ] Phase 2 ~ 10：尚未开始
+- [x] Phase 2：结构化模拟安全日志
+- [ ] Phase 3 ~ 10：尚未开始
 
 ### 已实现
 
@@ -36,6 +37,15 @@ Client → FastAPI → LangGraph → Tools / Knowledge / Security → SQLite / C
 - 最小 SecurityAgent：`app/core/agent.py`（User → LLM → Response，单轮对话）
 - FastAPI API：`app/api/main.py`（`POST /chat`，Pydantic Request/Response 模型，依赖注入，LLM 异常 → 502）
 - 测试：`tests/`（完全离线，Fake LLM，不需要真实 API Key）
+- 结构化安全日志（Phase 2）：`app/schemas/log_event.py`（LogEvent 模型）+ `scripts/seed_logs.py`（固定 seed 生成 8 类安全场景的模拟日志 → `data/security_events.jsonl`）
+
+### 生成模拟日志
+
+```bash
+uv run python scripts/seed_logs.py   # 生成 data/security_events.jsonl（可重复，固定 seed=42）
+```
+
+覆盖场景：正常登录、单次失败噪声、同用户多次失败（密码猜测）、SSH 撒网式爆破、爆破 IP 后续成功登录、权限提升、Web 攻击迹象、正常业务流量。
 
 ## Quick Start
 
@@ -61,7 +71,7 @@ Swagger UI：http://127.0.0.1:8000/docs
 |---|---|---|
 | 0 | Architecture | ✅ 完成 |
 | 1 | Minimal Security Agent（LLM API + FastAPI） | ✅ 完成 |
-| 2 | Security Logs（结构化日志） | Planned |
+| 2 | Security Logs（结构化日志） | ✅ 完成 |
 | 3 | Tool Calling + 手写 ReAct | Planned |
 | 4 | LangGraph 迁移 | Planned |
 | 5 | Threat Intelligence + RAG | Planned |

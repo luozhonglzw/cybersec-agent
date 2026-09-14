@@ -370,9 +370,9 @@ ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，�
 | 2 | GitHub 仓库名与可见性 | 已定：`cybersec-agent`（private，求职展示时可改 public） |
 | 3 | License | 待定（Phase 10 前确定） |
 
-## 14. Phase 1 实现进度（随开发更新）
+## 14. 实现进度（随开发更新）
 
-> 2026-09-14 · Step 1 + Step 2 完成
+> 2026-09-14 · Phase 1（Step 1+2）、Phase 2 完成
 
 当前实际实现（以代码为准）：
 
@@ -393,6 +393,16 @@ OpenAI-compatible LLM
   - `app/api/main.py`：`create_app()` 工厂 + lifespan 创建真实 Agent；测试通过 `create_app(agent=SecurityAgent(FakeLLMClient))` 注入假依赖
   - 错误处理：请求校验失败 → 422（Pydantic/FastAPI 自动）；LLM 初始化/调用失败（LLMClientError）→ 502，不泄露内部细节
   - 测试：`tests/test_api/test_chat.py`（正常 / 非法请求 / LLM 异常 / 消息透传，全部离线）
+
+> 2026-09-14 · Phase 2 完成（结构化模拟安全日志）
+
+- `app/schemas/log_event.py`：LogEvent 模型。字段：timestamp / event_type(Literal) / source / source_ip / destination_ip / source_port / destination_port / username / action / status(Literal) / severity(Literal，与 Phase 7 风险分级同一套词汇表) / message。
+  - IP 用 `str` + Pydantic validator 校验 IPv4（JSONL / 工具参数 / LLM 数据交换统一字符串形态）；port 校验 0~65535；可枚举字段全部 Literal，脏数据在校验边界被拒绝。
+  - 设计要点：**"SSH 暴力破解"不是 event_type，而是大量 login_failed 事件构成的模式**——数据层只记录原子事实，模式识别是 Agent（Phase 3+）的工作。
+- `scripts/seed_logs.py`：固定 `random.Random(42)` + 固定基准时间（2026-09-10 08:00 UTC），输出逐字节可复现 → `data/security_events.jsonl`（144 条事件；data/ 生成物不进 git，见 §7 策略）。
+- 8 个安全场景：正常登录 / 单次失败噪声 / 同用户多次失败（密码猜测）/ SSH 撒网式爆破 / 爆破 IP 后续成功登录 / 权限提升（sudo 失败→加入 sudo 组）/ Web 攻击迹象 / 正常防火墙流量。场景 3/4/5 构成递进攻击故事线，为 Phase 3 的多步推理（查失败→按 IP 聚合→查是否成功登录）准备真实问题。
+- 测试：`tests/test_schemas/`（模型校验拒绝非法 IP/event_type/severity/status/port；生成可重复；JSONL 逐行 roundtrip；8 场景真实存在）。
+- LogEvent 查询工具（query_security_logs）：Not implemented yet（Phase 3）。
 
 - Tools：Not implemented yet（Phase 3，先手写 ReAct 循环）
 - LangGraph：Not implemented yet（Phase 4，原因见 §9.2）
