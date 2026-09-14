@@ -109,3 +109,95 @@ def query_security_logs(
     # 排序确定性:timestamp 相同时按文件行号,不依赖文件当前顺序的隐式行为
     results.sort(key=lambda e: e.timestamp)
     return results[:limit]
+
+
+# LangChain 工具包装器:保持核心查询逻辑独立
+def _create_tool_wrapper():
+    """返回 LangChain 工具装饰器,避免直接修改原函数。
+    
+    原函数 query_security_logs() 保持纯 Python,不依赖 LangChain。
+    工具包装器负责:
+    1. 参数验证和转换
+    2. 结果结构化
+    3. 错误处理
+    4. 生成 ToolMessage
+    """
+    from langchain_core.tools import tool
+    from langchain_core.messages import ToolMessage
+    import json
+
+    @tool
+    def query_security_logs_tool(
+        event_type: str | None = None,
+        source_ip: str | None = None,
+        username: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        min_severity: str | None = None,
+        limit: int = DEFAULT_LIMIT,
+        data_path: str = str(DEFAULT_DATA_PATH),
+        **kwargs
+    ) -> str:
+        """查询安全日志的详细描述。
+        
+        参数说明:
+        - event_type: 精确匹配事件类型(如 "login_failed")
+        - source_ip: 精确匹配源 IP(字符串,如 "203.0.113.66")
+        - username: 精确匹配账号
+        - start_time: 开始时间(ISO 8601 格式,如 "2026-09-10T08:00:00Z")
+        - end_time: 结束时间(ISO 8601 格式,如 "2026-09-10T09:00:00Z")
+        - min_severity: 最低严重级别(可选: "info", "low", "medium", "high", "critical")
+        - limit: 最多返回条数(1-200)
+        - data_path: 数据文件路径
+        
+        返回:
+        JSON 格式的查询结果,包含事件数量和事件列表。
+        """
+        try:
+            # 转换时间参数
+            start_dt = datetime.fromisoformat(start_time) if start_time else None
+            end_dt = datetime.fromisoformat(end_time) if end_time else None
+            
+            # 调用核心查询函数
+            events = query_security_logs(
+                event_type=event_type,
+                source_ip=source_ip,
+                username=username,
+                start_time=start_dt,
+                end_time=end_dt,
+                min_severity=min_severity,
+                limit=limit,
+                data_path=data_path,
+            )
+            
+            # 结构化结果
+            result = {
+                "count": len(events),
+                "events": [event.model_dump() for event in events]
+            }
+            
+            return json.dumps(result)
+            
+        except Exception as exc:
+            # 参数错误让 LLM 修正参数
+            if isinstance(exc, (ValueError, FileNotFoundError)):
+                error_info = {
+                    "error": str(exc),
+                    "type": type(exc).__name__,
+                    "suggest_retry": True
+                }
+                return json.dumps(error_info)
+            
+            # 其他错误返回通用信息
+            error_info = {
+                "error": "工具执行失败",
+                "type": "ToolExecutionError",
+                "details": "请稍后重试或简化查询条件"
+            }
+            return json.dumps(error_info)
+
+    return query_security_logs_tool
+
+
+# 导出工具实例
+query_security_logs_tool = _create_tool_wrapper()

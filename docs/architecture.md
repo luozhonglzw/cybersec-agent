@@ -372,7 +372,7 @@ ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，�
 
 ## 14. 实现进度（随开发更新）
 
-> 2026-09-14 · Phase 1（Step 1+2）、Phase 2 完成
+> 2026-09-14 · Phase 1（Step 1+2）、Phase 2、Phase 3 Step 1 完成
 
 当前实际实现（以代码为准）：
 
@@ -381,7 +381,7 @@ HTTP Client
  ↓
 FastAPI（app/api/main.py：POST /chat，Pydantic 校验，依赖注入 Agent，LLM 错误 → 502）
  ↓
-SecurityAgent（app/core/agent.py：system prompt + 用户消息，一次 LLM 往返）
+SecurityAgent（app/core/agent.py：支持 Tool Calling 和手写 ReAct 循环）
  ↓
 LLMClient（app/core/llm.py：ChatOpenAI 统一封装，provider 由 .env 决定）
  ↓
@@ -397,6 +397,30 @@ OpenAI-compatible LLM
 > 2026-09-14 · Phase 2 完成（结构化模拟安全日志）
 
 - `app/schemas/log_event.py`：LogEvent 模型。字段：timestamp / event_type(Literal) / source / source_ip / destination_ip / source_port / destination_port / username / action / status(Literal) / severity(Literal，与 Phase 7 风险分级同一套词汇表) / message。
+
+> 2026-09-14 · Phase 3 Step 1 完成（安全日志查询工具）
+
+- `app/tools/query_logs.py`：query_security_logs 工具，支持按 event_type、source_ip、username、start_time、end_time、min_severity、limit 等条件过滤，返回结构化 LogEvent 列表
+- `scripts/seed_logs.py`：生成 144 条结构化安全日志，覆盖 8 个安全场景
+- `tests/test_tools/test_query_logs.py`：20 个测试用例，覆盖各种查询条件和错误处理
+
+> 2026-09-14 · Phase 3 Step 2 完成（Tool Calling + 手写 ReAct 循环）
+
+- `app/core/agent.py`：SecurityAgent 支持 Tool Calling 和手写 ReAct 循环，默认 max_iterations=5
+- `app/tools/query_logs.py`：添加 LangChain 工具包装器，保持核心查询逻辑独立
+- `tests/test_core/test_react_agent.py`：ReAct 循环测试，覆盖直接回答、工具调用、错误处理、max_iterations 等场景
+- System Prompt 增强：强调事实优先、证据驱动、不足证据时明确说明
+
+- 核心流程：
+  ```
+  HumanMessage
+  → AIMessage(tool_calls)
+  → ToolMessage(tool_call_id=...)
+  → AIMessage(final answer)
+  ```
+- 错误处理：参数错误让 LLM 修正参数，执行错误返回结构化错误信息
+- 工具结果：JSON 格式，包含 count 和 events，不暴露内部细节
+- 终止条件：达到 max_iterations 时返回明确信息，为后续 Evaluation 和 Observability 做准备
   - IP 用 `str` + Pydantic validator 校验 IPv4（JSONL / 工具参数 / LLM 数据交换统一字符串形态）；port 校验 0~65535；可枚举字段全部 Literal，脏数据在校验边界被拒绝。
   - 设计要点：**"SSH 暴力破解"不是 event_type，而是大量 login_failed 事件构成的模式**——数据层只记录原子事实，模式识别是 Agent（Phase 3+）的工作。
 - `scripts/seed_logs.py`：固定 `random.Random(42)` + 固定基准时间（2026-09-10 08:00 UTC），输出逐字节可复现 → `data/security_events.jsonl`（144 条事件；data/ 生成物不进 git，见 §7 策略）。

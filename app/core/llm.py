@@ -9,14 +9,54 @@
 绝不记录 API Key、Authorization 头或消息内容。
 """
 import time
+from typing import List, Optional
 
 import structlog
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolCall
 from langchain_openai import ChatOpenAI
 
 from app.core.config import Settings, get_settings
 
 logger = structlog.get_logger(__name__)
+
+
+class FakeChatModel:
+    """模拟 ChatOpenAI,控制工具调用行为。"""
+    
+    def __init__(self, responses: list[str], tool_results: list[dict] = None):
+        self.responses = responses
+        self.tool_results = tool_results or []
+        self.call_count = 0
+        self.messages_history: list = []
+    
+    async def ainvoke(self, messages: list):
+        self.call_count += 1
+        self.messages_history = messages
+        
+        if not self.responses:
+            return AIMessage(content="没有预设响应")
+        
+        response = self.responses.pop(0)
+        
+        # 模拟工具调用 - 检查是否包含查询日志的关键词
+        if any(keyword in response for keyword in ["查询安全日志", "query_security_logs", "需要查询"]):
+            if not self.tool_results:
+                raise ValueError("没有预设工具结果")
+            
+            tool_result = self.tool_results.pop(0)
+            tool_call = ToolCall(
+                name="query_security_logs_tool",
+                args=tool_result.get("args", {}),
+                id=f"tool_call_{self.call_count}"
+            )
+            return AIMessage(content="", tool_calls=[tool_call])
+        
+        return AIMessage(content=response)
+    
+    def bind_tools(self, tools):
+        """绑定工具的模拟方法。"""
+        # 直接返回 self，因为我们在测试中不需要真实的工具绑定
+        return self
 
 
 class LLMClientError(Exception):
@@ -83,3 +123,26 @@ class LLMClient:
         text = response.content
         # 当前阶段只处理纯文本;未来出现工具调用等内容块时兜底成字符串
         return text if isinstance(text, str) else str(text)
+
+
+class FakeLLMClient:
+    """内存中的假 LLM Client:记录收到的 messages,返回预设回复。
+
+    为什么不用 MagicMock:显式的 Fake 可读性更好,
+    断言"收到了什么"一眼就能看懂,不需要 mock 框架知识。
+    """
+    def __init__(self, reply: str = "收到,正在分析。") -> None:
+        self.reply = reply
+        self.last_messages: list = []
+        # 为了兼容 SecurityAgent,添加一个假的 settings
+        class FakeSettings:
+            llm_model = "gpt-3.5-turbo"
+            llm_base_url = "https://api.openai.com/v1"
+            llm_api_key = type('APIKey', (), {'get_secret_value': lambda self: "fake-key"})()
+        self._settings = FakeSettings()
+        # 为了兼容 SecurityAgent,添加一个假的 _model
+        self._model = FakeChatModel([self.reply])
+
+    async def chat(self, messages):
+        self.last_messages = messages
+        return self.reply
