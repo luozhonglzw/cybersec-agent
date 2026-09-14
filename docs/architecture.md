@@ -372,12 +372,14 @@ ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，�
 
 ## 14. Phase 1 实现进度（随开发更新）
 
-> 2026-09-11 · Step 1 完成
+> 2026-09-14 · Step 1 + Step 2 完成
 
 当前实际实现（以代码为准）：
 
 ```
-User
+HTTP Client
+ ↓
+FastAPI（app/api/main.py：POST /chat，Pydantic 校验，依赖注入 Agent，LLM 错误 → 502）
  ↓
 SecurityAgent（app/core/agent.py：system prompt + 用户消息，一次 LLM 往返）
  ↓
@@ -385,6 +387,12 @@ LLMClient（app/core/llm.py：ChatOpenAI 统一封装，provider 由 .env 决定
  ↓
 OpenAI-compatible LLM
 ```
+
+- Step 2（FastAPI API Layer，已完成）：
+  - `app/api/schemas.py`：ChatRequest / ChatResponse（Pydantic 契约，与 core 层解耦）
+  - `app/api/main.py`：`create_app()` 工厂 + lifespan 创建真实 Agent；测试通过 `create_app(agent=SecurityAgent(FakeLLMClient))` 注入假依赖
+  - 错误处理：请求校验失败 → 422（Pydantic/FastAPI 自动）；LLM 初始化/调用失败（LLMClientError）→ 502，不泄露内部细节
+  - 测试：`tests/test_api/test_chat.py`（正常 / 非法请求 / LLM 异常 / 消息透传，全部离线）
 
 - Tools：Not implemented yet（Phase 3，先手写 ReAct 循环）
 - LangGraph：Not implemented yet（Phase 4，原因见 §9.2）
