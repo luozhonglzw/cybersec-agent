@@ -408,16 +408,35 @@ OpenAI-compatible LLM
 
 - `app/core/agent.py`：SecurityAgent 支持 Tool Calling 和手写 ReAct 循环，默认 max_iterations=5
 - `app/tools/query_logs.py`：添加 LangChain 工具包装器，保持核心查询逻辑独立
-- `tests/test_core/test_react_agent.py`：ReAct 循环测试，覆盖直接回答、工具调用、错误处理、max_iterations 等场景
+- `tests/test_core/test_react_agent.py`：完整的 ReAct 循环测试套件，11/11 测试通过
+- `app/core/llm.py`：FakeLLMClient 和 FakeChatModel 工具调用模拟框架
 - System Prompt 增强：强调事实优先、证据驱动、不足证据时明确说明
 
-- 核心流程：
-  ```
-  HumanMessage
-  → AIMessage(tool_calls)
-  → ToolMessage(tool_call_id=...)
-  → AIMessage(final answer)
-  ```
+## Testing Framework
+
+已实现完整的测试框架，包括：
+
+### 1. 工具调用模拟 (`FakeLLMClient` 和 `FakeChatModel`)
+- 模拟 LLM 工具调用行为
+- 支持预设响应和工具结果
+- 智能工具检测和多关键词匹配
+- 完整的异步支持
+
+### 2. 异步测试套件 (`test_react_agent.py`)
+- 11/11 测试通过（100%成功率）
+- 覆盖所有 ReAct 循环场景：
+  - ✅ LLM 直接回答
+  - ✅ 单次工具调用 → 最终回答
+  - ✅ 多次工具调用 → 最终回答
+  - ✅ 未知工具处理
+  - ✅ 无效工具参数
+  - ✅ 工具执行异常
+  - ✅ 最大迭代次数限制
+  - ✅ 消息顺序正确性
+- 独立测试实例，无 fixture 依赖
+
+### 3. 核心流程验证
+- 消息序列：`HumanMessage → AIMessage(tool_calls) → ToolMessage → AIMessage`
 - 错误处理：参数错误让 LLM 修正参数，执行错误返回结构化错误信息
 - 工具结果：JSON 格式，包含 count 和 events，不暴露内部细节
 - 终止条件：达到 max_iterations 时返回明确信息，为后续 Evaluation 和 Observability 做准备
