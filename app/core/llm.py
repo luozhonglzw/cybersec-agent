@@ -125,6 +125,15 @@ class LLMClient:
             model=self._settings.llm_model,
         )
 
+    def bind_tools(self, tools):
+        """把 LangChain 工具绑定到内部 Chat Model,返回绑定了工具的 runnable。
+
+        调用方(SecurityAgent / 未来的 LangGraph agent 节点)只应通过
+        本方法获取带工具的模型,不应直接访问 _model ——
+        这样 API Key 的注入边界仍然只有 LLMClient 一处。
+        """
+        return self._model.bind_tools(tools)
+
     async def chat(self, messages: list[BaseMessage]) -> str:
         """把一组消息发给 LLM,返回 assistant 的文本回复。"""
         started = time.perf_counter()
@@ -183,7 +192,12 @@ class FakeLLMClient:
         return AIMessage(content=self.reply)
     
     def bind_tools(self, tools):
-        """兼容 SecurityAgent 的 bind_tools 调用。"""
+        """与 LLMClient.bind_tools 同契约:返回绑定了工具的可 ainvoke 对象。
+
+        Fake 不做真实绑定,记录收到的工具供测试断言后返回 self,
+        保证 SecurityAgent / 未来的 LangGraph 节点走与生产一致的路径。
+        """
+        self.bound_tools = tools
         return self
     
     async def chat(self, messages):
