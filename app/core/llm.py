@@ -165,19 +165,18 @@ class FakeLLMClient:
     为什么不用 MagicMock:显式的 Fake 可读性更好,
     断言"收到了什么"一眼就能看懂,不需要 mock 框架知识。
     """
-    def __init__(self, reply: str = "收到,正在分析。", raise_error: bool = False) -> None:
+    def __init__(
+        self,
+        reply: str = "收到,正在分析。",
+        raise_error: bool = False,
+        model=None,
+    ) -> None:
         self.reply = reply
         self.raise_error = raise_error
         self.last_message: str | None = None
         self.last_messages: list = []
-        # 为了兼容 SecurityAgent,添加一个假的 settings
-        class FakeSettings:
-            llm_model = "gpt-3.5-turbo"
-            llm_base_url = "https://api.openai.com/v1"
-            llm_api_key = type('APIKey', (), {'get_secret_value': lambda self: "fake-key"})()
-        self._settings = FakeSettings()
-        # 为了兼容 SecurityAgent,添加 _model 属性指向自己
-        self._model = self
+        # 可选注入底层模型(如 FakeChatModel);未注入时由本 Fake 自行响应
+        self._model = model
 
     async def ainvoke(self, messages):
         """兼容 SecurityAgent 的 ainvoke 调用。"""
@@ -190,14 +189,16 @@ class FakeLLMClient:
                 self.last_message = msg.content
                 break
         return AIMessage(content=self.reply)
-    
+
     def bind_tools(self, tools):
         """与 LLMClient.bind_tools 同契约:返回绑定了工具的可 ainvoke 对象。
 
-        Fake 不做真实绑定,记录收到的工具供测试断言后返回 self,
-        保证 SecurityAgent / 未来的 LangGraph 节点走与生产一致的路径。
+        未注入 model 时返回自身(自身实现 ainvoke);
+        注入后委托给 model.bind_tools,与生产路径一致。
         """
         self.bound_tools = tools
+        if self._model is not None:
+            return self._model.bind_tools(tools)
         return self
     
     async def chat(self, messages):

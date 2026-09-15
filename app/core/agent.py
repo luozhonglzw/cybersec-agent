@@ -1,30 +1,21 @@
-"""最小 SecurityAgent:User -> LLM -> Response。
+"""SecurityAgent:对外对话入口,控制流委托给 LangGraph。
 
-本阶段(Phase 1)故意不使用 LangGraph,先实现最直白的数据流:
-    user message -> [SystemMessage + HumanMessage] -> LLM -> assistant text
+调用链(Phase 4 起):
+    SecurityAgent.chat(message)
+        → 构造 [SystemMessage, HumanMessage]
+        → graph.ainvoke(AgentState)     (app/core/graph.py 是唯一控制流实现)
+        → 从最终 state 提取 AI 文本回答
 
-演进路线(记录在 docs/architecture.md §9.2):
-- Phase 3:加入 Tool Calling + 手写 ReAct 循环;
-- Phase 4:迁移到 LangGraph。
-
-先亲手写一遍循环,才能理解 LangGraph 到底解决了什么问题,
-而不是只会调用框架 API。
+Phase 3 的手写 ReAct for loop 已删除,由 graph 的
+agent / tools / should_continue 三个节点替代。
 """
 import structlog
-from datetime import datetime
 from typing import List, Optional
-import json
 
-from langchain_core.messages import (
-    AIMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolCall,
-    ToolMessage,
-)
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
-from langchain_openai import ChatOpenAI
 
+from app.core.graph import create_agent_graph
 from app.core.llm import LLMClient
 from app.tools.query_logs import query_security_logs_tool
 
@@ -44,19 +35,18 @@ SECURITY_ANALYST_SYSTEM_PROMPT = (
     "7. 达到最大工具调用次数时,要说明分析受限"
 )
 
+MAX_ITERATIONS_REPLY = "当前分析达到最大工具调用次数,无法在限定步骤内完成分析。"
+
 
 class SecurityAgent:
-    """当前阶段:支持 Tool Calling 和手写 ReAct 循环的 Agent。
+    """构造并持有 LangGraph,对外提供与 Phase 3 相同的 chat() 契约。
 
     参数:
-        llm_client: LLMClient(或任何实现了 async chat(messages) -> str 的对象)
+        llm_client: LLMClient(或任何实现 bind_tools/ainvoke 的对象)
         tools: 可选工具列表,默认包含 query_security_logs_tool
-        max_iterations: 最大工具调用次数,默认 5
+        max_iterations: 业务层最大迭代次数,默认 5
     调用:
         await agent.chat(message) -> str
-
-    谁调用:未来的 API 层(FastAPI)与 CLI demo。
-    依赖注入:Agent 只依赖"能聊天的东西",不依赖具体实现 —— 测试时换 Fake。
     """
     def __init__(
         self,
@@ -67,142 +57,49 @@ class SecurityAgent:
         self._llm = llm_client
         self._tools = tools or [query_security_logs_tool]
         self._max_iterations = max_iterations
-        self._tool_map = {tool.name: tool for tool in self._tools}
+        # 通过公开 bind_tools() 接口注入 LLM;graph 是唯一的控制流实现
+        self._graph = create_agent_graph(
+            llm_client, tools=self._tools, max_iterations=max_iterations
+        )
 
     async def chat(self, message: str) -> str:
-        """执行对话:支持 Tool Calling 和 ReAct 循环。
+        """执行对话:控制流全部由 graph 完成,这里只做输入组装与输出提取。
 
-        参数:
-            message: 用户输入的自然语言
-        返回:
-            LLM 的文本回复,可能包含多次工具调用后的最终分析
-        流程:
-            1. 组装 [SystemMessage, HumanMessage]
-            2. 执行 ReAct 循环(max_iterations 次)
-            3. 返回最终文本
+        LLM 调用失败(LLMClientError)原样抛出,由 API 层统一转 502;
+        工具异常已在 graph 的 tools 节点内按安全契约转为 ToolMessage。
         """
         logger.info(
-            "agent_chat_started", 
+            "agent_chat_started",
             user_message_length=len(message),
-            max_iterations=self._max_iterations
+            max_iterations=self._max_iterations,
         )
-        
-        # 初始化消息列表
-        messages = [
-            SystemMessage(content=SECURITY_ANALYST_SYSTEM_PROMPT),
-            HumanMessage(content=message),
-        ]
-        
-        # 使用传入的 LLM 实例并绑定工具
-        if hasattr(self._llm, '_model'):
-            llm_with_tools = self._llm._model.bind_tools(self._tools)
-        else:
-            # 对于 FakeLLMClient，直接使用它（已经实现了 bind_tools）
-            llm_with_tools = self._llm
-        
-        # 执行 ReAct 循环
-        for iteration in range(self._max_iterations):
-            logger.info("react_iteration", iteration=iteration + 1, max_iterations=self._max_iterations)
-            
-            # 调用 LLM
-            response = await llm_with_tools.ainvoke(messages)
-            messages.append(response)
-            
-            # 检查是否需要工具调用
-            if not response.tool_calls:
-                logger.info("react_completed_no_tool_calls", iterations=iteration + 1)
-                return response.content
-            
-            # 处理工具调用
-            for tool_call in response.tool_calls:
-                try:
-                    # 执行工具
-                    tool_message = await self._execute_tool(tool_call, messages)
-                    messages.append(tool_message)
-                except Exception as exc:
-                    # 记录错误日志但不暴露敏感信息
-                    logger.error(
-                        "tool_execution_failed",
-                        tool_name=tool_call["name"],
-                        error_type=type(exc).__name__,
-                        tool_call_id=tool_call["id"],
-                        # 不记录具体错误详情到日志，只记录类型
-                    )
-                    
-                    # 工具执行错误处理
-                    error_message = ToolMessage(
-                        content=json.dumps({
-                            "error": "工具执行失败",
-                            "type": "ToolExecutionError",
-                            "details": "工具执行过程中发生错误，请稍后重试或调整查询条件"
-                        }),
-                        tool_call_id=tool_call["id"]
-                    )
-                    messages.append(error_message)
-        
-        # 达到最大迭代次数
-        logger.info("react_completed_max_iterations", max_iterations=self._max_iterations)
-        return "当前分析达到最大工具调用次数,无法在限定步骤内完成分析。"
 
-    async def _execute_tool(self, tool_call: ToolCall, messages: List) -> ToolMessage:
-        """执行单个工具调用。
+        final_state = await self._graph.ainvoke({
+            "messages": [
+                SystemMessage(content=SECURITY_ANALYST_SYSTEM_PROMPT),
+                HumanMessage(content=message),
+            ],
+            "iteration_count": 0,
+        })
 
-        参数:
-            tool_call: 工具调用信息
-            messages: 当前消息历史
+        answer = self._extract_final_answer(final_state["messages"])
+        logger.info("agent_chat_completed", iterations=final_state.get("iteration_count", 0))
+        return answer
 
-        返回:
-            ToolMessage: 工具执行结果
+    @staticmethod
+    def _extract_final_answer(messages: list) -> str:
+        """从最终 state 的消息历史中提取对外回答。
+
+        正常流程末尾是不带 tool_calls 的 AIMessage,直接取其文本;
+        达到 max_iterations 时末尾可能是带 tool_calls 的 AIMessage
+        (LLM 还想调工具但被业务上限终止),此时保持 Phase 3 外部行为:
+        返回分析受限说明,而不是空字符串。
         """
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
-        
-        # 查找工具
-        if tool_name not in self._tool_map:
-            return ToolMessage(
-                content=json.dumps({
-                    "error": "未知工具",
-                    "tool_name": tool_name,
-                    "suggest_retry": True
-                }),
-                tool_call_id=tool_call["id"]
-            )
-        
-        tool = self._tool_map[tool_name]
-        
-        try:
-            # 执行工具
-            result = await tool.ainvoke(tool_call)
-            
-            # 验证结果是否为 JSON 字符串
-            if not isinstance(result, str):
-                result = str(result)
-            
-            return ToolMessage(content=result, tool_call_id=tool_call["id"])
-            
-        except Exception as exc:
-            # 记录错误日志但不暴露敏感信息
-            logger.error(
-                "tool_exception",
-                tool_name=tool_name,
-                error_type=type(exc).__name__,
-                tool_call_id=tool_call["id"],
-                # 不记录具体参数值和错误详情到日志
-            )
-            
-            # 参数错误让 LLM 修正参数
-            if "参数" in str(exc) or "argument" in str(exc).lower():
-                # 重新抛出参数验证错误，让 LLM 修正参数
-                raise exc
-            else:
-                # 其他错误返回通用信息
-                error_info = {
-                    "error": "工具执行失败",
-                    "type": "ToolExecutionError",
-                    "details": "工具执行过程中发生错误，请稍后重试或简化查询条件"
-                }
-                
-                return ToolMessage(
-                    content=json.dumps(error_info),
-                    tool_call_id=tool_call["id"]
-                )
+        for msg in reversed(messages):
+            if not isinstance(msg, AIMessage):
+                continue
+            if not msg.tool_calls and msg.content:
+                return msg.content if isinstance(msg.content, str) else str(msg.content)
+            # 最近一条 AIMessage 仍带 tool_calls → 迭代上限终止
+            return MAX_ITERATIONS_REPLY
+        return MAX_ITERATIONS_REPLY
