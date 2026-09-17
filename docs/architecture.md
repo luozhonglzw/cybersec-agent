@@ -334,7 +334,7 @@ class AgentState(TypedDict):
 | security_events | 模拟安全日志 | ts, src_ip, dst_ip, username, action, status, user_agent, raw | 2 |
 | threat_intel | IOC 库 | ioc_type(ip/domain/hash), ioc_value, source, confidence, tags | 5 |
 | knowledge_docs | RAG 源文档 | kind(cve/mitre/report), key, title, text, metadata | 5 |
-| incidents | 分析结论沉淀 | summary, risk_level, linked_iocs, resolution | 7 |
+| incidents | 分析结论沉淀 | summary, risk_level, linked_iocs, resolution | 8 |
 | action_requests | HITL 审批单 | tool, params, risk, status(pending/approved/denied/executed), requester, approver, 各时间戳 | 8 |
 | audit_logs | 审计流水 | ts, actor, event, resource, detail, outcome | 8（概念始于 1） |
 | checkpoints | LangGraph 断点 | 框架自动管理 | 4 |
@@ -345,6 +345,7 @@ ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，�
 
 - `audit_logs` 与 `action_requests` **只 INSERT 不 UPDATE**——状态变化 = 追加新记录（approved 不是把 pending 改掉，而是追加一条 decision 记录）。可变的"历史"不叫审计。
 - `security_events` 保留 `raw` 原始字段——分析可能出错，原始数据永远可回溯。
+- **incident 持久化延后至 Phase 8**：原计划 Phase 7 引入 `incidents` 表，实际 Phase 7 只交付 `ResponsePlan` 结构化契约与规则引擎，计划随 ToolMessage 流转、不落库。incident persistence 与 HITL / checkpoint / audit lifecycle 属同一条状态生命周期，拆开实现会产生两套状态语义，故统一延后到 Phase 8 一次性落地。
 
 ## 12. Phase Roadmap
 
@@ -374,7 +375,7 @@ ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，�
 
 ## 14. 实现进度（随开发更新）
 
-> 2026-09-17 · **Phase 0-6 全部完成**（Phase 7 未启动）。最新状态见文末"当前架构快照"。
+> 2026-09-17 · **Phase 0-7 全部完成**（Phase 8 未启动）。最新状态见文末"当前架构快照"。
 > 下方按 Phase 顺序记录各阶段的交付物与设计决策。
 
 历史快照（Phase 1-3 时期的调用链，已被 LangGraph 版取代，见文末）：
@@ -462,19 +463,35 @@ OpenAI-compatible LLM
   - `collect_evidence()` 便利采集器 + @tool wrapper；采集与分析分离，未来可支持直接传 Evidence
 - **Hybrid 分工**：Rule-based Tool 输出可审计的结构化等级与分数；LLM 拿到 ToolMessage 后负责解释与汇报——数字与等级不经过 LLM
 - SecurityAgent 默认注册三工具；prompt 第 9 条：优先用风险工具的结构化结果，LLM 职责是解释
-- 159 tests（当前基线）
+- 159 tests（Phase 6 终态基线）
+
+> 2026-09-17 · Phase 7 完成（Incident Response Planning，规则引擎侧）
+
+- `app/schemas/response.py`：ResponseAction（action_type / priority / target / rationale / requires_approval / reversible）+ ResponsePlan（indicator / risk_level / summary / actions / **内嵌 assessment**）——plan → assessment → evidence 全链可追溯，Phase 9 golden set 可直接比对
+- `app/tools/response_planner.py`：
+  - `plan_response(assessment)` **纯函数规则引擎**：只消费 RiskAssessment，**不重新推导风险**——误报抑制等判定已在 risk_analyzer 完成，此处复用其结果而非重复实现，避免两个真相源
+  - risk_level → 基础动作集，外加两条**修正项**：情报标记恶意 → 补 `block_ip`；失败登录 ≥ 20 → 补 `reset_credentials`。修正项不是冗余——仅情报恶意（40 分）与 20 次失败登录（30 分）都只落在 medium 档，而 medium 的基础动作集不含这两个动作
+  - 动作属性表：破坏性动作（block_ip / isolate_host / reset_credentials）强制 `requires_approval=True`；`reset_credentials.reversible=False`（已改密不可逆）——**审批标记由规则引擎给出，不经过 LLM**
+  - `plan_response_tool` 签名只接受 indicator 等查询意图参数，**不暴露 risk_level / score**：LLM 无法幻觉或篡改风险等级（守住 Phase 6「数字与等级不经过 LLM」）
+- `app/tools/__init__.py`：`DEFAULT_TOOLS` 成为默认工具清单的**唯一真相源**，消除 graph 兜底默认（1 个）与 agent 默认（3 个）的漂移陷阱；刻意不引入 ToolRegistry 等注册机制
+- 顺手统一 `risk_analyzer.py` 的 intel 路径常量，复用 `query_threat_intel.DEFAULT_DATA_PATH`（原为第三处硬编码）
+- SecurityAgent 默认注册四工具；prompt 第 10 条：优先用规划工具的结构化计划，**是否需要人工审批由工具判定，LLM 不得自行推断**
+- **采用 Tool 方案而非 Node**：graph.py 控制流零改动（tool_map 泛型路由对工具数量零假设），`AgentState` 仍为 2 字段；节点化、interrupt 与 State 扩展统一留到 Phase 8（见偏离说明）
+- 198 tests（当前基线）
 
 ### Implementation Deviation Note（与 §12 Roadmap 的实现偏离说明）
 
 > §12 Roadmap 的原始设计保持不变；本节只记录实际实现与蓝图之间的有意偏离及原因。
 
 - **IOC 查询采用 Exact Match 而非 RAG**：IOC（IP/域名/Hash）是唯一标识符，查询语义是等值判断——Embedding 的语义近似性在此恰恰是缺陷（`203.0.113.66` 的向量近邻可能是 `203.0.113.65`，产生假阳性关联），且引入向量库违背精确查找的本质。§3.2 F3 的"RAG 语义检索"适用于 CVE/ATT&CK 知识库（自然语言文档），不适用于 IOC 库；RAG 仍按原计划留给知识库部分。
-- **Risk Analyzer 提前实现**：原 §12 安排在 Phase 7，实际在 Phase 6 前置完成规则侧——因为它的输入（结构化证据）已由 Phase 5 的两个查询工具备齐，且 Rule-based 输出可离线确定性测试，是 Evidence Fusion 的自然收口。Response Planner / LLM 复核层仍留给 Phase 7。
+- **Risk Analyzer 提前实现**：原 §12 安排在 Phase 7，实际在 Phase 6 前置完成规则侧——因为它的输入（结构化证据）已由 Phase 5 的两个查询工具备齐，且 Rule-based 输出可离线确定性测试，是 Evidence Fusion 的自然收口。Response Planner 已在 Phase 7 补齐规则侧；LLM 风险复核层与计划节点化留给 Phase 8。
 - LangGraph 实际形态（2 节点 + 条件边）比 §9.1 蓝图更小：checkpoint/interrupt/审批节点未引入（Phase 8），`AgentState` 仅 2 字段而非 §10 的 7 字段——蓝图描述终态，实现按最小必要演进。
+- **Response Planner 采用 Tool 而非 Node（Phase 7）**：§9.1 蓝图把它画成 `response_plan` 节点，实际实现为第 4 个工具。原因：Node 需要从 messages 反解 `RiskAssessment` 或在 tools 节点特判风险工具，两者都会侵蚀 graph 的通用性；而 `interrupt()` 必须落在节点内，所以节点化与 State 扩展应和 Phase 8 的 HITL 一起做。Phase 8 的节点可直接复用同一个纯函数 `plan_response()`，不产生返工。
+- **incident 持久化延后（Phase 7 → Phase 8）**：见 §11 说明。Phase 7 不引入数据库，`ResponsePlan` 仅作为结构化输出契约存在，随 ToolMessage 流转；落库与 HITL / checkpoint / audit lifecycle 一起在 Phase 8 实现。
 
 ## 当前架构快照（2026-09-17）
 
-> 完成状态：**Phase 0-6 已完成**，Phase 7 未启动。
+> 完成状态：**Phase 0-7 已完成**，Phase 8 未启动。
 
 ```
 HTTP Client
@@ -488,22 +505,23 @@ LangGraph StateGraph（app/core/graph.py：唯一控制流实现）
    should_continue 条件边（无 tool_calls / iteration_count ≥ max_iterations → END）
  ↓
 Tool layer（纯函数核心 + @tool wrapper 分层）：
-   query_security_logs（144 条日志）/ query_threat_intel（29 条 IOC，Exact Match）/ analyze_risk（规则引擎）
+   query_security_logs（144 条日志）/ query_threat_intel（29 条 IOC，Exact Match）/
+   analyze_risk（风险规则引擎）/ plan_response（处置规划规则引擎）
  ↓
-Structured evidence（messages 按 reducer 顺序累积：LogToolMsg → IntelToolMsg → RiskToolMsg）
+Structured evidence（messages 按 reducer 顺序累积：LogToolMsg → IntelToolMsg → RiskToolMsg → PlanToolMsg）
  ↓
 LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终回答）
 ```
 
-- 默认注册工具：`[query_security_logs_tool, query_threat_intel_tool, analyze_risk_tool]`，graph 对工具数量零假设（加工具 = 加 map 条目，控制流不变）
-- 测试基线：159 passed，全部离线（FakeLLMClient / FakeChatModel / ScriptedTraceModel 模式，无真实 API 调用）
+- 默认注册工具：`app.tools.DEFAULT_TOOLS` = `[query_security_logs_tool, query_threat_intel_tool, analyze_risk_tool, plan_response_tool]`（单一真相源，agent 与 graph 共用），graph 对工具数量零假设（加工具 = 加 map 条目，控制流不变）
+- 测试基线：198 passed，全部离线（FakeLLMClient / FakeChatModel / ScriptedTraceModel 模式，无真实 API 调用）
 
 ## 尚未实现（按 §12 Roadmap）
 
 - RAG / 知识库（CVE、ATT&CK）——Phase 5 剩余部分，检索对象是自然语言文档，与 IOC Exact Match 不冲突
 - MCP Server——原 Phase 6（现顺延）
-- Response Planner / LLM 风险复核层——Phase 7
-- HITL / 安全层 / 审批流——Phase 8（checkpoint/interrupt 同步引入）
+- Response Planner 节点化 / LLM 风险复核层——Phase 8（`interrupt()` 必须落在节点内，与 HITL 同步引入）
+- incident 持久化 / HITL / 安全层 / 审批流——Phase 8（checkpoint / interrupt / audit lifecycle 同步引入）
 - Observability / Evaluation——Phase 9
 
 ## Testing Framework
@@ -529,8 +547,9 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 | 目录 | 覆盖对象 |
 |---|---|
 | `tests/test_api/` | FastAPI 路由、错误码、消息透传 |
-| `tests/test_core/` | agent / graph / llm / config / tool schema / evidence fusion / risk 集成 |
-| `tests/test_schemas/` | LogEvent / ThreatIntelRecord / RiskAssessment 的校验边界、seed 可复现 |
-| `tests/test_tools/` | 三个工具核心函数的过滤、排序、错误契约 |
+| `tests/test_core/` | agent / graph / llm / config / tool schema / evidence fusion / risk 集成 / response 集成 |
+| `tests/test_schemas/` | LogEvent / ThreatIntelRecord / RiskAssessment / ResponsePlan 的校验边界、seed 可复现 |
+| `tests/test_tools/` | 四个工具核心函数的过滤、排序、规则分支与错误契约 |
 
-当前基线：**159 passed**（`pytest -q`，2026-09-17）。
+当前基线：**198 passed**（`pytest -q`，2026-09-17）。
+`test_response_integration.py` 用 `tmp_path` 现场生成数据文件，不依赖 `data/*.jsonl`（该目录被 gitignore，新克隆下不存在），是可重复的离线测试。

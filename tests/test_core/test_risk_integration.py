@@ -50,13 +50,14 @@ def _make_agent() -> SecurityAgent:
     return SecurityAgent(llm)
 
 
-def test_default_tools_include_all_three():
-    """默认注册三个工具:日志 / 情报 / 风险分析。"""
+def test_default_tools_include_all_four():
+    """默认注册四个工具:日志 / 情报 / 风险分析 / 处置规划。"""
     agent = _make_agent()
     assert {t.name for t in agent._tools} == {
         "query_security_logs_tool",
         "query_threat_intel_tool",
         "analyze_risk_tool",
+        "plan_response_tool",
     }
 
 

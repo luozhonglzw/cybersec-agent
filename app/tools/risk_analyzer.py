@@ -16,6 +16,7 @@ from pathlib import Path
 from app.schemas.risk import RiskAssessment, RiskEvidence
 from app.tools.query_logs import DEFAULT_DATA_PATH as LOGS_DATA_PATH
 from app.tools.query_logs import query_security_logs
+from app.tools.query_threat_intel import DEFAULT_DATA_PATH as INTEL_DATA_PATH
 from app.tools.query_threat_intel import query_threat_intel
 
 # ---- 规则阈值与权重(模块级常量,Phase 6 先硬编码,不做配置化)----
@@ -101,7 +102,7 @@ def collect_evidence(
     indicator: str,
     event_type: str | None = None,
     logs_path: Path | str = LOGS_DATA_PATH,
-    intel_path: Path | str = Path("data/threat_intel.jsonl"),
+    intel_path: Path | str = INTEL_DATA_PATH,
 ) -> RiskEvidence:
     """便利接口:从本地数据源采集证据,组装 RiskEvidence。"""
     events = query_security_logs(
@@ -134,7 +135,7 @@ def _create_tool_wrapper():
         indicator: str,
         event_type: str | None = None,
         logs_path: str = str(LOGS_DATA_PATH),
-        intel_path: str = "data/threat_intel.jsonl",
+        intel_path: str = str(INTEL_DATA_PATH),
     ) -> str:
         """对指定安全指标(IP/域名/Hash)做结构化风险评估。
 

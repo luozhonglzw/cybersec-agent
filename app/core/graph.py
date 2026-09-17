@@ -27,7 +27,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from app.core.llm import LLMClient
-from app.tools.query_logs import query_security_logs_tool
+from app.tools import DEFAULT_TOOLS
 
 logger = structlog.get_logger(__name__)
 
@@ -50,8 +50,10 @@ def create_agent_graph(
     """构建并编译 ReAct graph。
 
     参数与 SecurityAgent 保持一致风格:LLM 客户端、可选工具列表、迭代上限。
+    省略 tools 时使用 app.tools.DEFAULT_TOOLS —— 与 SecurityAgent 同一个真相源,
+    不再各自维护一份(Phase 7 前这里只兜底 1 个工具,与 agent 的 3 个不一致)。
     """
-    tools = tools or [query_security_logs_tool]
+    tools = tools or list(DEFAULT_TOOLS)
     tool_map = {tool.name: tool for tool in tools}
     bound_model = llm_client.bind_tools(tools)
 
