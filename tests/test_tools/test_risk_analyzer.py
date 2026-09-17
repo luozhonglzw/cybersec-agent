@@ -3,7 +3,12 @@
 两层验证:
 - analyze_risk(evidence) 纯函数:手工构造证据,穷举规则分支,
   不触碰任何数据文件 —— 确定性;
-- wrapper 便利接口:基于固定 seed 数据(203.0.113.66 等)端到端采集。
+- wrapper 便利接口:用 tmp_path 现场生成最小数据(203.0.113.66 等)端到端采集。
+
+Hermetic:本文件的数据由 `paths` fixture 用 tmp_path 现场生成,不依赖仓库内
+`data/*.jsonl`(该目录被 data/.gitignore 排除,新克隆的仓库里并不存在,
+依赖它会导致 fresh clone 上测试失败,且原实现会通过 subprocess 回写真实 data/)。
+所有工具调用显式注入临时路径,不修改任何全局默认值。
 """
 import json
 from pathlib import Path
@@ -19,7 +24,8 @@ from app.tools.risk_analyzer import (
 
 BRUTE_FORCE_IP = "203.0.113.66"
 TRUSTED_IP = "192.0.2.10"
-INTEL_PATH = Path("data/threat_intel.jsonl")
+UNKNOWN_IP = "10.9.9.9"
+FAILED_LOGIN_COUNT = 30
 
 
 def _evidence(**overrides) -> RiskEvidence:
@@ -146,19 +152,73 @@ def test_max_reachable_score():
     assert result.risk_level == "critical"
 
 
-# ---------- wrapper:便利接口(固定 seed 数据) ----------
+# ---------- wrapper:便利接口(tmp_path 现场数据,hermetic) ----------
 
-@pytest.fixture(scope="module")
-def paths():
-    """确保情报数据存在(与 Phase 5.1 一致的固定数据)。"""
-    if not INTEL_PATH.exists():
-        import subprocess, sys
-        result = subprocess.run(
-            [sys.executable, "scripts/seed_threat_intel.py"],
-            capture_output=True, text=True,
-        )
-        assert result.returncode == 0, result.stderr
-    return Path("data/security_events.jsonl"), INTEL_PATH
+def _write_logs(path: Path) -> None:
+    """生成 FAILED_LOGIN_COUNT 条来自 BRUTE_FORCE_IP 的 login_failed 事件。"""
+    with path.open("w", encoding="utf-8") as f:
+        for i in range(FAILED_LOGIN_COUNT):
+            f.write(json.dumps({
+                "timestamp": f"2026-09-10T07:{i:02d}:00Z",
+                "event_type": "login_failed",
+                "source": "sshd",
+                "source_ip": BRUTE_FORCE_IP,
+                "username": "root",
+                "status": "failed",
+                "severity": "high",
+                "message": "Failed password for root",
+            }) + "\n")
+
+
+def _write_intel(path: Path) -> None:
+    """最小情报库:BRUTE_FORCE_IP 恶意(critical) + TRUSTED_IP 可信。
+
+    保留"已知可信"记录,使误报抑制路径(规则 3)仍被真实覆盖;
+    UNKNOWN_IP 故意不在库中,用于无证据分支。
+    """
+    records = [
+        {
+            "indicator": BRUTE_FORCE_IP,
+            "indicator_type": "ip",
+            "malicious": True,
+            "confidence": 95,
+            "severity": "critical",
+            "tags": ["ssh-brute-force", "scanner"],
+            "source": "test-fixture",
+            "first_seen": "2026-09-01T00:00:00Z",
+            "last_seen": "2026-09-02T00:00:00Z",
+            "description": "SSH 暴力破解攻击源",
+        },
+        {
+            "indicator": TRUSTED_IP,
+            "indicator_type": "ip",
+            "malicious": False,
+            "confidence": 99,
+            "severity": "info",
+            "tags": ["trusted-scan-engine"],
+            "source": "test-fixture",
+            "first_seen": "2026-09-01T11:00:00Z",
+            "last_seen": "2026-09-02T11:00:00Z",
+            "description": "内部扫描引擎,已知可信",
+        },
+    ]
+    path.write_text(
+        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
+    )
+
+
+@pytest.fixture
+def paths(tmp_path):
+    """最小必要数据:30 条失败登录 + 2 条情报(1 恶意 / 1 可信)。
+
+    返回 (logs_path, intel_path),全部位于 pytest 临时目录 ——
+    不读仓库 data/,也不通过 subprocess 回写真实数据目录。
+    """
+    logs = tmp_path / "security_events.jsonl"
+    intel = tmp_path / "threat_intel.jsonl"
+    _write_logs(logs)
+    _write_intel(intel)
+    return logs, intel
 
 
 def test_collect_evidence_brute_force_ip(paths):
@@ -203,7 +263,7 @@ def test_wrapper_trusted_ip(paths):
 def test_wrapper_unknown_indicator(paths):
     """无任何证据的 IP → none + 证据不足。"""
     raw = analyze_risk_tool.invoke({
-        "indicator": "10.9.9.9",
+        "indicator": UNKNOWN_IP,
         "logs_path": str(paths[0]),
         "intel_path": str(paths[1]),
     })
@@ -211,9 +271,13 @@ def test_wrapper_unknown_indicator(paths):
     assert parsed["assessment"]["risk_level"] == "none"
 
 
-def test_wrapper_error_format():
-    """空 indicator → 错误契约 JSON。"""
-    raw = analyze_risk_tool.invoke({"indicator": ""})
+def test_wrapper_error_format(paths):
+    """空 indicator → 错误契约 JSON(显式注入临时路径,脱离仓库 data/)。"""
+    raw = analyze_risk_tool.invoke({
+        "indicator": "",
+        "logs_path": str(paths[0]),
+        "intel_path": str(paths[1]),
+    })
     parsed = json.loads(raw)
     assert "error" in parsed
     assert parsed["suggest_retry"] is True
