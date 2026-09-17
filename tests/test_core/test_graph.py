@@ -206,3 +206,111 @@ async def test_message_order_preserved():
     msgs = result["messages"]
     types = [type(m) for m in msgs]
     assert types == [HumanMessage, AIMessage, ToolMessage, AIMessage]
+
+
+# ---------- 执行轨迹(astream updates) ----------
+
+class ScriptedTraceModel:
+    """轨迹测试专用的脚本化模型:精确控制 tool_call_id 与响应内容。
+
+    与 FakeChatModel 的区别:tool_call id 固定为 "call_trace_001",
+    便于断言 id 从 AIMessage → tools node → ToolMessage 的传递。
+    """
+
+    def __init__(self):
+        self.call_count = 0
+
+    async def ainvoke(self, messages):
+        self.call_count += 1
+        if self.call_count == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "query_security_logs_tool",
+                             "args": {"limit": 7}, "id": "call_trace_001"}],
+            )
+        return AIMessage(content="发现高危登录事件。")
+
+    def bind_tools(self, tools):
+        return self
+
+
+def _make_trace_setup():
+    """组装 trace 测试:脚本化模型 + 记录型工具。"""
+    from langchain_core.tools import tool
+
+    received: list = []
+
+    @tool
+    async def query_security_logs_tool(limit: int = 1) -> str:
+        """记录收到的 args 的测试工具。"""
+        received.append({"limit": limit})
+        return json.dumps({"count": 0, "events": []})
+
+    llm = FakeLLMClient("unused")
+    llm._model = ScriptedTraceModel()
+    graph = create_agent_graph(llm, tools=[query_security_logs_tool])
+    return graph, received
+
+
+@pytest.mark.asyncio
+async def test_execution_trace_agent_tools_agent_end():
+    """通过 astream(stream_mode='updates') 观察完整执行轨迹。
+
+    每个 update 是节点增量:{'agent': {...}} / {'tools': {...}},
+    不是完整 state —— 按 State Update 语义逐条断言。
+    """
+    graph, received = _make_trace_setup()
+    initial = {
+        "messages": [HumanMessage(content="查询最近的高危登录日志")],
+        "iteration_count": 0,
+    }
+
+    updates = [u async for u in graph.astream(initial, stream_mode="updates")]
+    node_order = [next(iter(u)) for u in updates]
+
+    # 1. node 执行顺序:agent → tools → agent
+    assert node_order == ["agent", "tools", "agent"]
+
+    # 2. 第一次 agent update:AIMessage(tool_calls),iteration_count = 1
+    first = updates[0]["agent"]
+    first_ai = first["messages"][0]
+    assert isinstance(first_ai, AIMessage) and first_ai.tool_calls
+    assert first["iteration_count"] == 1
+
+    # 3. tools update:ToolMessage,tool_call_id 传递,iteration_count 不自增
+    second = updates[1]["tools"]
+    tool_msg = second["messages"][0]
+    assert isinstance(tool_msg, ToolMessage)
+    assert tool_msg.tool_call_id == "call_trace_001"
+    assert "iteration_count" not in second  # tools node 不修改迭代计数
+    assert received == [{"limit": 7}]       # 工具实际收到 args
+
+    # 4. 第二次 agent update:AIMessage(final text),iteration_count = 2
+    third = updates[2]["agent"]
+    final_ai = third["messages"][0]
+    assert isinstance(final_ai, AIMessage) and not final_ai.tool_calls
+    assert third["iteration_count"] == 2
+
+    # 6. 最终 AIMessage 内容与无 tool_calls
+    assert final_ai.content == "发现高危登录事件。"
+
+
+@pytest.mark.asyncio
+async def test_execution_trace_final_state():
+    """最终完整 state(经 ainvoke 单独获取):消息顺序 + iteration_count。"""
+    graph, _ = _make_trace_setup()
+    result = await graph.ainvoke({
+        "messages": [HumanMessage(content="查询最近的高危登录日志")],
+        "iteration_count": 0,
+    })
+
+    msgs = result["messages"]
+    # 5. 顺序:graph 视角为 Human → AI(tool_calls) → Tool → AI(final)
+    #    (SystemMessage 由 SecurityAgent.chat() 在入口注入,graph 内不含)
+    assert [type(m) for m in msgs] == [HumanMessage, AIMessage, ToolMessage, AIMessage]
+    assert msgs[1].tool_calls[0]["id"] == "call_trace_001"
+    assert msgs[2].tool_call_id == "call_trace_001"
+    assert result["iteration_count"] == 2
+    # 6. final AIMessage
+    assert msgs[-1].content == "发现高危登录事件。"
+    assert not msgs[-1].tool_calls
