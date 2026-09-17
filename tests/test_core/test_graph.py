@@ -6,6 +6,7 @@ tool_call_id 传递、tool args 正确传参、异常安全契约、
 max_iterations 业务层终止、消息顺序。
 """
 import json
+from typing import get_args, get_type_hints
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -36,8 +37,36 @@ def test_graph_builds_and_contains_nodes():
 
 
 def test_agent_state_schema():
-    """AgentState 只含 messages 和 iteration_count 两个键。"""
-    assert set(AgentState.__annotations__.keys()) == {"messages", "iteration_count"}
+    """AgentState 的字段集是**精确**约定的:多一个少一个都算契约变更。
+
+    Phase 8.3 有意扩展了 5 个 HITL 字段(见 app/core/graph.py 的 AgentState
+    docstring)。这里保留精确断言而不是放宽成 `<=`,是为了让任何未来的
+    字段增删都必须**有意**改这一行,而不是悄悄通过。
+    """
+    assert set(AgentState.__annotations__.keys()) == {
+        # 基础字段(Phase 4,勿删)
+        "messages",
+        "iteration_count",
+        # HITL 安全层(Phase 8.3)
+        "indicator",
+        "plan",
+        "policy_decision",
+        "approval_request",
+        "approval_decision",
+    }
+
+
+def test_agent_state_keeps_base_fields():
+    """messages 仍是 add_messages reducer,iteration_count 仍是普通字段。
+
+    扩展 State 时最容易踩的坑就是把 messages 的 reducer 丢掉 ——
+    那样消息会退化成 last-write-wins,整个 ReAct 循环失效。
+    """
+    from langgraph.graph.message import add_messages
+
+    hints = get_type_hints(AgentState, include_extras=True)
+    assert get_args(hints["messages"])[1] is add_messages
+    assert hints["iteration_count"] is int
 
 
 # ---------- END 路由 ----------
