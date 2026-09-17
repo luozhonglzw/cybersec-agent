@@ -18,6 +18,8 @@ from langchain_core.tools import BaseTool
 from app.core.graph import create_agent_graph
 from app.core.llm import LLMClient
 from app.tools.query_logs import query_security_logs_tool
+from app.tools.query_threat_intel import query_threat_intel_tool
+from app.tools.risk_analyzer import analyze_risk_tool
 
 logger = structlog.get_logger(__name__)
 
@@ -33,6 +35,10 @@ SECURITY_ANALYST_SYSTEM_PROMPT = (
     "5. 对攻击判断给出证据"
     "6. 可以多次调用工具查询不同信息"
     "7. 达到最大工具调用次数时,要说明分析受限"
+    "8. 当日志分析发现可疑 IOC(IP/域名/Hash)时,可以查询威胁情报库核实其信誉;"
+    "给出结论时综合日志证据与威胁情报证据,并明确说明每项证据的来源"
+    "9. 需要给出风险结论时,优先调用风险分析工具获取结构化评估(等级/分数/依据),"
+    "再基于其证据与判定依据陈述结论;工具的结构化结果是事实,你的职责是解释它们"
 )
 
 MAX_ITERATIONS_REPLY = "当前分析达到最大工具调用次数,无法在限定步骤内完成分析。"
@@ -55,7 +61,11 @@ class SecurityAgent:
         max_iterations: int = 5,
     ) -> None:
         self._llm = llm_client
-        self._tools = tools or [query_security_logs_tool]
+        self._tools = tools or [
+            query_security_logs_tool,
+            query_threat_intel_tool,
+            analyze_risk_tool,
+        ]
         self._max_iterations = max_iterations
         # 通过公开 bind_tools() 接口注入 LLM;graph 是唯一的控制流实现
         self._graph = create_agent_graph(
