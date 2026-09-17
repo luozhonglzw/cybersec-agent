@@ -129,6 +129,8 @@ LLM 只能产生：
 └─────────────────────────────────────────────┘
 ```
 
+> 注：Phase 4 完成后，编排层实际实现为单文件 `app/core/graph.py`，未单独创建 `app/graph/` 包；`rag/` / `knowledge/` / `security/` / `evaluation/` 仍待对应 Phase 创建。上方框图与 §7 目录描述的是**终态蓝图**。
+
 ### 为什么是单进程 + FastAPI + SQLite + ChromaDB？
 
 | 选择 | 原因 |
@@ -142,7 +144,7 @@ LLM 只能产生：
 
 ## 6. 技术栈
 
-> **Current**：Phase 0 未安装任何依赖，下表均为 **Planned**。装了什么、何时安装，以 pyproject.toml 与 Git History 为准。
+> **Current**：Phase 0-6 所需依赖均已安装（实际版本以 `pyproject.toml` / `uv.lock` 为准）。下表"引入 Phase"记录该依赖首次加入的里程碑；Phase 7-10 的依赖仍为 Planned。
 
 ### 代码依赖
 
@@ -187,7 +189,7 @@ cybersec-agent/
 │   ├── core/                    # Phase 1：config、logging、llm 客户端
 │   ├── schemas/                 # Phase 2：LogEvent、IOC、CVE、RiskAssessment、AuditEvent...
 │   ├── tools/                   # Phase 3：工具 = 描述 + 参数 schema + 实现，三者分离
-│   ├── graph/                   # Phase 4：state、nodes、edges、checkpointer
+│   ├── graph/                   # Phase 4：蓝图位置；实际实现为 app/core/graph.py
 │   ├── security/                # Phase 8：policy、approval、audit（概念从 Phase 1 就存在）
 │   ├── rag/                     # Phase 5：embedding、retriever、vector store
 │   ├── knowledge/               # Phase 5：知识库加载器（data → SQLite + ChromaDB）
@@ -372,16 +374,17 @@ ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，�
 
 ## 14. 实现进度（随开发更新）
 
-> 2026-09-14 · Phase 1（Step 1+2）、Phase 2、Phase 3 Step 1 完成
+> 2026-09-17 · **Phase 0-6 全部完成**（Phase 7 未启动）。最新状态见文末"当前架构快照"。
+> 下方按 Phase 顺序记录各阶段的交付物与设计决策。
 
-当前实际实现（以代码为准）：
+历史快照（Phase 1-3 时期的调用链，已被 LangGraph 版取代，见文末）：
 
 ```
 HTTP Client
  ↓
 FastAPI（app/api/main.py：POST /chat，Pydantic 校验，依赖注入 Agent，LLM 错误 → 502）
  ↓
-SecurityAgent（app/core/agent.py：支持 Tool Calling 和手写 ReAct 循环）
+SecurityAgent（app/core/agent.py：当时为手写 ReAct 循环，Phase 4 起委托 LangGraph）
  ↓
 LLMClient（app/core/llm.py：ChatOpenAI 统一封装，provider 由 .env 决定）
  ↓
@@ -397,6 +400,11 @@ OpenAI-compatible LLM
 > 2026-09-14 · Phase 2 完成（结构化模拟安全日志）
 
 - `app/schemas/log_event.py`：LogEvent 模型。字段：timestamp / event_type(Literal) / source / source_ip / destination_ip / source_port / destination_port / username / action / status(Literal) / severity(Literal，与 Phase 7 风险分级同一套词汇表) / message。
+- 校验边界：IP 用 `str` + Pydantic validator 校验 IPv4（JSONL / 工具参数 / LLM 数据交换统一字符串形态）；port 校验 0~65535；可枚举字段全部 Literal，脏数据在校验边界被拒绝。
+- 设计要点：**"SSH 暴力破解"不是 event_type，而是大量 login_failed 事件构成的模式**——数据层只记录原子事实，模式识别是 Agent（Phase 3+）的工作。
+- `scripts/seed_logs.py`：固定 `random.Random(42)` + 固定基准时间（2026-09-10 08:00 UTC），输出逐字节可复现 → `data/security_events.jsonl`（144 条事件；data/ 生成物不进 git，见 §7 策略）。
+- 8 个安全场景：正常登录 / 单次失败噪声 / 同用户多次失败（密码猜测）/ SSH 撒网式爆破 / 爆破 IP 后续成功登录 / 权限提升（sudo 失败→加入 sudo 组）/ Web 攻击迹象 / 正常防火墙流量。场景 3/4/5 构成递进攻击故事线，为 Phase 3 的多步推理（查失败→按 IP 聚合→查是否成功登录）准备真实问题。
+- 测试：`tests/test_schemas/`（模型校验拒绝非法 IP/event_type/severity/status/port；生成可重复；JSONL 逐行 roundtrip；8 场景真实存在）。
 
 > 2026-09-14 · Phase 3 Step 1 完成（安全日志查询工具）
 
@@ -408,49 +416,121 @@ OpenAI-compatible LLM
 
 - `app/core/agent.py`：SecurityAgent 支持 Tool Calling 和手写 ReAct 循环，默认 max_iterations=5
 - `app/tools/query_logs.py`：添加 LangChain 工具包装器，保持核心查询逻辑独立
-- `tests/test_core/test_react_agent.py`：完整的 ReAct 循环测试套件，11/11 测试通过
+- `tests/test_core/test_react_agent.py`：完整的 ReAct 循环测试套件
 - `app/core/llm.py`：FakeLLMClient 和 FakeChatModel 工具调用模拟框架
 - System Prompt 增强：强调事实优先、证据驱动、不足证据时明确说明
 
+> 2026-09-17 · Phase 3 Step 2 Review Fix 完成（测试完善 + 缺陷修复）
+
+- 独立 LangChain Tool Schema 测试（`tests/test_core/test_tool_schema.py`）：参数一致性、错误响应契约、真实 `.invoke()` 路径
+- 缺陷修复：工具包装器 JSON 序列化（`model_dump(mode="json")` 修复 datetime 不可序列化导致全部查询返回通用错误）；异常日志只记录 `error_type`/`tool_call_id`，不暴露参数与路径
+- 77 tests（Phase 3 终态基线）
+
+> 2026-09-17 · Phase 4 完成（LangGraph 迁移）
+
+分四步实施（4.1 依赖与接口 → 4.2 graph 构建 → 4.3 接入 → 4.3-B 执行轨迹验证）：
+
+- **4.1**：`langgraph` 依赖；`LLMClient.bind_tools()` 公开接口——API Key 注入边界收敛在 LLMClient 一处，调用方不再触碰内部模型
+- **4.2**：新建 `app/core/graph.py`，图结构：
+  ```
+  START → agent → [should_continue] → tools → agent（循环）
+                       ↓（无 tool_calls 或达 max_iterations）
+                      END
+  ```
+  - `AgentState`：仅 `messages`（`add_messages` reducer 追加）+ `iteration_count`（业务层迭代上限）
+  - agent / tools 节点手写（未用 ToolNode/create_react_agent）；工具执行严格 `tool.ainvoke(tc["args"])` + `ToolMessage(tool_call_id=tc["id"])`，修复了旧循环传整个 tool_call dict 的 bug
+  - 业务层 `max_iterations` 与 LangGraph `recursion_limit` 分离，前者由 `should_continue` 控制
+- **4.3**：`SecurityAgent.chat()` 切换为构造 `graph.ainvoke()` 委托（签名不变，API 零改动）；删除手写 ReAct for loop；达到迭代上限返回 Phase 3 相同的受限说明
+- **4.3-B**：`astream(stream_mode="updates")` 原生执行轨迹测试——逐节点验证 agent→tools→agent 顺序、iteration_count 递增、tool_call_id 传递
+- 测试覆盖：graph 构建/路由/多工具循环/tool_call_id/异常安全契约/消息顺序（`test_graph.py`）
+
+> 2026-09-17 · Phase 5 完成（威胁情报 + Evidence Fusion）
+
+- **5.1 数据层与工具**：
+  - `app/schemas/threat_intel.py`：ThreatIntelRecord（indicator / indicator_type(ip/domain/hash) / malicious / confidence 0-100 / severity / tags / source / first_seen / last_seen）
+  - `scripts/seed_threat_intel.py`：固定 seed + 固定时间，29 条 IOC（恶意 IP 11 / 域名 8 / Hash 6 / 可信对照 4），与 Phase 2 攻击场景对应（203.0.113.66）
+  - `app/tools/query_threat_intel.py`：**Exact Match 查询**（见下方 Roadmap 偏离说明）+ @tool wrapper（found/not-found/error 三种 JSON 契约）
+  - 跨数据集关联测试：Phase 2 日志中的攻击 IP 可在情报库精确命中（Evidence Fusion 的数据地基）
+- **5.2 多工具串联**：SecurityAgent 默认注册双工具；prompt 增加融合指导（发现 IOC → 可查情报 → 综合证据并说明来源）；messages 是唯一证据容器，**未新增 State 字段**——日志 ToolMessage 与情报 ToolMessage 按 reducer 顺序自然进入 LLM 上下文
+- `tests/test_core/test_evidence_fusion.py`：日志→情报→融合回答的完整链路验证
+
+> 2026-09-17 · Phase 6 完成（Rule-based Risk Analyzer，Hybrid 架构）
+
+- `app/schemas/risk.py`：RiskEvidence（证据快照：事件计数/失败登录数/情报命中与标签）+ RiskAssessment（risk_level 含 none / score 0-100 / confidence / reasons 逐条引用证据 / 内嵌可复现 evidence）
+- `app/tools/risk_analyzer.py`：
+  - `analyze_risk(evidence)` **纯函数规则引擎**：不读文件不查库，同样证据永远同样结果；权重表（恶意情报 +40、severity≥high +15、失败登录≥20 +30 / 5-19 +15、可信情报强制 ≤10 误报抑制），分数映射 none/low/medium/high/critical
+  - `collect_evidence()` 便利采集器 + @tool wrapper；采集与分析分离，未来可支持直接传 Evidence
+- **Hybrid 分工**：Rule-based Tool 输出可审计的结构化等级与分数；LLM 拿到 ToolMessage 后负责解释与汇报——数字与等级不经过 LLM
+- SecurityAgent 默认注册三工具；prompt 第 9 条：优先用风险工具的结构化结果，LLM 职责是解释
+- 159 tests（当前基线）
+
+### Implementation Deviation Note（与 §12 Roadmap 的实现偏离说明）
+
+> §12 Roadmap 的原始设计保持不变；本节只记录实际实现与蓝图之间的有意偏离及原因。
+
+- **IOC 查询采用 Exact Match 而非 RAG**：IOC（IP/域名/Hash）是唯一标识符，查询语义是等值判断——Embedding 的语义近似性在此恰恰是缺陷（`203.0.113.66` 的向量近邻可能是 `203.0.113.65`，产生假阳性关联），且引入向量库违背精确查找的本质。§3.2 F3 的"RAG 语义检索"适用于 CVE/ATT&CK 知识库（自然语言文档），不适用于 IOC 库；RAG 仍按原计划留给知识库部分。
+- **Risk Analyzer 提前实现**：原 §12 安排在 Phase 7，实际在 Phase 6 前置完成规则侧——因为它的输入（结构化证据）已由 Phase 5 的两个查询工具备齐，且 Rule-based 输出可离线确定性测试，是 Evidence Fusion 的自然收口。Response Planner / LLM 复核层仍留给 Phase 7。
+- LangGraph 实际形态（2 节点 + 条件边）比 §9.1 蓝图更小：checkpoint/interrupt/审批节点未引入（Phase 8），`AgentState` 仅 2 字段而非 §10 的 7 字段——蓝图描述终态，实现按最小必要演进。
+
+## 当前架构快照（2026-09-17）
+
+> 完成状态：**Phase 0-6 已完成**，Phase 7 未启动。
+
+```
+HTTP Client
+ ↓
+FastAPI（POST /chat，Pydantic 校验，LLM 错误 → 502）
+ ↓
+SecurityAgent（app/core/agent.py：组装 System+Human、构造持有 graph、提取最终回答）
+ ↓
+LangGraph StateGraph（app/core/graph.py：唯一控制流实现）
+   agent 节点（LLM.bind_tools().ainvoke）⇄ tools 节点（tool_map 路由 + 安全错误契约）
+   should_continue 条件边（无 tool_calls / iteration_count ≥ max_iterations → END）
+ ↓
+Tool layer（纯函数核心 + @tool wrapper 分层）：
+   query_security_logs（144 条日志）/ query_threat_intel（29 条 IOC，Exact Match）/ analyze_risk（规则引擎）
+ ↓
+Structured evidence（messages 按 reducer 顺序累积：LogToolMsg → IntelToolMsg → RiskToolMsg）
+ ↓
+LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终回答）
+```
+
+- 默认注册工具：`[query_security_logs_tool, query_threat_intel_tool, analyze_risk_tool]`，graph 对工具数量零假设（加工具 = 加 map 条目，控制流不变）
+- 测试基线：159 passed，全部离线（FakeLLMClient / FakeChatModel / ScriptedTraceModel 模式，无真实 API 调用）
+
+## 尚未实现（按 §12 Roadmap）
+
+- RAG / 知识库（CVE、ATT&CK）——Phase 5 剩余部分，检索对象是自然语言文档，与 IOC Exact Match 不冲突
+- MCP Server——原 Phase 6（现顺延）
+- Response Planner / LLM 风险复核层——Phase 7
+- HITL / 安全层 / 审批流——Phase 8（checkpoint/interrupt 同步引入）
+- Observability / Evaluation——Phase 9
+
 ## Testing Framework
 
-已实现完整的测试框架，包括：
+全部测试**离线运行**，不依赖真实 LLM API Key（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`）。
 
-### 1. 工具调用模拟 (`FakeLLMClient` 和 `FakeChatModel`)
-- 模拟 LLM 工具调用行为
-- 支持预设响应和工具结果
-- 智能工具检测和多关键词匹配
-- 完整的异步支持
+### 1. 工具调用模拟（`FakeLLMClient` / `FakeChatModel`）
+- 模拟 LLM 的工具调用行为，支持预设响应与预设工具结果
+- 完整的异步支持；显式 Fake 而非 MagicMock，断言"收到了什么消息"一目了然
 
-### 2. 异步测试套件 (`test_react_agent.py`)
-- 11/11 测试通过（100%成功率）
-- 覆盖所有 ReAct 循环场景：
-  - ✅ LLM 直接回答
-  - ✅ 单次工具调用 → 最终回答
-  - ✅ 多次工具调用 → 最终回答
-  - ✅ 未知工具处理
-  - ✅ 无效工具参数
-  - ✅ 工具执行异常
-  - ✅ 最大迭代次数限制
-  - ✅ 消息顺序正确性
-- 独立测试实例，无 fixture 依赖
+### 2. 图执行轨迹验证（`test_graph.py`）
+- 用 `astream(stream_mode="updates")` 逐节点验证 `agent → tools → agent` 的执行顺序
+- 覆盖 `iteration_count` 递增、`tool_call_id` 传递、多工具循环、异常安全契约、消息顺序
 
 ### 3. 核心流程验证
 - 消息序列：`HumanMessage → AIMessage(tool_calls) → ToolMessage → AIMessage`
 - 错误处理：参数错误让 LLM 修正参数，执行错误返回结构化错误信息
 - 工具结果：JSON 格式，包含 count 和 events，不暴露内部细节
 - 终止条件：达到 max_iterations 时返回明确信息，为后续 Evaluation 和 Observability 做准备
-  - IP 用 `str` + Pydantic validator 校验 IPv4（JSONL / 工具参数 / LLM 数据交换统一字符串形态）；port 校验 0~65535；可枚举字段全部 Literal，脏数据在校验边界被拒绝。
-  - 设计要点：**"SSH 暴力破解"不是 event_type，而是大量 login_failed 事件构成的模式**——数据层只记录原子事实，模式识别是 Agent（Phase 3+）的工作。
-- `scripts/seed_logs.py`：固定 `random.Random(42)` + 固定基准时间（2026-09-10 08:00 UTC），输出逐字节可复现 → `data/security_events.jsonl`（144 条事件；data/ 生成物不进 git，见 §7 策略）。
-- 8 个安全场景：正常登录 / 单次失败噪声 / 同用户多次失败（密码猜测）/ SSH 撒网式爆破 / 爆破 IP 后续成功登录 / 权限提升（sudo 失败→加入 sudo 组）/ Web 攻击迹象 / 正常防火墙流量。场景 3/4/5 构成递进攻击故事线，为 Phase 3 的多步推理（查失败→按 IP 聚合→查是否成功登录）准备真实问题。
-- 测试：`tests/test_schemas/`（模型校验拒绝非法 IP/event_type/severity/status/port；生成可重复；JSONL 逐行 roundtrip；8 场景真实存在）。
-- LogEvent 查询工具（query_security_logs）：Not implemented yet（Phase 3）。
 
-- Tools：Not implemented yet（Phase 3，先手写 ReAct 循环）
-- LangGraph：Not implemented yet（Phase 4，原因见 §9.2）
-- RAG：Not implemented yet（Phase 5）
-- MCP：Not implemented yet（Phase 6）
-- Risk Analyzer / Response Planner：Not implemented yet（Phase 7）
-- HITL：Not implemented yet（Phase 8）
-- Observability / Evaluation：Not implemented yet（Phase 9）
+### 4. 测试分层
+
+| 目录 | 覆盖对象 |
+|---|---|
+| `tests/test_api/` | FastAPI 路由、错误码、消息透传 |
+| `tests/test_core/` | agent / graph / llm / config / tool schema / evidence fusion / risk 集成 |
+| `tests/test_schemas/` | LogEvent / ThreatIntelRecord / RiskAssessment 的校验边界、seed 可复现 |
+| `tests/test_tools/` | 三个工具核心函数的过滤、排序、错误契约 |
+
+当前基线：**159 passed**（`pytest -q`，2026-09-17）。
