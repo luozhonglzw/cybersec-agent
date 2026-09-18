@@ -40,12 +40,14 @@ from app.core.graph import (
     PLANNER_TOOL_NAME,
     AgentState,
     HitlConfig,
+    PlanFailedError,
     create_agent_graph,
 )
 from app.core.llm import FakeLLMClient
 from app.security.audit import compute_plan_digest
 from app.security.store import SqliteAuditStore
 from app.tools import DEFAULT_TOOLS
+from app.tools.response_planner import plan_response_tool
 
 # 30 次失败登录 + 恶意情报 → critical → 含 block_ip / reset_credentials → 需审批
 BRUTE_FORCE_IP = "203.0.113.66"
@@ -124,6 +126,22 @@ def hitl(data_paths, audit_store) -> HitlConfig:
     )
 
 
+@pytest.fixture
+def broken_hitl(data_paths, audit_store, tmp_path) -> HitlConfig:
+    """logs_path 指向**不存在**的文件 → plan 节点必然失败。
+
+    用于验证 Phase 8.5 的失败契约:写 plan.failed、抛通用消息的
+    PlanFailedError、且路径不出现在审计与 checkpoint 里。
+    """
+    _, intel = data_paths
+    return HitlConfig(
+        checkpointer=InMemorySaver(),
+        audit_store=audit_store,
+        logs_path=tmp_path / "missing.jsonl",
+        intel_path=intel,
+    )
+
+
 def _build(hitl: HitlConfig | None, reply: str = "分析完成"):
     """返回 (graph, llm)。llm 用于断言实际绑定了哪些工具。"""
     llm = FakeLLMClient(reply)
@@ -165,23 +183,57 @@ def test_hitl_enabled_adds_three_nodes(hitl):
     assert nodes == {"agent", "tools", "plan", "policy_gate", "human_approval"}
 
 
-def test_hitl_tools_is_default_minus_planner():
-    """D2:计划由节点确定性产出,LLM 不再持有规划工具。
+def test_planner_tool_is_excluded_from_hitl_tools():
+    """D2:计划由节点确定性产出,LLM 不得持有规划工具。
 
-    绊线:DEFAULT_TOOLS 一旦改名/新增,这条会失败 —— 届时请有意更新,
-    而不是让 HITL 悄悄多出一个计划来源。
+    断言的是**工具对象身份**,不是字符串。旧版本拿 HITL_TOOLS 与"用同一个
+    常量过滤出来的结果"比 —— 两侧同源:工具一旦改名,过滤静默空转、
+    规划工具回到集合里,而断言依然全绿(用过期常量名复刻验证过)。
+    护栏比没有更糟,因为它制造虚假信心。
     """
-    assert [t.name for t in HITL_TOOLS] == [
-        t.name for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME
-    ]
-    assert PLANNER_TOOL_NAME not in {t.name for t in HITL_TOOLS}
+    assert plan_response_tool in DEFAULT_TOOLS          # 前提:它在全量集里
+    assert plan_response_tool not in HITL_TOOLS         # 结论:被排除(身份比较)
+    assert len(HITL_TOOLS) == len(DEFAULT_TOOLS) - 1    # 过滤确实生效,而非空转
+
+
+def test_planner_tool_name_is_derived_not_hardcoded():
+    """结构性护栏:PLANNER_TOOL_NAME 必须派生自工具对象,不得手写字符串。
+
+    行为断言(`== plan_response_tool.name`)挡不住"有人改回正确的字面量":
+    那样写今天也对,但工具明天改名就又静默漂移。所以查 AST ——
+    赋值右侧必须是属性访问(plan_response_tool.name),不能是字符串常量。
+
+    注意:源码写的是 `PLANNER_TOOL_NAME: str = ...`,带注解的赋值在 AST 里是
+    `ast.AnnAssign` 而非 `ast.Assign` —— 两种都要覆盖,否则护栏会静默失效。
+    """
+    for node in ast.walk(_graph_tree()):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == "PLANNER_TOOL_NAME"
+            for t in targets
+        ):
+            continue
+        assert isinstance(node.value, ast.Attribute), (
+            f"PLANNER_TOOL_NAME 必须派生自工具对象,实际是: {ast.dump(node.value)}"
+        )
+        return
+    pytest.fail("graph.py 里未找到 PLANNER_TOOL_NAME 的赋值")
 
 
 def test_hitl_graph_does_not_bind_planner_tool(hitl):
-    """行为级验证:实际绑给 LLM 的工具里没有规划工具。"""
+    """行为级验证:实际绑给 LLM 的工具里没有规划工具对象。"""
     _, llm = _build(hitl)
-    assert [t.name for t in llm.bound_tools] == [t.name for t in HITL_TOOLS]
-    assert PLANNER_TOOL_NAME not in {t.name for t in llm.bound_tools}
+
+    assert plan_response_tool not in llm.bound_tools
+    # 与 DEFAULT_TOOLS(**独立来源**)比对,而不是与 HITL_TOOLS 自比
+    assert [t.name for t in llm.bound_tools] == [
+        t.name for t in DEFAULT_TOOLS if t is not plan_response_tool
+    ]
 
 
 def test_plain_graph_still_binds_all_default_tools():
@@ -481,6 +533,117 @@ async def test_incident_is_not_written_in_phase_8_3(hitl, audit_store):
 
 
 # =====================================================================
+# C2. plan 节点失败(Phase 8.5):失败留痕 + 不泄漏内部信息
+# =====================================================================
+
+async def test_plan_failure_raises_plan_failed_error(broken_hitl):
+    """失败契约:抛通用消息的 PlanFailedError,真实原因留在 __cause__。
+
+    消息恒定是关键 —— 它会随 checkpoint 持久化,不能带路径。
+    """
+    graph, _ = _build(broken_hitl)
+    with pytest.raises(PlanFailedError) as excinfo:
+        await graph.ainvoke(_initial(BRUTE_FORCE_IP), _config())
+
+    assert str(excinfo.value) == "计划生成失败"
+    # 真实原因不丢:因果链留给日志与 traceback
+    assert isinstance(excinfo.value.__cause__, FileNotFoundError)
+
+
+async def test_plan_failure_writes_exactly_one_plan_failed(broken_hitl, audit_store):
+    """失败也必须留痕(F6),且恰好一条 —— 失败路径不写任何其它事件。"""
+    graph, _ = _build(broken_hitl)
+    with pytest.raises(PlanFailedError):
+        await graph.ainvoke(_initial(BRUTE_FORCE_IP), _config())
+
+    events = [r.event for r in audit_store.list_audit()]
+    assert events == ["plan.failed"]
+
+
+async def test_plan_failed_detail_contains_only_indicator_and_error_type(
+    broken_hitl, audit_store
+):
+    """detail 的字段集是精确契约:只有 indicator 与 error_type。"""
+    graph, _ = _build(broken_hitl)
+    with pytest.raises(PlanFailedError):
+        await graph.ainvoke(_initial(BRUTE_FORCE_IP), _config())
+
+    records = audit_store.list_audit(event="plan.failed")
+    assert len(records) == 1
+    record = records[0]
+
+    assert set(record.detail) == {"indicator", "error_type"}
+    assert record.detail["indicator"] == BRUTE_FORCE_IP
+    assert record.detail["error_type"] == "FileNotFoundError"
+    assert record.outcome == "failed"
+    assert record.actor == "system"
+    # 没有计划 → 没有摘要;没有 incident(生命周期留给 triage)
+    assert record.plan_digest is None
+    assert record.incident_id is None
+
+
+async def test_plan_failed_audit_leaks_no_path_or_message(
+    broken_hitl, audit_store, data_paths, tmp_path
+):
+    """审计记录整体不得出现绝对路径或原始异常消息。
+
+    原始 FileNotFoundError 的消息形如
+    "安全日志数据文件不存在: <绝对路径>(先运行 scripts/seed_logs.py 生成)" ——
+    它可能出现在 detail / reason / outcome 任何一个字段里,所以整条记录一起查。
+    """
+    graph, _ = _build(broken_hitl)
+    with pytest.raises(PlanFailedError):
+        await graph.ainvoke(_initial(BRUTE_FORCE_IP), _config())
+
+    dumped = json.dumps(
+        [r.model_dump(mode="json") for r in audit_store.list_audit()],
+        ensure_ascii=False,
+    )
+    assert "missing.jsonl" not in dumped
+    assert str(tmp_path) not in dumped
+    assert "seed_logs" not in dumped
+
+
+async def test_plan_failure_checkpoint_leaks_no_path(broken_hitl, tmp_path):
+    """checkpoint 里的 error 也不得带路径。
+
+    实测确认 LangGraph 只序列化异常**自身**的 repr、不序列化 __cause__ ——
+    所以"换通用消息"这一招才有效。这条测试把这个前提钉住:
+    若哪天框架改成序列化因果链,这里会变红。
+    """
+    graph, _ = _build(broken_hitl)
+    with pytest.raises(PlanFailedError):
+        await graph.ainvoke(_initial(BRUTE_FORCE_IP), _config())
+
+    snapshot = await graph.aget_state(_config())
+    error_repr = str(snapshot.tasks[0].error)
+
+    assert "missing.jsonl" not in error_repr
+    assert str(tmp_path) not in error_repr
+    assert "PlanFailedError" in error_repr
+
+
+async def test_plan_failure_writes_no_incident_or_action_rows(broken_hitl, audit_store):
+    """失败没有产出计划 → 没有可沉淀的对象,不写 incident / 审批单。"""
+    graph, _ = _build(broken_hitl)
+    with pytest.raises(PlanFailedError):
+        await graph.ainvoke(_initial(BRUTE_FORCE_IP), _config())
+
+    assert audit_store.list_action_rows() == []
+    assert audit_store.pending_action_rows() == []
+
+
+async def test_plan_failure_does_not_pause_for_approval(broken_hitl):
+    """失败是硬错误,不是"等审批":图停在 plan,不会走到 human_approval。"""
+    graph, _ = _build(broken_hitl)
+    with pytest.raises(PlanFailedError):
+        await graph.ainvoke(_initial(BRUTE_FORCE_IP), _config())
+
+    snapshot = await graph.aget_state(_config())
+    assert snapshot.next == ("plan",)
+
+
+# =====================================================================
 # D. 结构性护栏(AST)
 # =====================================================================
 
@@ -578,6 +741,55 @@ def test_graph_module_does_not_touch_private_llm_model():
     """护栏:API Key 注入边界仍只在 LLMClient 一处,图模块不得访问 _model。"""
     source = Path(graph_module.__file__).read_text(encoding="utf-8")
     assert not re.search(r"\._model\b", source)
+
+
+def test_plan_failed_helper_never_reads_exception_message():
+    """结构性护栏:失败审计不得读取异常消息。
+
+    `str(exc)` / `repr(exc)` / `exc.args` / `traceback` 都可能带出绝对路径,
+    而审计记录长期留存。行为测试只能覆盖当前这一种异常;这条护栏把
+    "不许读消息"变成结构约束,新写一个 `str(exc)` 会立刻变红。
+    """
+    func = _find_func(_graph_tree(), "_audit_plan_failed")
+
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id not in ("str", "repr", "format", "traceback"), (
+                f"失败审计不得把异常转成字符串: {node.func.id}()"
+            )
+        if isinstance(node, ast.Attribute):
+            assert node.attr not in ("args", "format_exc", "__traceback__"), (
+                f"失败审计不得读取异常内部: .{node.attr}"
+            )
+
+
+def test_plan_node_catches_and_reraises_generic_message():
+    """plan_node 必须:捕获 → 审计 → 抛**通用消息**的 PlanFailedError。
+
+    只用 `in ast.dump(...)` 太弱:"把消息改成 f-string 拼接异常"同样能让
+    `"计划生成失败" in dumped` 通过。所以逐 raise 节点检查 ——
+    异常构造参数必须是**字符串常量**,且必须带 `from exc`(cause 非空)。
+    """
+    func = _find_func(_graph_tree(), "plan_node")
+
+    plan_failed = [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id == "PlanFailedError"
+    ]
+    assert plan_failed, "plan_node 未抛 PlanFailedError"
+
+    for node in plan_failed:
+        assert len(node.exc.args) == 1 and isinstance(node.exc.args[0], ast.Constant), (
+            "PlanFailedError 的消息必须是常量字面量,不得拼接异常内容"
+        )
+        assert node.exc.args[0].value == "计划生成失败"
+        assert node.cause is not None, "必须用 `from exc` 保留原始异常链(仅用于日志)"
+
+    assert "_audit_plan_failed" in ast.dump(func), "失败路径必须先写审计"
 
 
 # =====================================================================

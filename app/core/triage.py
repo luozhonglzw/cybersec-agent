@@ -39,6 +39,10 @@ interrupt_id 由服务端从 checkpoint 恢复(D7),绝不采信客户端传的�
       → 服务写 record_action_request(request, incident_id=incident_id)
     于是 incident → action_requests 有关联。
 
+    失败路径(Phase 8.5):plan 节点写一条 plan.failed 后抛 PlanFailedError,
+    服务**不写** incident / action_requests —— 没有产出计划,就没有可沉淀的对象。
+    所以一次失败的判定在审计里恰好只有 1 条 plan.failed。
+
 已知限制(必须文档化,不得掩盖):
     1. **audit_logs.incident_id 为 NULL**。incident 在图跑完之后才创建
        (D4 决定 incident_id 不进 AgentState),所以图节点写审计时无从得知它。
@@ -63,6 +67,7 @@ from langchain_core.messages import (
 from langgraph.types import Command
 
 from app.core.agent import MAX_ITERATIONS_REPLY, SECURITY_ANALYST_SYSTEM_PROMPT
+from app.core.graph import PlanFailedError
 from app.schemas.approval import ApprovalStatus, TriageOutcome, utc_now
 from app.schemas.incident import Incident
 from app.security.store import SqliteAuditStore
@@ -96,10 +101,15 @@ class CheckpointLostError(NotAwaitingApprovalError):
 
 
 class TriageDataUnavailableError(TriageError):
-    """数据源不可用(日志 / 威胁情报文件缺失)→ 503。
+    """判定所需的数据源不可用 → 503。
 
-    刻意**不**携带原始异常信息:collect_evidence 抛出的 FileNotFoundError
-    消息里含**绝对路径**,属于内部部署信息,不能回给客户端。
+    **所有** plan 节点失败统一映射到这里(Phase 8.5 决策):plan 节点的输入
+    只有数据文件 + 纯规则函数,失败压倒性是数据/部署问题。刻意不细分
+    "数据问题 503 / 代码 bug 500" —— 那需要给 PlanFailedError 加 cause_type
+    判别字段;而真实 error_type 已写进 plan.failed 审计与 error 日志,
+    排查信息不丢,不值得为此加一个分支。
+
+    消息恒定且通用,不回传任何原始异常信息(路径属于内部部署信息)。
     """
 
 
@@ -210,14 +220,13 @@ class TriageService:
                 },
                 config,
             )
-        except FileNotFoundError as exc:
-            # 数据文件缺失是**部署问题**,不是客户端错误(4xx)。
-            # 原始消息含绝对路径 → 只记日志,不回传。
+        except PlanFailedError as exc:
+            # plan 节点的失败契约:消息通用、不含路径(见 graph.PlanFailedError)。
+            # 细节在 __cause__ 里,且已由 graph 层写进 plan.failed 审计与 error 日志。
             logger.error(
-                "triage_data_unavailable",
+                "triage_plan_failed",
                 thread_id=thread_id,
                 indicator=indicator,
-                error_type=type(exc).__name__,
             )
             raise TriageDataUnavailableError("安全数据源不可用") from exc
 
@@ -276,7 +285,7 @@ class TriageService:
         interrupt_id **由服务端恢复**,不接受客户端传入(D7):
         客户端能指定 interrupt_id 就等于能伪造"审批的是哪一次暂停"。
 
-        这里不捕获 FileNotFoundError:plan 节点是**已完成节点**,
+        这里不捕获 PlanFailedError:plan 节点是**已完成节点**,
         resume 不会重放它(实测确认:resume 后 plan.created 仍只有一条),
         因此采集证据的 I/O 不会再次发生。
         """

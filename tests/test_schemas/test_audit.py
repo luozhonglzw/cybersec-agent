@@ -62,10 +62,18 @@ def test_full_record_valid():
 
 def test_all_declared_events_accepted():
     for event in (
-        "plan.created", "policy.evaluated", "approval.requested",
-        "approval.decided", "approval.timeout",
+        "plan.created", "plan.failed", "policy.evaluated",
+        "approval.requested", "approval.decided", "approval.timeout",
     ):
         assert AuditRecord(**_payload(event=event)).event == event
+
+
+def test_failure_events_are_declared():
+    """失败事件必须进词汇表:只记成功的审计是幸存者偏差。
+
+    没有 plan.failed,"判定失败了多少次、为什么失败"就无从回答。
+    """
+    assert AuditRecord(**_payload(event="plan.failed", outcome="failed")).outcome == "failed"
 
 
 def test_unknown_event_rejected():

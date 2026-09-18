@@ -53,6 +53,19 @@ Phase 8.3 在 ReAct 循环**之后**接上 HITL 安全层(仅在传入 HitlConfi
    (由 8.4 的 resume() 从 aget_state().tasks[*].interrupts[*].id 恢复后
    注入 resume 载荷)。这正是 audit_logs.interrupt_id 可空的原因。
 
+7. **失败也留痕,且不泄漏内部信息**(Phase 8.5)。plan 节点把"采集证据 +
+   风险评估 + 计划生成"整段包进 try/except:失败时先写一条 plan.failed
+   (detail 只含 indicator 与 error_type),再抛**通用消息**的 PlanFailedError。
+   两个理由:
+   (a) 只记成功的审计是幸存者偏差 —— 失败必须可查,否则"多少次判定失败、
+       为什么"无从回答(F6);
+   (b) 原始异常消息可能含绝对路径,而异常会随 checkpoint 持久化。
+       实测确认 LangGraph 只序列化异常**自身**的 repr、不序列化 `__cause__`,
+       所以换成通用消息就能把路径挡在 checkpoint 之外;真实原因由
+       `raise ... from exc` 的因果链保留给日志与 traceback。
+   审计写入自身失败时**只记日志**:审计是旁路,不能掩盖原始错误,
+   更不能改变控制流。
+
 checkpoint 的现实约束(必须文档化):
     本阶段只能用 InMemorySaver —— langgraph-checkpoint-sqlite **未安装**,
     引入即新增依赖。因此 checkpoint 是**进程内运行时状态,重启丢失**;
@@ -84,15 +97,18 @@ from app.security.store import SqliteAuditStore
 from app.tools import DEFAULT_TOOLS
 from app.tools.query_logs import DEFAULT_DATA_PATH as LOGS_DATA_PATH
 from app.tools.query_threat_intel import DEFAULT_DATA_PATH as INTEL_DATA_PATH
-from app.tools.response_planner import plan_response
+from app.tools.response_planner import plan_response, plan_response_tool
 from app.tools.risk_analyzer import analyze_risk, collect_evidence
 
 logger = structlog.get_logger(__name__)
 
 # HITL 路径不注册规划工具:计划由 plan 节点确定性产出(见模块 docstring 第 2 条)。
-# 唯一的真相源仍是 app.tools.DEFAULT_TOOLS —— 这里是它的**子集**,
-# 由 tests/test_core/test_hitl_graph.py 的 test_hitl_tools_is_default_minus_planner 守着。
-PLANNER_TOOL_NAME = "plan_response_tool"
+# 唯一的真相源仍是 app.tools.DEFAULT_TOOLS —— 这里是它的**子集**。
+#
+# 名字从**工具对象**派生,不再手写字符串字面量。手写字符串是真正的第二真相源:
+# 工具一旦改名,`t.name != "plan_response_tool"` 会静默失配 —— 过滤变成空转、
+# 规划工具悄悄回到 HITL 工具集里,而 D2 的单计划源不变量无人报警。
+PLANNER_TOOL_NAME: str = plan_response_tool.name
 HITL_TOOLS: list[BaseTool] = [
     tool for tool in DEFAULT_TOOLS if tool.name != PLANNER_TOOL_NAME
 ]
@@ -118,6 +134,21 @@ class HitlConfig:
     audit_store: SqliteAuditStore
     logs_path: Path | None = None
     intel_path: Path | None = None
+
+
+class PlanFailedError(RuntimeError):
+    """plan 节点失败。
+
+    消息**恒定且通用**,这是刻意的:原始异常可能带绝对路径(例如
+    FileNotFoundError 会带上数据文件路径),而异常会随 checkpoint 一起
+    持久化 —— 实测确认 LangGraph 只序列化异常**自身**的 repr,
+    不序列化 `__cause__` 链,所以只要换一个通用消息,路径就进不了 checkpoint。
+
+    真实原因不丢:由 `raise PlanFailedError(...) from exc` 保留因果链,
+    给日志与 traceback 用;`error_type` 另写进审计。对外只暴露这一层。
+
+    这不是"通用错误框架" —— 它只描述**一个节点**的失败契约。
+    """
 
 
 class AgentState(TypedDict, total=False):
@@ -168,6 +199,29 @@ def _thread_id() -> str:
     return thread_id
 
 
+def _audit_plan_failed(hitl: HitlConfig, indicator: str, exc: BaseException) -> None:
+    """写一条 plan.failed 审计。
+
+    只记 indicator 与 error_type —— **不记异常 message、不记路径、不记 traceback**。
+    审计记录会长期留存,而异常消息里可能含部署路径等内部信息。
+
+    本函数**自身绝不抛**:审计写入失败(如 SQLite 不可写)不能掩盖原始错误,
+    更不能改变控制流 —— 失败只记日志。审计是旁路,不是主链路的一环。
+    """
+    try:
+        hitl.audit_store.append_audit(build_audit_record(
+            "plan.failed",
+            thread_id=_thread_id(),
+            outcome="failed",
+            detail={"indicator": indicator, "error_type": type(exc).__name__},
+        ))
+    except Exception as audit_exc:
+        logger.error(
+            "graph_plan_failed_audit_write_failed",
+            error_type=type(audit_exc).__name__,
+        )
+
+
 def _select_tools(
     tools: list[BaseTool] | None, hitl: HitlConfig | None
 ) -> list[BaseTool]:
@@ -192,14 +246,25 @@ def _make_plan_node(hitl: HitlConfig):
             # 下游 policy_gate 会因 plan is None 一并短路,整条 HITL 链路跳过。
             return {}
 
-        # event_type 由调用方经 state 透传(D6);缺失即 None,与旧行为一致
-        evidence = collect_evidence(
-            indicator,
-            state.get("event_type"),
-            hitl.logs_path if hitl.logs_path is not None else LOGS_DATA_PATH,
-            hitl.intel_path if hitl.intel_path is not None else INTEL_DATA_PATH,
-        )
-        plan = plan_response(analyze_risk(evidence))
+        try:
+            # event_type 由调用方经 state 透传(D6);缺失即 None,与旧行为一致
+            evidence = collect_evidence(
+                indicator,
+                state.get("event_type"),
+                hitl.logs_path if hitl.logs_path is not None else LOGS_DATA_PATH,
+                hitl.intel_path if hitl.intel_path is not None else INTEL_DATA_PATH,
+            )
+            plan = plan_response(analyze_risk(evidence))
+        except Exception as exc:
+            # 失败也必须留痕(F6):否则"有多少次判定失败、为什么"无从回答。
+            _audit_plan_failed(hitl, indicator, exc)
+            logger.error(
+                "graph_plan_failed",
+                indicator=indicator,
+                error_type=type(exc).__name__,
+            )
+            # 通用消息 + from exc:路径/消息进不了 checkpoint,因果链留给日志
+            raise PlanFailedError("计划生成失败") from exc
 
         # 本节点是已完成节点,resume 时不会被重放 → 恰好写一次
         hitl.audit_store.append_audit(build_audit_record(

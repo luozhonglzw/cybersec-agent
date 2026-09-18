@@ -106,7 +106,7 @@ LLM 只能产生：
 └───────────────────┬──────────────────────────┘
 ┌───────────────────▼──────────────────────────┐
 │ API 层（app/api）  FastAPI                   │
-│ /chat /approve /audit 路由、输入校验          │
+│ /chat /triage /resume 路由、输入校验          │
 └───────────────────┬──────────────────────────┘
 ┌───────────────────▼──────────────────────────┐
 │ 编排层（app/graph）  LangGraph               │
@@ -129,7 +129,9 @@ LLM 只能产生：
 └─────────────────────────────────────────────┘
 ```
 
-> 注：Phase 4 完成后，编排层实际实现为单文件 `app/core/graph.py`，未单独创建 `app/graph/` 包；`rag/` / `knowledge/` / `security/` / `evaluation/` 仍待对应 Phase 创建。上方框图与 §7 目录描述的是**终态蓝图**。
+> 注：上图与 §7 目录描述的是**终态蓝图**。截至 2026-09-17 的实际实现：编排层为单文件 `app/core/graph.py`（未创建 `app/graph/` 包）；`app/security/` 已创建（policy / audit / store）；`app/rag/`、`app/knowledge/`、`app/evaluation/`、`mcp_server/`、`docker/` 尚未创建。
+>
+> **路由命名的实现偏离**：蓝图写 `/chat /approve /audit`，实际实现为 `/chat /triage /resume`。审批不是独立端点——审批决定（`status` + `operator`）是 `/resume` 的请求载荷，与恢复句柄 `thread_id` 一起构成一次完整的恢复请求，拆成两个端点会引入"审批了但没恢复"的中间态。审计目前**没有读接口**（`/audit` 未实现），审计写入走 `app/security/store.py`。
 
 ### 为什么是单进程 + FastAPI + SQLite + ChromaDB？
 
@@ -138,33 +140,35 @@ LLM 只能产生：
 | 单进程部署 | 求职项目要求"一条命令跑起来"；微服务在此规模收益为零、成本是实的（网络调用、一致性、部署复杂度） |
 | FastAPI | 类型驱动、自带 Swagger（=免费的产品 UI）、原生 async |
 | SQLite | 零运维、单文件，够用到 Phase 9；Phase 10 遇到真实痛点再换 PostgreSQL |
-| ChromaDB（embedded） | 持久化、元数据过滤、pip 即用；不引入 Docker 依赖 |
+| ChromaDB（embedded） | 持久化、元数据过滤、pip 即用；不引入 Docker 依赖（**尚未引入**：Phase 5 只交付 IOC Exact Match，RAG 顺延，见 §6 / §14） |
 
 分层是**逻辑边界**，不是物理边界——边界清晰，Phase 10 想拆随时能拆。
 
 ## 6. 技术栈
 
-> **Current**：Phase 0-6 所需依赖均已安装（实际版本以 `pyproject.toml` / `uv.lock` 为准）。下表"引入 Phase"记录该依赖首次加入的里程碑；Phase 7-10 的依赖仍为 Planned。
+> **Current（2026-09-17）**：已装依赖以 `pyproject.toml` / `uv.lock` 为准。下表"引入 Phase"记录该依赖首次加入的**里程碑**，"当前状态"记录它**此刻是否真的装上了**——两者不是一回事。关键事实：**ChromaDB（Phase 5）与 mcp（Phase 6）都还没引入**，对应能力已顺延（见 §14 偏离说明）；`respx` 从未加入依赖，测试改用显式 Fake（`FakeLLMClient` / `FakeChatModel`）而非 mock HTTP 层。
 
 ### 代码依赖
 
-| 组件 | 用途 | 引入 Phase |
-|---|---|---|
-| Python 3.12 | 语言 | 1 |
-| uv | 包管理与环境管理 | 1 |
-| FastAPI + uvicorn | API 层 | 1 |
-| langchain-openai | LLM 接入（OpenAI 兼容协议，provider 可切换） | 1 |
-| Pydantic v2 | Schema 校验 | 1 |
-| pydantic-settings | 配置管理（.env） | 1 |
-| structlog | 结构化日志 | 1 |
-| pytest / pytest-asyncio | 测试 | 1 |
-| respx | Mock LLM 的 HTTP 调用 | 1 |
-| LangGraph | Agent 编排（State/Node/Edge/Checkpoint/Interrupt） | 4 |
-| ChromaDB | 向量库（RAG） | 5 |
-| mcp（FastMCP） | MCP Server | 6 |
-| OpenTelemetry | Trace | 9 |
-| Langfuse | 可观测平台 | 9 |
-| Docker / PostgreSQL / Redis | 工程化 | 10（可选，按需引入） |
+| 组件 | 用途 | 引入 Phase | 当前状态 |
+|---|---|---|---|
+| Python 3.12 | 语言 | 1 | 已装（`.venv`） |
+| uv | 包管理与环境管理 | 1 | 已用（`uv.lock` 存在） |
+| FastAPI + uvicorn | API 层 | 1 | 已装 |
+| langchain-openai | LLM 接入（OpenAI 兼容协议，provider 可切换） | 1 | 已装 |
+| langchain-core | 消息 / 工具 / runnable 基础类型 | 1 | 已装 |
+| Pydantic v2 | Schema 校验 | 1 | 已装 |
+| pydantic-settings | 配置管理（.env） | 1 | 已装 |
+| structlog | 结构化日志 | 1 | 已装 |
+| pytest / pytest-asyncio | 测试 | 1 | 已装 |
+| httpx | 测试用 HTTP 客户端（FastAPI `TestClient` 依赖） | 1 | 已装（dev） |
+| respx | Mock LLM 的 HTTP 调用 | 1 | **未引入**（测试用显式 Fake 替身，不需要 mock HTTP 层） |
+| LangGraph | Agent 编排（State/Node/Edge/Checkpoint/Interrupt） | 4 | 已装（1.0.1） |
+| ChromaDB | 向量库（RAG） | 5 | **未引入**（Phase 5 只交付 IOC Exact Match） |
+| mcp（FastMCP） | MCP Server | 6 | **未引入**（Phase 6 顺延） |
+| OpenTelemetry | Trace | 9 | 未引入 |
+| Langfuse | 可观测平台 | 9 | 未引入 |
+| Docker / PostgreSQL / Redis | 工程化 | 10（可选，按需引入） | 未引入 |
 
 ### 安全领域知识（知识库内容，非代码依赖）
 
@@ -175,6 +179,8 @@ LLM 只能产生：
 | STIX / TAXII | 威胁情报交换标准，作为 IOC 数据结构的参考 | 5 |
 | Sigma | 检测规则格式，知识库扩展 | 10（可选） |
 | YARA | 恶意样本规则，知识库扩展 | 10（可选） |
+
+> 上述知识库内容**均未实现**：Phase 5 只落地了 IOC 库（`ThreatIntelRecord`），且查询语义是 Exact Match 而非 RAG（见 §14 偏离说明）。STIX / TAXII 的"参考"作用体现在 `ThreatIntelRecord` 的字段设计上，未引入其数据格式。
 
 ### LLM 接入
 
@@ -217,6 +223,32 @@ cybersec-agent/
 - **data/ 的 Git 策略**：git 只存生成脚本（scripts/seed_*.py），不存生成物；换台机器 `python scripts/seed.py` 一键复原。
 - mcp_server/ 放顶层：MCP Server 是独立进程入口，生命周期与 API 服务不同。
 - schemas/ 独立成包：Pydantic 模型被 tools、graph、api、knowledge 同时引用，单独放置避免循环 import。
+
+### 7.1 当前实际结构（2026-09-17）
+
+蓝图中的目录并非全部已创建。实际存在的是：
+
+```
+cybersec-agent/
+├── app/
+│   ├── core/       # config / logging / llm / agent / graph（编排层单文件）
+│   ├── schemas/    # log_event / threat_intel / risk / response / approval / audit
+│   ├── tools/      # query_logs / query_threat_intel / risk_analyzer / response_planner
+│   ├── security/   # policy / audit / store（Phase 8）
+│   └── api/        # main（/chat /triage /resume）+ schemas
+├── data/           # security_events.jsonl / threat_intel.jsonl（**仅 JSONL**）
+├── scripts/        # seed_logs.py / seed_threat_intel.py
+├── tests/          # test_api / test_core / test_schemas / test_security / test_tools
+├── docs/           # **仅 architecture.md**
+├── pyproject.toml
+├── uv.lock
+├── .env.example
+└── .gitignore
+```
+
+**尚未创建**：`app/graph/`（编排层实现为 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`app/evaluation/`、`mcp_server/`、`docker/`、`docs/learning/`、`docs/interview/`。
+
+**data/ 的实际内容**：只有两个 seed 生成的 JSONL 文件，**没有** SQLite 或 Chroma 持久化文件。`audit.db` 由 `SqliteAuditStore` 在运行时按需创建（测试全部注入 `tmp_path`，仓库里不产生该文件）；checkpoint 走 `InMemorySaver`，**不落盘**。
 
 ## 8. 数据流设计
 
@@ -287,6 +319,8 @@ analyze_request（LLM：理解意图，决定下一步）
                                END
 ```
 
+> 上图为**终态蓝图**。实际实现是 5 节点（`agent ⇄ tools` + `plan → policy_gate → human_approval`），差异与原因见 §14 偏离说明；审批端点并入 `/resume`，见 §5 注。
+
 ### 9.2 教学设计：为什么 Phase 3 先手写 ReAct，Phase 4 再迁移 LangGraph？
 
 这是**故意的绕路**：
@@ -306,7 +340,9 @@ analyze_request（LLM：理解意图，决定下一步）
 
 ## 10. State 设计
 
-计划中的 `AgentState`（Phase 4 落实，实现时可能调整字段）：
+### 10.1 终态蓝图（Phase 0 设计，尚未落地）
+
+计划中的 `AgentState`：
 
 ```python
 class AgentState(TypedDict):
@@ -319,6 +355,27 @@ class AgentState(TypedDict):
     audit_entries: list                 # 本轮审计流水
 ```
 
+### 10.2 实际实现（`app/core/graph.py`，Phase 8.3 落地，8 字段）
+
+```python
+class AgentState(TypedDict, total=False):
+    messages: Annotated[list[BaseMessage], add_messages]
+    iteration_count: int
+    indicator: str
+    event_type: str | None
+    plan: ResponsePlan | None
+    policy_decision: PolicyDecision | None
+    approval_request: ApprovalRequest | None
+    approval_decision: ApprovalDecision | None
+```
+
+与蓝图的三处实质差异（记录事实，不改设计）：
+
+- **没有 `tool_results` / `retrieved_docs` / `audit_entries`**：证据统一走 `messages`（`ToolMessage` 按 `add_messages` reducer 顺序累积），审计直接写 store。在 state 里再存一份就是第二个真相源。
+- **`risk` 折叠进 `plan`**：`ResponsePlan` 内嵌 `RiskAssessment`（plan → assessment → evidence 全链可追溯），因此没有独立 `risk` 字段。
+- **`thread_id` 刻意不进 state**：它是运行时 `configurable`，进 state 会制造第二个真相源；节点内用 `_thread_id()` 读取。
+- **`indicator` / `event_type` 必须声明**：LangGraph 对**未声明**的初始 state 键是**静默丢弃**的（实测确认：`ainvoke` 传了不报错，节点里读不到），所以"调用方能传"就等于"这里必须有字段"。这也是 HITL 链路能按 `indicator` 自动短路的前提——自由对话（`/chat`）不传 `indicator`，`plan` 节点直接跳过。
+
 **为什么用结构化 State，而不是把所有内容拼成一个字符串？**
 
 - 每个节点只读写自己关心的字段，职责清晰，不会互相踩踏；
@@ -329,23 +386,65 @@ class AgentState(TypedDict):
 
 原则：**表随 Phase 增长，Phase 0 只定蓝图；审计类数据 append-only。**
 
+### 11.1 实际落地的表（`app/security/store.py`，Phase 8.2）
+
+三张 SQLite 表，字段以 DDL 为准：
+
 | 表 | 用途 | 关键字段 | 引入 Phase |
 |---|---|---|---|
-| security_events | 模拟安全日志 | ts, src_ip, dst_ip, username, action, status, user_agent, raw | 2 |
-| threat_intel | IOC 库 | ioc_type(ip/domain/hash), ioc_value, source, confidence, tags | 5 |
-| knowledge_docs | RAG 源文档 | kind(cve/mitre/report), key, title, text, metadata | 5 |
-| incidents | 分析结论沉淀 | summary, risk_level, linked_iocs, resolution | 8 |
-| action_requests | HITL 审批单 | tool, params, risk, status(pending/approved/denied/executed), requester, approver, 各时间戳 | 8 |
-| audit_logs | 审计流水 | ts, actor, event, resource, detail, outcome | 8（概念始于 1） |
-| checkpoints | LangGraph 断点 | 框架自动管理 | 4 |
+| incidents | 分析结论沉淀 | id, created_at, indicator, risk_level, score, summary, plan_json | 8 |
+| action_requests | HITL 审批单 | id, incident_id, thread_id, indicator, risk_level, score, summary, policy_reasons, action_type, priority, target, rationale, requires_approval, reversible, requested_at | 8 |
+| audit_logs | 审计流水 | id, ts, actor, event, incident_id, thread_id, interrupt_id, outcome, reason, plan_digest, detail_json | 8 |
 
-ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，每个 chunk 带 metadata（kind, id, tags）支持过滤检索。
+> **`action_requests` 没有 `status` 列** —— 这不是遗漏，见 §11.3。
 
-设计细节：
+### 11.2 蓝图 vs 实现（未被实现为 SQLite 表的部分）
 
-- `audit_logs` 与 `action_requests` **只 INSERT 不 UPDATE**——状态变化 = 追加新记录（approved 不是把 pending 改掉，而是追加一条 decision 记录）。可变的"历史"不叫审计。
-- `security_events` 保留 `raw` 原始字段——分析可能出错，原始数据永远可回溯。
-- **incident 持久化延后至 Phase 8**：原计划 Phase 7 引入 `incidents` 表，实际 Phase 7 只交付 `ResponsePlan` 结构化契约与规则引擎，计划随 ToolMessage 流转、不落库。incident persistence 与 HITL / checkpoint / audit lifecycle 属同一条状态生命周期，拆开实现会产生两套状态语义，故统一延后到 Phase 8 一次性落地。
+| 蓝图项 | 蓝图字段 | 实际情况 |
+|---|---|---|
+| security_events | ts, src_ip, dst_ip, username, action, status, user_agent, raw | **不是 SQLite 表**：实现为 JSONL 文件 `data/security_events.jsonl`（144 条），按需全量读入内存过滤 |
+| threat_intel | ioc_type, ioc_value, source, confidence, tags | **不是 SQLite 表**：实现为 JSONL 文件 `data/threat_intel.jsonl`（29 条 IOC） |
+| knowledge_docs | kind, key, title, text, metadata | **未实现**（RAG 顺延，见 §14 偏离说明） |
+| checkpoints | 框架自动管理 | 已实现，但用 `InMemorySaver` —— **进程内内存，不落盘**。`langgraph-checkpoint-sqlite` 未安装，所以"崩溃恢复"目前只在进程存活期内成立（跨进程恢复是 Phase 9/10 的事） |
+
+ChromaDB collections（`mitre_techniques` / `cve_entries` / `threat_reports`）：**未创建**（ChromaDB 未引入）。
+
+### 11.3 append-only 事件模型（Phase 8.1 落地）
+
+`audit_logs` 与 `action_requests` **只 INSERT 不 UPDATE** —— 状态变化 = 追加新记录。这不是靠约定，而是靠**数据库强制**。完整的 5 个前提（缺一不可）：
+
+1. **纯 INSERT 写入路径**：store 不提供任何 UPDATE / DELETE / INSERT OR REPLACE 接口；
+2. **`id` 为 PRIMARY KEY**：重复写入抛 `IntegrityError`（响亮失败，不静默覆盖）；
+3. **库层禁改触发器**：每张表 `BEFORE UPDATE` / `BEFORE DELETE` 各一条 `RAISE(ABORT, ...)` —— 绕过应用层直连 `sqlite3` 也改不动（共 6 条触发器）；
+4. **表中不存在可变状态列**：`action_requests` 没有 `status`；
+5. **待审批状态是派生值**：某 `thread_id` 在 `audit_logs` 里没有对应的 `approval.decided` 行 → 仍为 pending。状态是 `NOT EXISTS` 的查询结果，不是被改写的字段。
+
+> **与早期草稿的冲突及修正**：§11 初稿曾把 `action_requests.status(pending/approved/denied/executed)` 列为字段。那与 append-only 原则**直接矛盾** —— 可变状态列意味着"历史"会被原地改写，而可变的"历史"不叫审计。实现按 append-only 落地：**不设 status 列**，状态一律由审计事件推导。
+>
+> 其他细节：`security_events` 保留 `raw` 原始字段（分析可能出错，原始数据永远可回溯）；时间列一律存 **tz-aware UTC ISO8601 文本**（拒绝 naive datetime —— 混入本地时区会让"字典序 == 时间序"这个前提失效，而审计流完全依赖顺序）；读取一律重新过 Pydantic 校验，脏数据在读取边界报错而非静默跳过。
+
+### 11.4 审计词汇表（封闭枚举）
+
+```python
+AuditEvent = Literal[
+    "plan.created", "plan.failed", "policy.evaluated",
+    "approval.requested", "approval.decided", "approval.timeout",
+]
+```
+
+刻意包含**失败事件**（`plan.failed`）：失败若不留痕，"有多少次判定失败、为什么失败"就无从回答（F6「每次工具调用、每个审批决策可查」）。**只记成功的审计是幸存者偏差。**
+
+`plan.failed` 的 `detail` 只含 `indicator` 与 `error_type`，**不记异常 message、不记绝对路径、不记 traceback** —— 审计库里的路径会永久留存，泄露内部目录结构。
+
+> 已知局限（Phase 8，必须文档化，不得掩盖）：
+> - `approval.timeout` 已在词汇表中声明，但**生产代码尚未产生该事件**（超时清理未实现）；
+> - 本阶段**没有身份认证** —— `actor` 只是调用方自称的字符串，**不具备不可否认性**。认证 / 签名留到 Phase 10（或后续引入最小 API key）。
+
+### 11.5 incident 持久化为何延后到 Phase 8（历史决策）
+
+原计划 Phase 7 引入 `incidents` 表，实际 Phase 7 只交付 `ResponsePlan` 结构化契约与规则引擎，计划随 `ToolMessage` 流转、不落库。理由：incident persistence 与 HITL / checkpoint / audit lifecycle 属**同一条状态生命周期**，拆开实现会产生两套状态语义，故统一延后到 Phase 8 一次性落地。Phase 8 已按此执行（见 §11.1）。
+
+
 
 ## 12. Phase Roadmap
 
@@ -365,6 +464,21 @@ ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，�
 
 依赖关系：Phase 3 → 4 → 8 是硬依赖（顺序不能乱）；Phase 5 与 6 可互换；评估集（golden set）从 Phase 2 起开始积累。
 
+### 12.1 实际进度 vs 上表（2026-09-17）
+
+上表是**设计蓝图**，保持不变。实际推进有两处顺序偏离（详见 §14 偏离说明）：
+
+| Phase | 蓝图内容 | 实际状态 |
+|---|---|---|
+| 0-4 | 骨架 / API / 日志 / 工具+ReAct / LangGraph | **已完成** |
+| 5 | 威胁情报 + RAG | **部分完成**：IOC 库与 Exact Match 查询已交付；RAG（CVE / ATT&CK 向量检索）**未实现**，顺延 |
+| 6 | MCP Server | **未按蓝图执行**：该 Phase 实际交付的是 Rule-based Risk Analyzer（提前实现，见 §14）；**MCP Server 整体顺延** |
+| 7 | 风险分析 + 响应规划 | **已完成**（规则引擎侧）：`RiskAssessment` + `ResponsePlan` 纯函数规则引擎 |
+| 8 | 安全层 + HITL | **已完成（8.1-8.5）**：策略引擎 / 审批流 / append-only 审计 / SQLite 持久化 / triage 服务与 API |
+| 9 | 可观测 + 评估 | 未启动 |
+| 10 | 工程化 | 未启动 |
+
+
 ## 13. 待定决策
 
 | # | 事项 | 说明 |
@@ -375,7 +489,7 @@ ChromaDB collections：`mitre_techniques` / `cve_entries` / `threat_reports`，�
 
 ## 14. 实现进度（随开发更新）
 
-> 2026-09-17 · **Phase 0-7 全部完成**（Phase 8 未启动）。最新状态见文末"当前架构快照"。
+> 2026-09-17 · **Phase 0-7 全部完成；Phase 8 已完成（8.1-8.5）**。最新状态见文末"当前架构快照"。
 > 下方按 Phase 顺序记录各阶段的交付物与设计决策。
 
 历史快照（Phase 1-3 时期的调用链，已被 LangGraph 版取代，见文末）：
@@ -477,7 +591,58 @@ OpenAI-compatible LLM
 - 顺手统一 `risk_analyzer.py` 的 intel 路径常量，复用 `query_threat_intel.DEFAULT_DATA_PATH`（原为第三处硬编码）
 - SecurityAgent 默认注册四工具；prompt 第 10 条：优先用规划工具的结构化计划，**是否需要人工审批由工具判定，LLM 不得自行推断**
 - **采用 Tool 方案而非 Node**：graph.py 控制流零改动（tool_map 泛型路由对工具数量零假设），`AgentState` 仍为 2 字段；节点化、interrupt 与 State 扩展统一留到 Phase 8（见偏离说明）
-- 198 tests（当前基线）
+- 198 tests（Phase 7 终态基线）
+
+> 2026-09-17 · Phase 8.1 完成（审计数据模型 + 策略引擎）
+
+- `app/schemas/audit.py`：`AuditRecord`（append-only 流水，写入后不再修改）+ `AuditEvent` 受限枚举 + `SYSTEM_ACTOR`。`plan_digest` 用 `pattern` 校验 64 位小写 sha256 —— 摘要写错会让"计划是否被改动"的比对失效。
+- `app/security/audit.py`：`compute_plan_digest`（规范化 sha256）+ `build_audit_record`（唯一的记录构造入口，统一生成 id / ts）。
+- `app/security/policy.py`：`evaluate_policy(plan) -> PolicyDecision`（`allow` / `require_approval`），`POLICY_VERSION = "phase8.1"`。**策略门永不解析 messages**，只消费结构化的 `ResponsePlan`。
+- 审计词汇表**刻意包含失败事件**：只记成功的审计是幸存者偏差。
+
+> 2026-09-17 · Phase 8.2 完成（SQLite 持久化 + append-only 强制）
+
+- `app/security/store.py`：`SqliteAuditStore`，三张表（incidents / action_requests / audit_logs）+ 索引 + **6 条禁改触发器**。
+- append-only 的 5 个前提全部落实（纯 INSERT / PRIMARY KEY / 库层触发器 / 无可变状态列 / 状态派生），详见 §11.3。
+- 只负责 persistence，**不承担任何判定**：不 import policy、不生成时间、不算 digest、不决定"该不该写"。
+- 时间列一律 tz-aware UTC ISO8601，**拒绝 naive datetime**（混入本地时区会破坏"字典序 == 时间序"）；读取重新过 Pydantic 校验，脏数据在边界报错。
+- 同步 sqlite3 而非 aiosqlite：写入频率极低（一次 triage 个位数行，且不在 ReAct 热循环上），async 是**调用点**的问题而非本模块的问题。
+
+> 2026-09-17 · Phase 8.3 完成（HITL 图：plan / policy_gate / human_approval）
+
+- `app/core/graph.py` 扩展为 5 节点：`agent ⇄ tools` + `plan → policy_gate → human_approval`。HITL 模式下把 `END` 用 `path_map` **重映射到 `plan`**，因此 `should_continue` 的返回值语义不变（控制流零改动）。
+- `interrupt()` 落在 `human_approval` 节点内；`AgentState` 扩到 8 字段（见 §10.2）。
+- **实测确认 interrupt 的重放语义**：`Command(resume=)` 会从被中断节点的**函数体顶部重放** —— `interrupt()` 之前的代码跑两次、之后跑一次（已完成节点不重放）。由此得到铁律：**`interrupt()` 之前不得有任何副作用**。
+- **实测确认框架不校验 `thread_id`**（4 个静默行为）：未知 thread 上 `aget_state()` 返回空快照（不报错）；`Command(resume=)` 会**静默从 START 新起一轮**（看起来像成功）；对已完成的图重复 resume 会**静默返回旧 state**；复用 thread_id 会**覆盖暂停中的 state**（劫持向量）。这些静默行为在 Phase 8.4 被逐一变成明确错误。
+- **实测确认 checkpoint 只序列化异常自身的 repr，不序列化 `__cause__` 链** —— 这条决定了 Phase 8.5 的失败处理写法（见下）。
+
+> 2026-09-17 · Phase 8.4 完成（TriageService + /triage + /resume）
+
+- `app/core/triage.py`：`TriageService.triage()` 生成 `thread_id` → 执行图 → 聚合 `TriageOutcome` → 落 incident（审批路径落 action_requests）；`resume()` 的判定树把框架的 4 个静默行为变成明确错误。
+- 错误模型：`UnknownThreadError`（404 语义）/ `NotAwaitingApprovalError`（409）/ `CheckpointLostError`（继承前者）/ `TriageDataUnavailableError`（503）。
+- `app/api/main.py`：`POST /triage` 与 `POST /resume`（响应体共用 `TriageResponse` = `TriageOutcome` + 传输层 `interrupt_id`）。
+- 安全约束（D 系列，均有结构性或行为级测试守着）：
+  - **D3**：`thread_id` 只能服务端生成 —— 客户端指定即可复用他人暂停中的 state（劫持向量）；
+  - **D7**：`interrupt_id` 只能服务端恢复 —— 客户端能指定就等于能伪造"审批的是哪一次暂停"；`resume()` 签名里没有 `interrupt_id`，服务端自己从 `aget_state().tasks[*].interrupts[*].id` 恢复；
+  - **D2**：单计划源 —— 规划工具（`plan_response_tool`）不进 HITL 工具集，`policy_gate` 只消费 state 里的 `plan`，永不解析 messages；
+  - **D6**：`event_type` 必须声明进 `AgentState` 才能透传（未声明键被静默丢弃，实测确认）；
+  - **D5**：错误消息一律净化 —— 不泄露绝对路径。
+- 465 tests（Phase 8.4 终态基线）。
+
+> 2026-09-17 · Phase 8.5 完成（失败留痕 + 护栏加固 + 文档同步）
+
+本阶段是**收口**性质，不含新功能：
+
+- **plan 失败留痕闭环**：新增 `AuditEvent "plan.failed"`；`plan_node` 用 try/except 包住"采集证据 + 生成计划"，失败时先写一条 append-only 审计（`detail` **只含 `indicator` 与 `error_type`**），再抛**通用消息**的 `PlanFailedError("计划生成失败")`。
+  - 为什么要通用消息：实测确认 LangGraph 会把异常的 repr 写进 checkpoint，若消息里带路径就会**永久留存**。`from exc` 保留因果链供日志使用，但因果链**不进 checkpoint**。
+  - 统一失败映射：`PlanFailedError` → `TriageDataUnavailableError` → HTTP 503。**刻意不做 `cause_type` 分类** —— 那会让"计划失败"长出第二套错误词汇表。
+  - 失败路径**不留业务痕迹**：没有 incident、没有 action_requests、没有 `plan.created`，恰好一条 `plan.failed`。
+- **HITL_TOOLS 护栏加固**：`PLANNER_TOOL_NAME` 从**工具对象**派生（`plan_response_tool.name`）而非手写字符串。原测试是**恒真**的（拿 `HITL_TOOLS` 与自身表达式比较），已重写为身份断言 + AST 结构断言 —— 用变异测试验证过"改回硬编码字面量会变红"。
+- **API DTO extra 策略显式化**：4 个请求 DTO 各自显式声明 `ConfigDict(extra="ignore")`。**行为不变**（不加 `forbid`）—— 在没有 API 版本化机制时，`forbid` 会让任何多发字段的客户端吃 422，兼容成本换不来对应收益；收紧到 `forbid` 留到 Phase 10。
+  - 护栏用 **AST** 判断"是否亲自声明"：pydantic v2 的元类**总会**往类 `__dict__` 里塞 `model_config`，且继承会把父类配置合并下来 —— 所以"在 `__dict__` 里"和"值等于 ignore"两条断言在"靠父类兜底"时**都为真**（实测确认），完全失明。
+- **hermetic 测试收口**：`test_query_threat_intel.py` / `test_tool_schema.py` / `test_react_agent.py` 三个文件不再依赖仓库 `data/`。根因是 `DEFAULT_DATA_PATH` 是**相对路径**，测试从无 `data/` 的 CWD 运行就红；修法是注入 `tmp_path` 现场生成的 seed 数据，**不改生产默认值**。seed 脚本路径统一锚定到仓库根（原为 CWD 相对）。
+- **文档同步**：本节 + §5 路由 / §6 依赖 / §7 结构 / §10 State / §11 数据库与事件模型 / §12 进度 / 快照 / Testing Framework 全部按**实际实现**校正（只改事实漂移，不改设计）。
+- 486 tests（Phase 8.5 终态基线）。验证方式：仓库根全绿；**从无 `data/` 目录的 CWD 运行同样 486 passed**（hermetic 证明）。
 
 ### Implementation Deviation Note（与 §12 Roadmap 的实现偏离说明）
 
@@ -485,44 +650,73 @@ OpenAI-compatible LLM
 
 - **IOC 查询采用 Exact Match 而非 RAG**：IOC（IP/域名/Hash）是唯一标识符，查询语义是等值判断——Embedding 的语义近似性在此恰恰是缺陷（`203.0.113.66` 的向量近邻可能是 `203.0.113.65`，产生假阳性关联），且引入向量库违背精确查找的本质。§3.2 F3 的"RAG 语义检索"适用于 CVE/ATT&CK 知识库（自然语言文档），不适用于 IOC 库；RAG 仍按原计划留给知识库部分。
 - **Risk Analyzer 提前实现**：原 §12 安排在 Phase 7，实际在 Phase 6 前置完成规则侧——因为它的输入（结构化证据）已由 Phase 5 的两个查询工具备齐，且 Rule-based 输出可离线确定性测试，是 Evidence Fusion 的自然收口。Response Planner 已在 Phase 7 补齐规则侧；LLM 风险复核层与计划节点化留给 Phase 8。
-- LangGraph 实际形态（2 节点 + 条件边）比 §9.1 蓝图更小：checkpoint/interrupt/审批节点未引入（Phase 8），`AgentState` 仅 2 字段而非 §10 的 7 字段——蓝图描述终态，实现按最小必要演进。
-- **Response Planner 采用 Tool 而非 Node（Phase 7）**：§9.1 蓝图把它画成 `response_plan` 节点，实际实现为第 4 个工具。原因：Node 需要从 messages 反解 `RiskAssessment` 或在 tools 节点特判风险工具，两者都会侵蚀 graph 的通用性；而 `interrupt()` 必须落在节点内，所以节点化与 State 扩展应和 Phase 8 的 HITL 一起做。Phase 8 的节点可直接复用同一个纯函数 `plan_response()`，不产生返工。
-- **incident 持久化延后（Phase 7 → Phase 8）**：见 §11 说明。Phase 7 不引入数据库，`ResponsePlan` 仅作为结构化输出契约存在，随 ToolMessage 流转；落库与 HITL / checkpoint / audit lifecycle 一起在 Phase 8 实现。
+- LangGraph 实际形态比 §9.1 蓝图更小：蓝图是 7 节点（含 `analyze_request` / `tool_router` / `tool_execute` / `risk_analyze` / `response_plan` / `execute_or_reject`），实际是 5 节点（`agent ⇄ tools` + `plan → policy_gate → human_approval`）。工具路由用 `tool_map` 泛型路由替代 `tool_router` 节点，风险分析与计划生成合并在 `plan` 节点内（规则引擎是纯函数，不需要单独节点）。`AgentState` 为 8 字段而非 §10.1 蓝图的 7 字段（差异原因见 §10.2）。蓝图描述终态，实现按最小必要演进。
+- **Response Planner 采用 Tool 而非 Node（Phase 7）→ 节点化在 Phase 8 落地**：§9.1 蓝图把它画成 `response_plan` 节点，Phase 7 先实现为第 4 个工具（Node 需要从 messages 反解 `RiskAssessment` 或在 tools 节点特判风险工具，两者都会侵蚀 graph 的通用性）。Phase 8.3 按计划把 `plan_response()` 提升为 `plan` 节点 —— **直接复用同一个纯函数，零返工**，验证了当初"等 HITL 一起做"的判断。
+- **incident 持久化延后（Phase 7 → Phase 8）**：见 §11.5。Phase 7 不引入数据库，`ResponsePlan` 仅作为结构化输出契约存在，随 ToolMessage 流转；落库与 HITL / checkpoint / audit lifecycle 一起在 Phase 8 实现（已完成）。
+- **MCP Server 与 RAG 顺延（Phase 5 / 6）**：§12 把 Phase 5 定为"威胁情报 + RAG"、Phase 6 定为"MCP Server"，实际 Phase 5 只交付 IOC Exact Match（理由见上一条），Phase 6 则交付了提前实现的 Rule-based Risk Analyzer。结果是 **RAG 与 MCP Server 两项能力整体顺延**，`ChromaDB` 与 `mcp` 依赖至今未引入。这不是"砍掉"，是排序调整：先做能用规则确定性验证的部分（风险分级 / 响应规划 / HITL 安全层），把依赖外部组件的能力留到后面。
+- **`/approve` 未实现，审批并入 `/resume`**：见 §5 注。审计也**没有读接口** —— `/audit` 未实现，审计写入走 store，读取目前只在测试里通过 `list_audit()` 进行。
 
 ## 当前架构快照（2026-09-17）
 
-> 完成状态：**Phase 0-7 已完成**，Phase 8 未启动。
+> 完成状态：**Phase 0-8.5 已完成**。
 
 ```
 HTTP Client
  ↓
-FastAPI（POST /chat，Pydantic 校验，LLM 错误 → 502）
+FastAPI（POST /chat | POST /triage | POST /resume，Pydantic 校验，
+         LLM 错误 → 502，领域错误 → 404 / 409 / 503）
  ↓
-SecurityAgent（app/core/agent.py：组装 System+Human、构造持有 graph、提取最终回答）
+┌─────────────────────────── /chat ───────────────────────────┐
+│ SecurityAgent（app/core/agent.py：组装 System+Human、        │
+│                构造持有 graph、提取最终回答）                 │
+└─────────────────────────────────────────────────────────────┘
+┌────────────────── /triage & /resume ────────────────────────┐
+│ TriageService（app/core/triage.py：thread_id 生成、          │
+│                outcome 聚合、incident / action_requests 落库、│
+│                resume 校验门把框架的 4 个静默行为变成明确错误）│
+└─────────────────────────────────────────────────────────────┘
  ↓
 LangGraph StateGraph（app/core/graph.py：唯一控制流实现）
    agent 节点（LLM.bind_tools().ainvoke）⇄ tools 节点（tool_map 路由 + 安全错误契约）
-   should_continue 条件边（无 tool_calls / iteration_count ≥ max_iterations → END）
+   should_continue 条件边（无 tool_calls / iteration_count ≥ max_iterations）
+   HITL 分支：plan → policy_gate → human_approval（interrupt）→ END
+   （HITL 模式把 END 经 path_map 重映射到 plan，should_continue 语义不变）
  ↓
 Tool layer（纯函数核心 + @tool wrapper 分层）：
    query_security_logs（144 条日志）/ query_threat_intel（29 条 IOC，Exact Match）/
-   analyze_risk（风险规则引擎）/ plan_response（处置规划规则引擎）
+   analyze_risk（风险规则引擎）/ plan_response（处置规划规则引擎，同时被 plan 节点复用）
  ↓
 Structured evidence（messages 按 reducer 顺序累积：LogToolMsg → IntelToolMsg → RiskToolMsg → PlanToolMsg）
  ↓
 LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终回答）
+ ↓
+安全层（app/security/，横切）
+   policy.py  evaluate_policy(plan) → allow / require_approval（永不解析 messages）
+   audit.py   compute_plan_digest / build_audit_record
+   store.py   SqliteAuditStore：incidents / action_requests / audit_logs
+              append-only（纯 INSERT + PRIMARY KEY + 6 条禁改触发器 + 无状态列 + 状态派生）
+ ↓
+持久化：SQLite（业务表 + 审计，append-only）
+        checkpoint = InMemorySaver（进程内内存，**不落盘**）
 ```
 
 - 默认注册工具：`app.tools.DEFAULT_TOOLS` = `[query_security_logs_tool, query_threat_intel_tool, analyze_risk_tool, plan_response_tool]`（单一真相源，agent 与 graph 共用），graph 对工具数量零假设（加工具 = 加 map 条目，控制流不变）
-- 测试基线：198 passed，全部离线（FakeLLMClient / FakeChatModel / ScriptedTraceModel 模式，无真实 API 调用）
+- **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
+- 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided`（`approval.timeout` 已声明但尚未产生）
+- 测试基线：**486 passed**，全部离线（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`，无真实 API 调用）；**从无 `data/` 目录的 CWD 运行同样 486 passed**（hermetic）
 
 ## 尚未实现（按 §12 Roadmap）
 
-- RAG / 知识库（CVE、ATT&CK）——Phase 5 剩余部分，检索对象是自然语言文档，与 IOC Exact Match 不冲突
-- MCP Server——原 Phase 6（现顺延）
-- Response Planner 节点化 / LLM 风险复核层——Phase 8（`interrupt()` 必须落在节点内，与 HITL 同步引入）
-- incident 持久化 / HITL / 安全层 / 审批流——Phase 8（checkpoint / interrupt / audit lifecycle 同步引入）
+- RAG / 知识库（CVE、ATT&CK）——Phase 5 剩余部分，检索对象是自然语言文档，与 IOC Exact Match 不冲突（ChromaDB 未引入）
+- MCP Server——原 Phase 6，整体顺延（`mcp` 未引入）
+- LLM 风险复核层——Phase 8 只做了规则侧；LLM 复核未实现
+- 审批超时清理——`approval.timeout` 事件已声明，但**没有超时触发机制**（需后台任务或惰性检查）
+- 跨进程 checkpoint 恢复——当前 `InMemorySaver` 只在进程存活期内有效（`langgraph-checkpoint-sqlite` 未安装）
+- 失败 thread 的 checkpoint 清理——失败的 thread 会留在内存里
+- 身份认证 / 不可否认性——`actor` 只是自称字符串（Phase 10）
+- 审计读接口（`/audit`）——未实现
 - Observability / Evaluation——Phase 9
+
 
 ## Testing Framework
 
@@ -542,14 +736,35 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - 工具结果：JSON 格式，包含 count 和 events，不暴露内部细节
 - 终止条件：达到 max_iterations 时返回明确信息，为后续 Evaluation 和 Observability 做准备
 
-### 4. 测试分层
+### 4. 结构性护栏（Phase 8 起大量使用）
+
+行为断言挡不住"今天写对了、明天漂移了"。对**不变式**（而非功能）用两种更强的断言：
+
+- **AST 断言**：直接解析源码语法树，断言结构而非行为。例：`PLANNER_TOOL_NAME` 的赋值右侧必须是属性访问（`ast.Attribute`）而非字符串常量；`_audit_plan_failed` 内不得出现 `str` / `repr` / `traceback` / `.args` 调用；请求 DTO 的类体里必须**亲自**出现 `model_config` 赋值。
+  - 注意 AST 的坑：带注解的赋值是 `ast.AnnAssign` 而非 `ast.Assign`；`ast.dump` 里查字符串会误匹配文档字符串之外的文本。这类护栏本身也需要被验证。
+- **变异测试**：临时把生产代码改坏（改回硬编码字面量 / 删掉审计写入 / 把通用消息换成 f-string 拼接异常），确认护栏**变红**，然后还原。没有这一步，护栏可能只是恒真断言 —— 本阶段就抓到过两条这样的护栏（见 §14 Phase 8.5）。
+
+### 5. 测试分层
 
 | 目录 | 覆盖对象 |
 |---|---|
-| `tests/test_api/` | FastAPI 路由、错误码、消息透传 |
-| `tests/test_core/` | agent / graph / llm / config / tool schema / evidence fusion / risk 集成 / response 集成 |
-| `tests/test_schemas/` | LogEvent / ThreatIntelRecord / RiskAssessment / ResponsePlan 的校验边界、seed 可复现 |
+| `tests/test_api/` | FastAPI 路由、错误码、消息透传、DTO 契约 |
+| `tests/test_core/` | agent / graph / HITL 图 / llm / config / tool schema / evidence fusion / risk 集成 / response 集成 / triage service |
+| `tests/test_schemas/` | LogEvent / ThreatIntelRecord / RiskAssessment / ResponsePlan / ApprovalRequest / AuditRecord 的校验边界、seed 可复现、API DTO 策略 |
+| `tests/test_security/` | 策略引擎 / 审计记录构造 / append-only store（含"源码里无 UPDATE/DELETE"的结构护栏） |
 | `tests/test_tools/` | 四个工具核心函数的过滤、排序、规则分支与错误契约 |
 
-当前基线：**198 passed**（`pytest -q`，2026-09-17）。
-`test_response_integration.py` 用 `tmp_path` 现场生成数据文件，不依赖 `data/*.jsonl`（该目录被 gitignore，新克隆下不存在），是可重复的离线测试。
+当前基线：**486 passed**（`pytest -q`，2026-09-17）。
+
+### 6. hermetic 约束（Phase 8.5 收口）
+
+**全部 29 个测试文件都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
+
+```bash
+cd <任意不含 data/ 的目录>
+<python> -m pytest <repo>/tests -q      # 期望:486 passed
+```
+
+根因说明：生产默认值 `DEFAULT_DATA_PATH` 是**相对路径**（`data/security_events.jsonl`），相对 CWD 解析 —— 这是**生产行为的正确设计**（部署时以启动目录为基准），但会让测试在换 CWD 时红。所以修的是**测试**（注入 `tmp_path` 现场生成的 seed 数据），不是生产默认值。
+
+同类约定：seed 脚本路径统一用 `Path(__file__).resolve().parents[2] / "scripts" / ...` 锚定仓库根，不写 CWD 相对路径；需要审计库的用例注入 `tmp_path/audit.db`，仓库里不产生 `audit.db`。

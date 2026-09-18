@@ -15,13 +15,27 @@ Phase 8.4 增加了 triage / resume 的契约。两条**刻意缺席**的字段:
         服务端从 checkpoint 恢复它(D7)。客户端能指定 interrupt_id
         就等于能伪造"审批的是哪一次暂停"。
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.approval import ApprovalStatus, TriageOutcome
+
+# 请求 DTO 的未知字段策略(Phase 8.5):**显式**声明为 ignore。
+#
+# 为什么显式:ignore 本来就是 Pydantic 的默认值,不写也生效 —— 但"没写"
+# 意味着这个策略**没人决定过**,下一个 DTO 作者无从判断它是有意还是疏忽。
+# 写出来,策略就从隐式默认变成可评审的决定。
+#
+# 为什么是 ignore 而不是 forbid:服务端自己生成 thread_id(D3),客户端多发
+# 一个 thread_id 不影响执行;而 forbid 会让任何多发字段的客户端收到 422 ——
+# 在没有 API 版本化机制时,这个兼容成本换不来对应的安全收益。
+# 收紧到 forbid 留到 Phase 10(有认证与版本化之后)。
+_REQUEST_EXTRA = ConfigDict(extra="ignore")
 
 
 class ChatRequest(BaseModel):
     """POST /chat 的请求体。"""
+
+    model_config = _REQUEST_EXTRA
 
     message: str = Field(min_length=1, description="用户输入的自然语言消息")
 
@@ -38,6 +52,8 @@ class TriageRequest(BaseModel):
     刻意不含 thread_id(见模块 docstring)。
     """
 
+    model_config = _REQUEST_EXTRA
+
     indicator: str = Field(
         min_length=1, description="判定对象(IP / 域名 / Hash)"
     )
@@ -48,6 +64,8 @@ class TriageRequest(BaseModel):
 
 class ApprovalDecisionRequest(BaseModel):
     """人工审批的决定字段(不含 thread_id,由 ResumeRequest 组合)。"""
+
+    model_config = _REQUEST_EXTRA
 
     status: ApprovalStatus = Field(description="决定:approved / denied")
     operator: str = Field(min_length=1, description="审批人标识")
@@ -61,6 +79,10 @@ class ResumeRequest(ApprovalDecisionRequest):
     服务端会用校验门确认它确实停在待审批状态(未知 → 404,已完成 /
     checkpoint 丢失 → 409),不会静默从 START 重跑一轮。
     """
+
+    # 父类已声明 extra 策略;此处再写一次是刻意的:策略必须在每个请求 DTO
+    # 上肉眼可见,不能靠"读者去追继承链"。
+    model_config = _REQUEST_EXTRA
 
     thread_id: str = Field(min_length=1, description="triage 返回的 thread_id")
 

@@ -12,6 +12,8 @@
 - message 顺序正确性
 """
 import json
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -31,6 +33,25 @@ from langchain_openai import ChatOpenAI
 from app.core.agent import SecurityAgent
 from app.core.llm import FakeLLMClient
 from app.tools.query_logs import query_security_logs_tool
+
+# 锚定仓库根:seed 脚本用相对路径会随 CWD 变化。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(scope="module")
+def logs_data(tmp_path_factory) -> Path:
+    """hermetic 日志数据:跑 seed_logs.py 生成到 tmp_path。
+
+    只有**真正读文件**的用例需要它(如 test_tool_wrapper_basic);
+    参数校验类用例(limit=0)在读取前就抛错,不依赖数据文件。
+    """
+    out = tmp_path_factory.mktemp("logs") / "security_events.jsonl"
+    result = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "scripts" / "seed_logs.py"), str(out)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return out
 
 
 class FakeChatModel:
@@ -468,12 +489,12 @@ class TestReactAgent:
 class TestToolWrapper:
     """测试工具包装器的功能。"""
     
-    def test_tool_wrapper_basic(self):
+    def test_tool_wrapper_basic(self, logs_data):
         """测试工具包装器基本功能。"""
         from app.tools.query_logs import query_security_logs
         
         # 直接调用核心查询函数
-        events = query_security_logs(limit=2)
+        events = query_security_logs(limit=2, data_path=logs_data)
         assert len(events) >= 0
         assert isinstance(events, list)
         for event in events:

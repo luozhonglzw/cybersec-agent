@@ -23,8 +23,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+# 审计词汇表。刻意包含**失败事件**(plan.failed):失败若不留痕,
+# "有多少次判定失败、为什么失败"就无从回答(F6「每次工具调用、每个审批
+# 决策可查」)。失败事件与成功事件同等重要 —— 只记成功的审计是幸存者偏差。
 AuditEvent = Literal[
     "plan.created",
+    "plan.failed",
     "policy.evaluated",
     "approval.requested",
     "approval.decided",

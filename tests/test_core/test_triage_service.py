@@ -173,6 +173,13 @@ def _incident_rows(db_path: Path) -> list[dict]:
         return [dict(row) for row in conn.execute("SELECT * FROM incidents")]
 
 
+def _action_rows(db_path: Path) -> list[dict]:
+    """直接读 action_requests 表(同样没有读接口)。"""
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute("SELECT * FROM action_requests")]
+
+
 # =====================================================================
 # A. triage() 发起与沉淀
 # =====================================================================
@@ -307,11 +314,40 @@ async def test_triage_missing_logs_raises_data_unavailable(tmp_path, store):
         await service.triage(BRUTE_FORCE_IP)
 
 
+async def test_plan_failure_writes_exactly_one_plan_failed(tmp_path, store, db_path):
+    """失败路径必须留痕:恰好一条 plan.failed。
+
+    只记成功的审计是幸存者偏差 —— "判定失败了多少次、为什么失败"必须可查。
+    同时验证失败**不留业务痕迹**:没有 incident、没有 action_requests、
+    没有 plan.created(否则会把"没判定成功"记成"判定成功")。
+    """
+    intel = tmp_path / "threat_intel.jsonl"
+    _write_intel(intel)
+    service = _service(store, tmp_path / "missing.jsonl", intel, InMemorySaver())
+
+    with pytest.raises(TriageDataUnavailableError):
+        await service.triage(BRUTE_FORCE_IP)
+
+    records = store.list_audit()
+    assert [r.event for r in records] == ["plan.failed"]
+
+    failed = records[0]
+    assert failed.actor == "system"
+    assert failed.outcome == "failed"
+    assert failed.detail == {
+        "indicator": BRUTE_FORCE_IP,
+        "error_type": "FileNotFoundError",
+    }
+    assert _incident_rows(db_path) == []
+    assert _action_rows(db_path) == []
+
+
 async def test_triage_data_error_message_is_sanitized(tmp_path, store):
-    """错误消息不得泄露绝对路径。
+    """错误消息与审计 detail 都不得泄露绝对路径。
 
     collect_evidence 抛出的 FileNotFoundError 消息里含部署路径,
-    直接回传等于把内部目录结构告诉客户端。
+    直接回传等于把内部目录结构告诉客户端;审计 detail 若照抄异常文本,
+    等于把路径永久写进库 —— 两处都要挡。
     """
     intel = tmp_path / "threat_intel.jsonl"
     _write_intel(intel)
@@ -325,6 +361,13 @@ async def test_triage_data_error_message_is_sanitized(tmp_path, store):
     assert str(missing) not in message
     assert str(tmp_path) not in message
     assert "/" not in message and "\\" not in message
+
+    # 审计 detail 是自包含取证负载 —— 同样不能夹带路径或异常原文
+    detail = store.list_audit(event="plan.failed")[0].detail
+    assert set(detail) == {"indicator", "error_type"}
+    assert not any(
+        isinstance(v, str) and ("\\" in v or "/" in v) for v in detail.values()
+    )
 
 
 # =====================================================================

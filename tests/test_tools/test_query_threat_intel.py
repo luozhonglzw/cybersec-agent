@@ -1,8 +1,11 @@
 """query_threat_intel 工具测试:纯函数 + LangChain wrapper + Phase 2 关联。
 
-全部离线:查询的是 scripts/seed_threat_intel.py 生成的固定数据。
+全部离线且 hermetic:数据由 scripts/ 下的 seed 脚本现场生成到 tmp_path,
+不读仓库 data/ —— 脚本路径锚定到仓库根,不依赖当前工作目录。
 """
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,23 +16,43 @@ from app.tools.query_threat_intel import (
     query_threat_intel_tool,
 )
 
-SEED_SCRIPT = Path("scripts/seed_threat_intel.py")
+# 锚定仓库根:相对路径会随 CWD 变化,在仓库外跑 pytest 就找不到脚本。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+SEED_SCRIPT = _REPO_ROOT / "scripts" / "seed_threat_intel.py"
+SEED_LOGS_SCRIPT = _REPO_ROOT / "scripts" / "seed_logs.py"
+
 BRUTE_FORCE_IP = "203.0.113.66"       # Phase 2 SSH brute force 攻击者
 EVIL_DOMAIN = "evil-example.com"
 MALWARE_HASH = "a" * 64               # seed 中的"恶意样本 #1"
 TRUSTED_DOMAIN = "trusted-example.com"
 
 
+def _run_seed(script: Path, out: Path) -> None:
+    """跑 seed 脚本生成数据文件;失败时把 stderr 带进断言消息。"""
+    result = subprocess.run(
+        [sys.executable, str(script), str(out)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.fixture(scope="module")
 def intel_data(tmp_path_factory) -> Path:
     """运行 seed 脚本生成模块级共享的临时数据文件(保证可重复、离线)。"""
     out = tmp_path_factory.mktemp("intel") / "threat_intel.jsonl"
-    import subprocess, sys
-    result = subprocess.run(
-        [sys.executable, str(SEED_SCRIPT), str(out)],
-        capture_output=True, text=True,
-    )
-    assert result.returncode == 0, result.stderr
+    _run_seed(SEED_SCRIPT, out)
+    return out
+
+
+@pytest.fixture(scope="module")
+def logs_data(tmp_path_factory) -> Path:
+    """Phase 2 日志的 hermetic 版本:同一 seed 脚本产出到 tmp_path。
+
+    关联测试需要"日志 + 情报"两份数据;日志侧也必须走临时文件,
+    否则测试会隐式依赖仓库 data/ 的存在(CWD 一变就红)。
+    """
+    out = tmp_path_factory.mktemp("logs") / "security_events.jsonl"
+    _run_seed(SEED_LOGS_SCRIPT, out)
     return out
 
 
@@ -161,7 +184,7 @@ def test_wrapper_schema_params():
 
 # ---------- Phase 2 关联验证 ----------
 
-def test_phase2_brute_force_ip_cross_reference(intel_data):
+def test_phase2_brute_force_ip_cross_reference(intel_data, logs_data):
     """Phase 2 日志中的攻击 IP 203.0.113.66 能查到对应威胁情报。
 
     这是"log evidence + threat intel evidence"关联能力的地基:
@@ -171,7 +194,7 @@ def test_phase2_brute_force_ip_cross_reference(intel_data):
     # 1. Phase 2 日志数据中确实存在该攻击 IP 的 login_failed 事件
     from app.tools.query_logs import query_security_logs
     log_events = query_security_logs(
-        source_ip=BRUTE_FORCE_IP, event_type="login_failed"
+        source_ip=BRUTE_FORCE_IP, event_type="login_failed", data_path=logs_data
     )
     assert len(log_events) > 0, "Phase 2 日志中应存在该 IP 的失败登录"
 
@@ -189,13 +212,8 @@ def test_seed_data_reproducible(tmp_path):
     """seed 脚本两次运行输出逐字节一致(可复现性)。"""
     out1 = tmp_path / "a.jsonl"
     out2 = tmp_path / "b.jsonl"
-    import subprocess, sys
     for out in (out1, out2):
-        result = subprocess.run(
-            [sys.executable, str(SEED_SCRIPT), str(out)],
-            capture_output=True, text=True,
-        )
-        assert result.returncode == 0, result.stderr
+        _run_seed(SEED_SCRIPT, out)
     assert out1.read_bytes() == out2.read_bytes()
 
 
