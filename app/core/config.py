@@ -8,6 +8,7 @@
 任何模块都不直接读 os.environ —— 全部通过 Settings。
 """
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -33,6 +34,13 @@ class Settings(BaseSettings):
     llm_model: str = Field(min_length=1)     # 必填:缺失/空串 → ValidationError
     llm_base_url: str | None = None          # None = 用 SDK 默认地址
     llm_api_key: SecretStr = Field(min_length=1)
+
+    # ---- 审计(Phase 8.4 D5)----
+    # 只加这一个路径。logs_path / intel_path 刻意**不进 Settings**:
+    # 它们已经由工具层持有默认值(app.tools.*.DEFAULT_DATA_PATH),测试通过
+    # HitlConfig 注入 tmp_path。再放一份到 Settings 就会出现第二个真相源,
+    # 且会让"测试是否 hermetic"取决于环境变量。
+    audit_db_path: Path = Path("data/audit.db")
 
 
 @lru_cache

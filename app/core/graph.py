@@ -129,6 +129,10 @@ class AgentState(TypedDict, total=False):
     ---- Phase 8.3(HITL 安全层)----
     indicator: 判定对象(IP/域名/Hash),由调用方给出。缺失时 plan 节点跳过,
               整条 HITL 链路自动短路 —— 自由对话(chat)因此不需要另建一张图。
+    event_type: 可选的日志事件类型过滤(如 "login_failed"),由调用方给出,
+              透传给 collect_evidence。**必须在此声明**:LangGraph 对未声明的
+              初始 state 键是静默丢弃的(实测确认:ainvoke 传了也不报错,
+              但节点里读不到),所以"调用方能传"就等于"这里必须有字段"。
     plan: 规则引擎产出的**权威**处置计划。刻意与 messages 里可能存在的
           ToolMessage 计划分开:那个是给 LLM 叙事用的上下文,这个才是
           policy_gate 消费的对象。策略门永不解析 messages。
@@ -143,6 +147,7 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     iteration_count: int
     indicator: str
+    event_type: str | None
     plan: ResponsePlan | None
     policy_decision: PolicyDecision | None
     approval_request: ApprovalRequest | None
@@ -187,9 +192,10 @@ def _make_plan_node(hitl: HitlConfig):
             # 下游 policy_gate 会因 plan is None 一并短路,整条 HITL 链路跳过。
             return {}
 
+        # event_type 由调用方经 state 透传(D6);缺失即 None,与旧行为一致
         evidence = collect_evidence(
             indicator,
-            None,
+            state.get("event_type"),
             hitl.logs_path if hitl.logs_path is not None else LOGS_DATA_PATH,
             hitl.intel_path if hitl.intel_path is not None else INTEL_DATA_PATH,
         )

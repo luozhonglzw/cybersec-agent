@@ -39,9 +39,10 @@ def test_graph_builds_and_contains_nodes():
 def test_agent_state_schema():
     """AgentState 的字段集是**精确**约定的:多一个少一个都算契约变更。
 
-    Phase 8.3 有意扩展了 5 个 HITL 字段(见 app/core/graph.py 的 AgentState
-    docstring)。这里保留精确断言而不是放宽成 `<=`,是为了让任何未来的
-    字段增删都必须**有意**改这一行,而不是悄悄通过。
+    Phase 8.3 有意扩展了 5 个 HITL 字段,Phase 8.4(D6)又加了 event_type
+    (见 app/core/graph.py 的 AgentState docstring)。这里保留精确断言而不是
+    放宽成 `<=`,是为了让任何未来的字段增删都必须**有意**改这一行,
+    而不是悄悄通过。
     """
     assert set(AgentState.__annotations__.keys()) == {
         # 基础字段(Phase 4,勿删)
@@ -53,6 +54,8 @@ def test_agent_state_schema():
         "policy_decision",
         "approval_request",
         "approval_decision",
+        # 调用方透传字段(Phase 8.4 D6)
+        "event_type",
     }
 
 

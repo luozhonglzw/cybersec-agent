@@ -593,6 +593,6 @@ def test_state_annotation_set_is_exact():
     """与 test_graph.py 的契约断言互为呼应(此处再锁一次,防止只改一处)。"""
     assert set(AgentState.__annotations__.keys()) == {
         "messages", "iteration_count",
-        "indicator", "plan", "policy_decision",
+        "indicator", "event_type", "plan", "policy_decision",
         "approval_request", "approval_decision",
     }

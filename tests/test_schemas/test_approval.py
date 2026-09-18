@@ -199,12 +199,30 @@ def test_triage_outcome_pending_without_request_rejected():
         TriageOutcome(thread_id="thread-abc", status="pending_approval")
 
 
-def test_triage_outcome_completed_with_request_rejected():
-    with pytest.raises(ValidationError, match="approval_request"):
-        TriageOutcome(
-            thread_id="thread-abc", status="completed",
-            approval_request=_request(),
-        )
+def test_triage_outcome_completed_with_request_allowed():
+    """Phase 8.4 D2:校验从"当且仅当"放宽为单向蕴含。
+
+    completed + approval_request 是 /resume 的**唯一合法终态**:
+    审批已走完,但"批的是什么"必须留在响应里(留痕依据)。
+    旧的双向校验会把它判为非法,导致 resume 无法表达结果。
+    """
+    o = TriageOutcome(
+        thread_id="thread-abc", status="completed",
+        approval_request=_request(),
+        approval=ApprovalDecision(
+            status="approved", operator="analyst-1", interrupt_id="int-001",
+        ),
+    )
+    assert o.status == "completed"
+    assert o.approval_request is not None
+    assert o.approval is not None
+
+
+def test_triage_outcome_completed_without_request_still_allowed():
+    """反向的"什么都没有"仍然是合法终态(未触发审批的 allow 路径)。"""
+    o = TriageOutcome(thread_id="thread-abc", status="completed")
+    assert o.approval_request is None
+    assert o.approval is None
 
 
 def test_triage_outcome_rejects_invalid_status():

@@ -8,8 +8,11 @@
 设计原则:
 - status 用 Literal 受限枚举:approved / denied 是封闭集合,"maybe" 这类
   中间态不存在;审批要么通过要么拒绝,没有第三种;
-- TriageOutcome 的 approval_request 与 status 必须同进同退(模型自校验):
-  pending_approval 却没有待审请求 = 客户端拿到一个无法操作的响应;
+- TriageOutcome 的 approval_request 与 status 是**单向蕴含**(Phase 8.4 D2):
+  pending_approval ⇒ 必须有 approval_request,否则客户端拿到一个无法操作的
+  响应;反向**不禁止** —— resume 之后的终态必须是
+  completed + approval_request(审批依据留痕)+ approval(人工决定),
+  用"当且仅当"会把这个唯一合法的终态判为非法,导致 /resume 无法表达结果;
 - 所有时间字段用 tz-aware UTC,与 LogEvent / ThreatIntelRecord 一致。
 
 安全约束(勿改):
@@ -88,8 +91,12 @@ class TriageOutcome(BaseModel):
 
     @model_validator(mode="after")
     def _validate_pending(self) -> "TriageOutcome":
-        if (self.status == "pending_approval") != (self.approval_request is not None):
-            raise ValueError(
-                "approval_request 必须当且仅当 status=pending_approval 时存在"
-            )
+        """单向蕴含:pending_approval ⇒ approval_request 存在(Phase 8.4 D2)。
+
+        刻意**不**禁止 completed + approval_request:审批走完之后,
+        approval_request 是"批的是什么"的留痕依据,approval 是"谁批的",
+        两者都要留在响应里。旧的双向校验会把 resume 的终态判为非法。
+        """
+        if self.status == "pending_approval" and self.approval_request is None:
+            raise ValueError("status=pending_approval 时必须给出 approval_request")
         return self
