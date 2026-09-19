@@ -565,7 +565,7 @@ OpenAI-compatible LLM
 
 - **5.1 数据层与工具**：
   - `app/schemas/threat_intel.py`：ThreatIntelRecord（indicator / indicator_type(ip/domain/hash) / malicious / confidence 0-100 / severity / tags / source / first_seen / last_seen）
-  - `scripts/seed_threat_intel.py`：固定 seed + 固定时间，29 条 IOC（恶意 IP 11 / 域名 8 / Hash 6 / 可信对照 4），与 Phase 2 攻击场景对应（203.0.113.66）
+  - `scripts/seed_threat_intel.py`：固定 seed + 固定时间，29 条 IOC（恶意 IP 10 / 域名 8 / Hash 6 / 可信对照 5），与 Phase 2 攻击场景对应（203.0.113.66）
   - `app/tools/query_threat_intel.py`：**Exact Match 查询**（见下方 Roadmap 偏离说明）+ @tool wrapper（found/not-found/error 三种 JSON 契约）
   - 跨数据集关联测试：Phase 2 日志中的攻击 IP 可在情报库精确命中（Evidence Fusion 的数据地基）
 - **5.2 多工具串联**：SecurityAgent 默认注册双工具；prompt 增加融合指导（发现 IOC → 可查情报 → 综合证据并说明来源）；messages 是唯一证据容器，**未新增 State 字段**——日志 ToolMessage 与情报 ToolMessage 按 reducer 顺序自然进入 LLM 上下文
@@ -728,7 +728,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - 默认注册工具：`app.tools.DEFAULT_TOOLS` = `[query_security_logs_tool, query_threat_intel_tool, analyze_risk_tool, plan_response_tool]`（单一真相源，agent 与 graph 共用），graph 对工具数量零假设（加工具 = 加 map 条目，控制流不变）
 - **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
 - 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided` / `approval.timeout` —— 6 个全部有生产写入路径（`approval.timeout` 由 Phase 9.1-A 的惰性超时补齐）
-- 测试基线：**522 passed**，全部离线（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`，无真实 API 调用）；**从无 `data/` 目录的 CWD 运行同样 522 passed**（hermetic）
+- 测试基线：**601 passed**，全部离线（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`，无真实 API 调用）；**从无 `data/` 目录的 CWD 运行同样 601 passed**（hermetic）
 
 ## 尚未实现（按 §12 Roadmap）
 
@@ -780,15 +780,15 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 | `tests/test_security/` | 策略引擎 / 审计记录构造 / append-only store（含"源码里无 UPDATE/DELETE"的结构护栏） |
 | `tests/test_tools/` | 四个工具核心函数的过滤、排序、规则分支与错误契约 |
 
-当前基线：**522 passed**（`pytest -q`，2026-09-19）。
+当前基线：**601 passed**（`pytest -q`，2026-09-19）。
 
 ### 6. hermetic 约束（Phase 8.5 收口）
 
-**全部 30 个测试文件都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
+**全部 35 个测试文件都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
 
 ```bash
 cd <任意不含 data/ 的目录>
-<python> -m pytest <repo>/tests -q      # 期望:522 passed
+<python> -m pytest <repo>/tests -q      # 期望:601 passed
 ```
 
 根因说明：生产默认值 `DEFAULT_DATA_PATH` 是**相对路径**（`data/security_events.jsonl`），相对 CWD 解析 —— 这是**生产行为的正确设计**（部署时以启动目录为基准），但会让测试在换 CWD 时红。所以修的是**测试**（注入 `tmp_path` 现场生成的 seed 数据），不是生产默认值。

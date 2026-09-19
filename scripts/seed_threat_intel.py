@@ -30,7 +30,7 @@ DEFAULT_OUTPUT = Path("data/threat_intel.jsonl")
 
 
 def _records() -> list[ThreatIntelRecord]:
-    """手工构造 30 条固定 IOC 记录(不依赖 now(),时间从 FIRST_SEEN 偏移)。"""
+    """手工构造 29 条固定 IOC 记录(不依赖 now(),时间从 FIRST_SEEN 偏移)。"""
     def rec(offset_hours: int, **kw) -> ThreatIntelRecord:
         seen = FIRST_SEEN + timedelta(hours=offset_hours)
         return ThreatIntelRecord(
