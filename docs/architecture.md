@@ -129,7 +129,7 @@ LLM 只能产生：
 └─────────────────────────────────────────────┘
 ```
 
-> 注：上图与 §7 目录描述的是**终态蓝图**。截至 2026-09-17 的实际实现：编排层为单文件 `app/core/graph.py`（未创建 `app/graph/` 包）；`app/security/` 已创建（policy / audit / store）；`app/rag/`、`app/knowledge/`、`app/evaluation/`、`mcp_server/`、`docker/` 尚未创建。
+> 注：上图与 §7 目录描述的是**终态蓝图**。截至 2026-09-19 的实际实现：编排层为单文件 `app/core/graph.py`（未创建 `app/graph/` 包）；`app/security/` 已创建（policy / audit / store）；`app/rag/`、`app/knowledge/`、`app/evaluation/`、`mcp_server/`、`docker/` 尚未创建。
 >
 > **路由命名的实现偏离**：蓝图写 `/chat /approve /audit`，实际实现为 `/chat /triage /resume`。审批不是独立端点——审批决定（`status` + `operator`）是 `/resume` 的请求载荷，与恢复句柄 `thread_id` 一起构成一次完整的恢复请求，拆成两个端点会引入"审批了但没恢复"的中间态。审计目前**没有读接口**（`/audit` 未实现），审计写入走 `app/security/store.py`。
 
@@ -224,7 +224,7 @@ cybersec-agent/
 - mcp_server/ 放顶层：MCP Server 是独立进程入口，生命周期与 API 服务不同。
 - schemas/ 独立成包：Pydantic 模型被 tools、graph、api、knowledge 同时引用，单独放置避免循环 import。
 
-### 7.1 当前实际结构（2026-09-17）
+### 7.1 当前实际结构（2026-09-19）
 
 蓝图中的目录并非全部已创建。实际存在的是：
 
@@ -417,7 +417,9 @@ ChromaDB collections（`mitre_techniques` / `cve_entries` / `threat_reports`）�
 2. **`id` 为 PRIMARY KEY**：重复写入抛 `IntegrityError`（响亮失败，不静默覆盖）；
 3. **库层禁改触发器**：每张表 `BEFORE UPDATE` / `BEFORE DELETE` 各一条 `RAISE(ABORT, ...)` —— 绕过应用层直连 `sqlite3` 也改不动（共 6 条触发器）；
 4. **表中不存在可变状态列**：`action_requests` 没有 `status`；
-5. **待审批状态是派生值**：某 `thread_id` 在 `audit_logs` 里没有对应的 `approval.decided` 行 → 仍为 pending。状态是 `NOT EXISTS` 的查询结果，不是被改写的字段。
+5. **待审批状态是派生值**：某 `thread_id` 在 `audit_logs` 里既没有对应的 `approval.decided`、也没有 `approval.timeout` 行 → 仍为 pending。状态是 `NOT EXISTS` 的查询结果，不是被改写的字段。
+   - Phase 9.1-A 起有**两个终态事件**（人工决定 / 审批超时）。超时若不解除 pending，已过期的 thread 会每轮惰性清理都重复写一条 `approval.timeout` —— 审计是事实日志，重复计数就是失真。
+   - 谓词只回答"是否已有终态事件"，**不做超时判定**（谁算过期由 `TriageService` 持有 `approval_timeout` 决定），职责边界不混。
 
 > **与早期草稿的冲突及修正**：§11 初稿曾把 `action_requests.status(pending/approved/denied/executed)` 列为字段。那与 append-only 原则**直接矛盾** —— 可变状态列意味着"历史"会被原地改写，而可变的"历史"不叫审计。实现按 append-only 落地：**不设 status 列**，状态一律由审计事件推导。
 >
@@ -436,9 +438,9 @@ AuditEvent = Literal[
 
 `plan.failed` 的 `detail` 只含 `indicator` 与 `error_type`，**不记异常 message、不记绝对路径、不记 traceback** —— 审计库里的路径会永久留存，泄露内部目录结构。
 
-> 已知局限（Phase 8，必须文档化，不得掩盖）：
-> - `approval.timeout` 已在词汇表中声明，但**生产代码尚未产生该事件**（超时清理未实现）；
+> 已知局限（必须文档化，不得掩盖）：
 > - 本阶段**没有身份认证** —— `actor` 只是调用方自称的字符串，**不具备不可否认性**。认证 / 签名留到 Phase 10（或后续引入最小 API key）。
+> - `audit_logs.incident_id` 对图节点与 `approval.timeout` 均为 `NULL`（incident 在图跑完之后才创建，D4）；按 incident 查审计流查不到本次判定，须改用 `thread_id`。
 
 ### 11.5 incident 持久化为何延后到 Phase 8（历史决策）
 
@@ -464,7 +466,7 @@ AuditEvent = Literal[
 
 依赖关系：Phase 3 → 4 → 8 是硬依赖（顺序不能乱）；Phase 5 与 6 可互换；评估集（golden set）从 Phase 2 起开始积累。
 
-### 12.1 实际进度 vs 上表（2026-09-17）
+### 12.1 实际进度 vs 上表（2026-09-19）
 
 上表是**设计蓝图**，保持不变。实际推进有两处顺序偏离（详见 §14 偏离说明）：
 
@@ -475,7 +477,7 @@ AuditEvent = Literal[
 | 6 | MCP Server | **未按蓝图执行**：该 Phase 实际交付的是 Rule-based Risk Analyzer（提前实现，见 §14）；**MCP Server 整体顺延** |
 | 7 | 风险分析 + 响应规划 | **已完成**（规则引擎侧）：`RiskAssessment` + `ResponsePlan` 纯函数规则引擎 |
 | 8 | 安全层 + HITL | **已完成（8.1-8.5）**：策略引擎 / 审批流 / append-only 审计 / SQLite 持久化 / triage 服务与 API |
-| 9 | 可观测 + 评估 | 未启动 |
+| 9 | 可观测 + 评估 | **部分启动**：9.1-A 交付可靠性侧（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 依赖护栏对齐），**不属于**蓝图的可观测/评估内容 —— 蓝图的 Trace / 指标 / LLM-as-Judge 仍未启动 |
 | 10 | 工程化 | 未启动 |
 
 
@@ -489,7 +491,7 @@ AuditEvent = Literal[
 
 ## 14. 实现进度（随开发更新）
 
-> 2026-09-17 · **Phase 0-7 全部完成；Phase 8 已完成（8.1-8.5）**。最新状态见文末"当前架构快照"。
+> 2026-09-19 · **Phase 0-7 全部完成；Phase 8 已完成（8.1-8.5）；Phase 9 已启动（9.1-A）**。最新状态见文末"当前架构快照"。
 > 下方按 Phase 顺序记录各阶段的交付物与设计决策。
 
 历史快照（Phase 1-3 时期的调用链，已被 LangGraph 版取代，见文末）：
@@ -644,6 +646,28 @@ OpenAI-compatible LLM
 - **文档同步**：本节 + §5 路由 / §6 依赖 / §7 结构 / §10 State / §11 数据库与事件模型 / §12 进度 / 快照 / Testing Framework 全部按**实际实现**校正（只改事实漂移，不改设计）。
 - 486 tests（Phase 8.5 终态基线）。验证方式：仓库根全绿；**从无 `data/` 目录的 CWD 运行同样 486 passed**（hermetic 证明）。
 
+> 2026-09-19 · Phase 9.1-A 完成（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 护栏对齐）
+
+本阶段闭合的是**已被文档化的一致性缺口**：`approval.timeout` 从 Phase 8.1 起就在审计词汇表里声明，但生产代码从未产生它（§11.4 / 快照 / §12.1 三处都写着"没有超时触发机制"）。现在补上。
+
+- **惰性超时（没有后台调度器）**：判定只在请求到达时发生 —— `triage()` 入口全量扫（`reap_expired()`）、`resume()` 校验门点检查。锚点 = 该 thread 的 `min(action_requests.requested_at)`，判定式 `utc_now() - 锚点 >= approval_timeout`（**闭区间**，让"窗口为 0"这种退化配置立即生效）。
+  - 锚点取自 `action_requests` 而非 `approval.requested` 审计的 `ts`：pending 的**定义**已经是"action_requests 行 + audit 的 NOT EXISTS"，锚点必须落在同一处，否则会出现两套时间真相。
+  - 窗口是 `APPROVAL_TIMEOUT = timedelta(hours=24)`（core 的**生命周期策略默认值**），`TriageService(approval_timeout=...)` keyword-only 可覆盖。**刻意不进 `Settings`** —— 不为一个参数扩大部署配置面；日后确需部署期可配，由组合根注入即可，生命周期语义不变。
+  - 代价（文档化，不是 bug）：长时间没有新的判定请求时，已过期的 pending 会继续显示为 pending、checkpoint 继续占内存，直到下一个 `/triage` 到达。
+- **超时的两个副作用，顺序固定**：先 append 一条 `approval.timeout`（终态事实），再删除该 thread 的 checkpoint。`detail` 记 `elapsed_seconds` / `timeout_seconds`，让"为什么算过期"可复算。
+  - **超时绝不写 `approval.decided`** —— 没有人工决定，就不能留下决定的痕迹（否则审计会显示"有人批准了"，而实际无人做过决定，是最严重的一类审计失真）。
+  - **超时不可逆**：`approval.timeout` 一旦落库，该 thread 永久 409（`ApprovalExpiredError`），不允许事后补批。不可逆性**不依赖清理是否成功** —— 校验门先看"是否已落库"再看窗口，所以即使 `adelete_thread` 没生效，第二次 `resume` 仍然拒绝。
+  - 幂等：`_reap_one` 有 `_has_timed_out` 闸门，同一 thread 最多一条 timeout 审计（`reap_expired` 是"先查 pending、再写审计"，两步之间没有事务，并发请求可能都读到 pending）。
+- **清理范围刻意收窄**：只删**终态** —— `failed`（plan 节点抛错后残留的 `next=('plan',)` 快照）与 `timed_out`。`pending_approval` **绝不删除**（删掉就是把正在等人批的请求凭空抹掉）。`completed` / `allowed` 本轮**不清理**（是"9.1-A 没做"，不是"必须保留"）。
+  - 单一 choke point：`adelete_thread` 在 `triage.py` 里**恰好出现 1 次**（`_drop_checkpoint` 内），由 AST 护栏钉住 —— 清理散落多处时"绝不删 pending"就无法靠审查一处保证。
+  - checkpointer 从图上取（`self._graph.checkpointer`）：它是 `CompiledStateGraph` 的**公开属性**且实测 `is` 组合根传入的同一个实例，所以本类**仍然不持有** checkpointer（不违背 Phase 8.4 的装配约束）。这条由身份断言 + 能力断言（有 `adelete_thread`）守着。
+  - 顺带收益：`pending` 是纯 DB 派生，所以进程重启留下的**僵尸 pending 行**（无 checkpoint、`resume` 永远 409）也会在窗口过期后被收成 `timed_out`，不再无限期污染 pending 视图。
+- **恢复守卫细化（消息准确性）**：`next == ()` 分支从 3 种情况细分为 5 种，新增 `ApprovalExpiredError`（继承 `NotAwaitingApprovalError` → 409，理由与 `CheckpointLostError` 同构）。新增的"有审计但无终态审批事件"一支修掉了一个**事实错误**：此前 `resume` 一个失败的 thread 会说"该 thread 的审批已完成，不能重复提交"（它从没完成，是失败了），现在说"未产生待审批项（规划失败或策略放行）"。
+- **错误优先级规则（本阶段唯一放宽的清理路径）**：`triage()` 的 `except PlanFailedError` 分支里，清理失败**不得顶替已经确立的主失败** —— 降级为 warning 并保留原始 `TriageDataUnavailableError`（→ 503）与完整 `__cause__` 链（`FileNotFoundError → PlanFailedError → TriageDataUnavailableError`）。**只在这一个"已在处理主失败"的路径上放宽**；`reap_expired` / `resume` 侧的清理失败一律响亮抛出。刻意不做通用错误框架。
+- **`/chat` 依赖护栏对齐**：新增 `_require_agent()`（镜像 `_require_service`）。此前 `/chat` 直接取 `request.app.state.agent`，缺 agent 时 `AttributeError` → 带 traceback 的 500，而同场景下 `/triage` 返回 503 —— 不对称，且让 `create_app` 的 docstring（"反之 /chat 不可用（503）"）成为假话。
+- **7 条变异测试全部验证变红后完整还原**：pending 谓词去掉 timeout / 失败路径不清理 / 过期判定 `>=` 反成 `<` / reap 去掉过期过滤 / 去掉幂等闸门 / 去掉 `/chat` 护栏 / 超时检查移位。其中"M4 reap 去掉过期过滤"打的是本阶段最重要的不变量 —— **未过期的 pending 绝不能被删**。
+- 522 tests（Phase 9.1-A 终态基线，8.5 的 486 → +36）。验证方式：仓库根全绿；**从无 `data/` 目录的 CWD 运行同样 522 passed**（hermetic 证明）。
+
 ### Implementation Deviation Note（与 §12 Roadmap 的实现偏离说明）
 
 > §12 Roadmap 的原始设计保持不变；本节只记录实际实现与蓝图之间的有意偏离及原因。
@@ -656,9 +680,9 @@ OpenAI-compatible LLM
 - **MCP Server 与 RAG 顺延（Phase 5 / 6）**：§12 把 Phase 5 定为"威胁情报 + RAG"、Phase 6 定为"MCP Server"，实际 Phase 5 只交付 IOC Exact Match（理由见上一条），Phase 6 则交付了提前实现的 Rule-based Risk Analyzer。结果是 **RAG 与 MCP Server 两项能力整体顺延**，`ChromaDB` 与 `mcp` 依赖至今未引入。这不是"砍掉"，是排序调整：先做能用规则确定性验证的部分（风险分级 / 响应规划 / HITL 安全层），把依赖外部组件的能力留到后面。
 - **`/approve` 未实现，审批并入 `/resume`**：见 §5 注。审计也**没有读接口** —— `/audit` 未实现，审计写入走 store，读取目前只在测试里通过 `list_audit()` 进行。
 
-## 当前架构快照（2026-09-17）
+## 当前架构快照（2026-09-19）
 
-> 完成状态：**Phase 0-8.5 已完成**。
+> 完成状态：**Phase 0-8.5 已完成；Phase 9.1-A 已完成**（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 护栏对齐）。
 
 ```
 HTTP Client
@@ -671,9 +695,10 @@ FastAPI（POST /chat | POST /triage | POST /resume，Pydantic 校验，
 │                构造持有 graph、提取最终回答）                 │
 └─────────────────────────────────────────────────────────────┘
 ┌────────────────── /triage & /resume ────────────────────────┐
-│ TriageService（app/core/triage.py：thread_id 生成、          │
-│                outcome 聚合、incident / action_requests 落库、│
-│                resume 校验门把框架的 4 个静默行为变成明确错误）│
+│ TriageService（app/core/triage.py：thread_id 生成、         │
+│ outcome 聚合、incident / action_requests 落库、             │
+│ resume 校验门把框架的 4 个静默行为变成明确错误、            │
+│ 惰性审批超时（9.1-A：approval.timeout + 终态清理）          │
 └─────────────────────────────────────────────────────────────┘
  ↓
 LangGraph StateGraph（app/core/graph.py：唯一控制流实现）
@@ -702,17 +727,18 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 
 - 默认注册工具：`app.tools.DEFAULT_TOOLS` = `[query_security_logs_tool, query_threat_intel_tool, analyze_risk_tool, plan_response_tool]`（单一真相源，agent 与 graph 共用），graph 对工具数量零假设（加工具 = 加 map 条目，控制流不变）
 - **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
-- 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided`（`approval.timeout` 已声明但尚未产生）
-- 测试基线：**486 passed**，全部离线（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`，无真实 API 调用）；**从无 `data/` 目录的 CWD 运行同样 486 passed**（hermetic）
+- 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided` / `approval.timeout` —— 6 个全部有生产写入路径（`approval.timeout` 由 Phase 9.1-A 的惰性超时补齐）
+- 测试基线：**522 passed**，全部离线（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`，无真实 API 调用）；**从无 `data/` 目录的 CWD 运行同样 522 passed**（hermetic）
 
 ## 尚未实现（按 §12 Roadmap）
 
 - RAG / 知识库（CVE、ATT&CK）——Phase 5 剩余部分，检索对象是自然语言文档，与 IOC Exact Match 不冲突（ChromaDB 未引入）
 - MCP Server——原 Phase 6，整体顺延（`mcp` 未引入）
 - LLM 风险复核层——Phase 8 只做了规则侧；LLM 复核未实现
-- 审批超时清理——`approval.timeout` 事件已声明，但**没有超时触发机制**（需后台任务或惰性检查）
+- 超时的**主动**触发——9.1-A 只做惰性判定（挂在请求入口），没有后台调度器；长时间无请求时过期 pending 不会被及时收掉
+- 超时的**观测面**——`TriageOutcome.status` 不新增 `timed_out`，也没有"查询 thread 状态"的端点，所以超时在 API 响应里只以 409 的形式出现，终态事实只能从 `audit_logs` 读
 - 跨进程 checkpoint 恢复——当前 `InMemorySaver` 只在进程存活期内有效（`langgraph-checkpoint-sqlite` 未安装）
-- 失败 thread 的 checkpoint 清理——失败的 thread 会留在内存里
+- `completed` / `allowed` 的 checkpoint 清理——9.1-A 的清理范围只有 `failed` 与 `timed_out`，这两个终态仍留在内存里
 - 身份认证 / 不可否认性——`actor` 只是自称字符串（Phase 10）
 - 审计读接口（`/audit`）——未实现
 - Observability / Evaluation——Phase 9
@@ -749,20 +775,20 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 | 目录 | 覆盖对象 |
 |---|---|
 | `tests/test_api/` | FastAPI 路由、错误码、消息透传、DTO 契约 |
-| `tests/test_core/` | agent / graph / HITL 图 / llm / config / tool schema / evidence fusion / risk 集成 / response 集成 / triage service |
+| `tests/test_core/` | agent / graph / HITL 图 / llm / config / tool schema / evidence fusion / risk 集成 / response 集成 / triage service / **审批生命周期（超时与终态清理）** |
 | `tests/test_schemas/` | LogEvent / ThreatIntelRecord / RiskAssessment / ResponsePlan / ApprovalRequest / AuditRecord 的校验边界、seed 可复现、API DTO 策略 |
 | `tests/test_security/` | 策略引擎 / 审计记录构造 / append-only store（含"源码里无 UPDATE/DELETE"的结构护栏） |
 | `tests/test_tools/` | 四个工具核心函数的过滤、排序、规则分支与错误契约 |
 
-当前基线：**486 passed**（`pytest -q`，2026-09-17）。
+当前基线：**522 passed**（`pytest -q`，2026-09-19）。
 
 ### 6. hermetic 约束（Phase 8.5 收口）
 
-**全部 29 个测试文件都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
+**全部 30 个测试文件都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
 
 ```bash
 cd <任意不含 data/ 的目录>
-<python> -m pytest <repo>/tests -q      # 期望:486 passed
+<python> -m pytest <repo>/tests -q      # 期望:522 passed
 ```
 
 根因说明：生产默认值 `DEFAULT_DATA_PATH` 是**相对路径**（`data/security_events.jsonl`），相对 CWD 解析 —— 这是**生产行为的正确设计**（部署时以启动目录为基准），但会让测试在换 CWD 时红。所以修的是**测试**（注入 `tmp_path` 现场生成的 seed 数据），不是生产默认值。

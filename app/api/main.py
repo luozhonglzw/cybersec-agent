@@ -83,18 +83,39 @@ def _triage_status_for(exc: TriageError) -> int:
     """领域错误 → HTTP 状态码。
 
     404: thread 从未存在 —— 客户端指错了对象;
-    409: 存在但不能恢复(审批已完成 / checkpoint 丢失)—— 是状态冲突,
-         不是参数格式错误,所以不用 4xx 里的参数类状态码;
+    409: 存在但不能恢复(审批已完成 / 审批已超时 / checkpoint 丢失)——
+         是状态冲突,不是参数格式错误,所以不用 4xx 里的参数类状态码;
     503: 数据源不可用 —— 部署问题,不是客户端的错;
     500: 兜底。新增 TriageError 子类若忘了归类,会落到这里并被测试发现。
+
+    ApprovalExpiredError 继承 NotAwaitingApprovalError → 409,无需单独分支
+    (与 CheckpointLostError 同一处理方式)。
     """
     if isinstance(exc, UnknownThreadError):
         return 404
-    if isinstance(exc, NotAwaitingApprovalError):  # 含 CheckpointLostError
+    if isinstance(exc, NotAwaitingApprovalError):  # 含 CheckpointLostError / ApprovalExpiredError
         return 409
     if isinstance(exc, TriageDataUnavailableError):
         return 503
     return 500
+
+
+def _require_agent(request: Request) -> SecurityAgent:
+    """取出进程级 SecurityAgent(与 _require_service 同构)。
+
+    缺失时给明确的 503,而不是让 AttributeError 变成带 traceback 的 500:
+    后者既难排查,又会把内部结构泄露给客户端。
+    这个分支只在"注入了 triage_service 但没注入 agent"时出现(测试场景)。
+
+    与 /triage 的护栏对齐(Phase 9.1-A):此前 /chat 直接取
+    request.app.state.agent,同一个测试场景下 /triage 返回 503 而 /chat
+    返回 500 —— 不对称。create_app 的 docstring 一直写着"反之 /chat 不可用
+    (503)",这里让它成为真话。
+    """
+    agent = getattr(request.app.state, "agent", None)
+    if agent is None:
+        raise HTTPException(status_code=503, detail="chat service unavailable")
+    return agent
 
 
 def _require_service(request: Request) -> TriageService:
@@ -164,7 +185,7 @@ def create_app(
     @app.post("/chat", response_model=ChatResponse)
     async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
         """对话式安全分析入口。校验交给 Pydantic,业务交给 Agent。"""
-        reply = await request.app.state.agent.chat(payload.message)
+        reply = await _require_agent(request).chat(payload.message)
         return ChatResponse(response=reply)
 
     @app.post("/triage", response_model=TriageResponse)

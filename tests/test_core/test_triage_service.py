@@ -320,10 +320,14 @@ async def test_plan_failure_writes_exactly_one_plan_failed(tmp_path, store, db_p
     只记成功的审计是幸存者偏差 —— "判定失败了多少次、为什么失败"必须可查。
     同时验证失败**不留业务痕迹**:没有 incident、没有 action_requests、
     没有 plan.created(否则会把"没判定成功"记成"判定成功")。
+
+    Phase 9.1-A 追加:失败会在 checkpoint 里留下 next=('plan',) 的残留快照,
+    服务层现在清掉它(该 thread 是终态,不可能再被恢复)。
     """
     intel = tmp_path / "threat_intel.jsonl"
     _write_intel(intel)
-    service = _service(store, tmp_path / "missing.jsonl", intel, InMemorySaver())
+    saver = InMemorySaver()
+    service = _service(store, tmp_path / "missing.jsonl", intel, saver)
 
     with pytest.raises(TriageDataUnavailableError):
         await service.triage(BRUTE_FORCE_IP)
@@ -340,6 +344,9 @@ async def test_plan_failure_writes_exactly_one_plan_failed(tmp_path, store, db_p
     }
     assert _incident_rows(db_path) == []
     assert _action_rows(db_path) == []
+
+    # 残留快照已清理:失败 thread 不在 checkpoint 存储里
+    assert failed.thread_id not in saver.storage
 
 
 async def test_triage_data_error_message_is_sanitized(tmp_path, store):

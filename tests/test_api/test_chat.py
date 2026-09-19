@@ -56,3 +56,18 @@ def test_agent_receives_user_message():
     client.post("/chat", json={"message": "用户问题"})
 
     assert fake.last_message == "用户问题"
+
+
+def test_chat_without_agent_returns_503():
+    """只注入了 triage_service → /chat 给明确 503,不是带 traceback 的 500。
+
+    与 /triage 的护栏对称(Phase 9.1-A 对齐):此前 /chat 直接取
+    request.app.state.agent,缺 agent 时 AttributeError → 500 + traceback,
+    而 /triage 缺 service 时是 503。create_app 的 docstring 一直写着
+    "反之 /chat 不可用(503)",这条让它成为真话。
+    """
+    client = TestClient(create_app(triage_service=object()))
+    resp = client.post("/chat", json={"message": "分析一下"})
+
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "chat service unavailable"

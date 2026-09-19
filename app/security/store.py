@@ -15,8 +15,11 @@ append-only(三张表,缺一不可的 5 个前提):
     2. PRIMARY KEY 存在 —— 重复写入抛 sqlite3.IntegrityError(响亮失败,不静默覆盖);
     3. 库层禁改触发器 —— BEFORE UPDATE/DELETE 直接 RAISE(ABORT);
     4. 表里不存在可变状态列 —— "当前状态"无处可存,只能派生;
-    5. 待审批状态是派生值 —— 某 thread_id 在 audit_logs 里没有对应的
-       approval.decided 行 → 仍 pending。
+    5. 待审批状态是派生值 —— 某 thread_id 在 audit_logs 里既没有对应的
+       approval.decided、也没有 approval.timeout 行 → 仍 pending。
+       (Phase 9.1-A 起有**两个**终态事件:人工决定 / 审批超时。
+       超时若不解除 pending,已过期的 thread 会每轮 reap 都重复写一条
+       approval.timeout —— 审计是事实日志,重复计数就是失真。)
 
     第 3 条把"我们承诺不 UPDATE"变成"数据库拒绝 UPDATE";第 1 条由
     tests/test_security/test_store.py 的结构性护栏测试守着(读源码断言无
@@ -331,14 +334,27 @@ class SqliteAuditStore:
         """派生查询:仍处于待审批状态的动作行。
 
         判定完全来自已落库的事实 —— 某 thread_id 在 audit_logs 里**没有**
-        对应的 approval.decided 行,即为 pending。本方法不写入、不判定策略,
+        对应的**终态事件**,即为 pending。本方法不写入、不判定策略,
         只是读取侧的集合差投影(状态不落库,因此不存在被改写的可能)。
+
+        两个终态事件(Phase 9.1-A 起):
+            approval.decided → 人工给了决定(approved / denied);
+            approval.timeout → 审批窗口过期,自动收成终态。
+
+        为什么 timeout 也算终态:超时之后该 thread 永久不能再被恢复,
+        它不再是"等人批",而是"已经作废"。若不在这里解除 pending,
+        triage() 入口的惰性 reap 会每轮都把它当成待处理,重复写
+        approval.timeout 审计 —— 审计是事实日志,重复计数就是失真。
+
+        注意:本方法**不**负责超时判定,只反映"是否已有终态事件"。
+        谁算过期由 TriageService(持有 approval_timeout)决定。
         """
         sql = (
             "SELECT r.* FROM action_requests r"
             " WHERE NOT EXISTS ("
             "   SELECT 1 FROM audit_logs a"
-            "   WHERE a.event = 'approval.decided' AND a.thread_id = r.thread_id"
+            "   WHERE a.event IN ('approval.decided', 'approval.timeout')"
+            "     AND a.thread_id = r.thread_id"
             " )"
         )
         params: list[object] = []

@@ -3,7 +3,8 @@
 覆盖:
 - 三张表(incidents / action_requests / audit_logs)的写入与读回往返;
 - D2 粒度:一行一个 action(action_requests 独立于 audit_logs 存在的意义);
-- 派生查询 pending_action_rows(状态不落库,由"有无 approval.decided"推导);
+- 派生查询 pending_action_rows(状态不落库,由"有无终态事件"推导:
+  approval.decided 或 approval.timeout,Phase 9.1-A 起两个);
 - append-only 的三重保障:PRIMARY KEY 响亮失败、库层禁改触发器、源码无 UPDATE/DELETE;
 - 时间列拒绝 naive datetime;
 - 构造函数必须显式传 db_path(不存在"忘记传就落到仓库 data/"的可能)。
@@ -359,11 +360,40 @@ def test_pending_rows_filter_by_thread_id(store: SqliteAuditStore):
 
 
 def test_pending_rows_ignores_unrelated_events(store: SqliteAuditStore):
-    """只有 approval.decided 能解除 pending;其他事件不算数。"""
+    """只有**终态**事件能解除 pending;其它事件一律不算数。
+
+    Phase 9.1-A 起终态事件有两个(approval.decided / approval.timeout),
+    但这条不变量不变:plan.created / policy.evaluated / approval.requested
+    这些"过程事件"都不代表审批结束。少了这条约束,任何一次审计写入都可能
+    意外清空 pending 视图。
+    """
     store.record_action_request(_request())
     for event in ("plan.created", "policy.evaluated", "approval.requested"):
         store.append_audit(build_audit_record(event, thread_id=THREAD_ID, ts=TS))
     assert len(store.pending_action_rows()) == 1
+
+
+def test_pending_rows_cleared_by_timeout(store: SqliteAuditStore):
+    """approval.timeout 也解除 pending(Phase 9.1-A)。
+
+    超时之后该 thread 永久不能再被恢复,它不是"等人批"而是"已经作废"。
+    若不在这里解除,triage() 入口的惰性 reap 会每轮都把它当成待处理,
+    重复写 approval.timeout —— 审计是事实日志,重复计数就是失真。
+    """
+    store.record_action_request(_request())
+    assert len(store.pending_action_rows()) == 1
+
+    store.append_audit(build_audit_record("approval.timeout", thread_id=THREAD_ID, ts=TS))
+
+    assert store.pending_action_rows() == []
+
+
+def test_pending_rows_cleared_by_decision_still_works(store: SqliteAuditStore):
+    """回归:approval.decided 解除 pending 的行为不因新增终态事件而改变。"""
+    store.record_action_request(_request())
+    store.append_audit(build_audit_record("approval.decided", thread_id=THREAD_ID, ts=TS))
+
+    assert store.pending_action_rows() == []
 
 
 def test_pending_rows_empty_when_no_request(store: SqliteAuditStore):
