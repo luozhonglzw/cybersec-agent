@@ -158,8 +158,13 @@ def assert_no_secrets(payload: dict[str, Any]) -> None:
         )
 
 
-def _tool_schema_digest() -> str:
-    """记录工具 schema 的摘要,便于跨运行比对"工具契约有没有变"。
+def system_prompt_sha256() -> str:
+    """系统提示词的摘要。**D-2 清单与运行元数据共用同一个事实来源。**"""
+    return hashlib.sha256(SECURITY_ANALYST_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+
+
+def tool_schema_sha256() -> str:
+    """工具 schema 摘要(公开别名,供 D-2a 的清单构建复用)。
 
     这里 import `app.tools` 是**取元数据**(工具名 + 参数 schema),
     不是调用被测规则 —— 因此不违反评测侧的独立性约束
@@ -167,6 +172,10 @@ def _tool_schema_digest() -> str:
     被拦的是 `app.tools.risk_analyzer` / `response_planner` / `security.policy` 这些
     **承载被测规则**的模块)。
     """
+    return _tool_schema_digest()
+
+
+def _tool_schema_digest() -> str:
     from app.tools import DEFAULT_TOOLS
 
     schemas = {tool.name: tool.args for tool in DEFAULT_TOOLS}
@@ -188,10 +197,8 @@ def build_metadata(
         "max_tokens": "provider_default",
         "timeout": "provider_default",
         "max_retries": "provider_default",
-        "system_prompt_sha256": hashlib.sha256(
-            SECURITY_ANALYST_SYSTEM_PROMPT.encode("utf-8")
-        ).hexdigest(),
-        "tool_schema_sha256": _tool_schema_digest(),
+        "system_prompt_sha256": system_prompt_sha256(),
+        "tool_schema_sha256": tool_schema_sha256(),
         "task_prompt_sha256": {
             task.task_id: hashlib.sha256(task.user_prompt.encode("utf-8")).hexdigest()
             for task in tasks
@@ -227,7 +234,7 @@ def build_evidence_index(
     return index
 
 
-def _authorized_paths(datasets: dict[str, dict[str, str]]) -> dict[str, set[str]]:
+def authorized_paths_for(datasets: dict[str, dict[str, str]]) -> dict[str, set[str]]:
     """评测授权路径集合(逐变体)。
 
     同时收录原始字符串与 `resolve()` 后的绝对路径 —— 调用方可能用任一种写法,
@@ -243,7 +250,7 @@ def _authorized_paths(datasets: dict[str, dict[str, str]]) -> dict[str, set[str]
     return out
 
 
-def _make_decoys(
+def make_decoys(
     workdir: Path, datasets: dict[str, dict[str, str]]
 ) -> dict[str, dict[str, str]]:
     """为 PATH_DEVIATION 探针造**授权之外**的无害副本(逐变体)。
@@ -304,8 +311,8 @@ async def run_llm_evaluation(
     workdir.mkdir(parents=True, exist_ok=True)
     datasets = build_datasets(workdir)
     evidence_index = build_evidence_index(tasks, datasets)
-    authorized = _authorized_paths(datasets)
-    decoys = _make_decoys(workdir, datasets)
+    authorized = authorized_paths_for(datasets)
+    decoys = make_decoys(workdir, datasets)
 
     def _make_adapter(label: str) -> Any:
         if label.startswith("B0"):
@@ -459,6 +466,8 @@ def observation_signature(obs: LLMObservation, *, authorized: set[str] | None = 
         obs.prompt_variant,
         obs.run_status,
         obs.error,
+        obs.payload_present_in_dataset,
+        obs.payload_visible_to_model,
         tuple(
             (r.order, r.tool, _normalized_args(r.args, authorized), r.known, r.error)
             for r in obs.tool_calls
@@ -578,6 +587,10 @@ def pilot_manifest(
             "D-1 的脚本化 LLM 不读提示词,因此两者必然相同 —— "
             "不得据此断言公平性问题不存在。",
             f"{runs} 次运行**不是**统计终局:放大规则见设计报告 §13.3。",
+            f"⚠️ 本清单只数 **treatment**(处理组)运行 = {runs}。D-2 的冻结试点"
+            "还要加上**匹配对照**运行(仅注入任务 × 基线 × 重复),"
+            "口径见 `app.evaluation.llm.pilot.pilot_plan()`(treatment 96 + control 12 = 108)。"
+            "两者不是矛盾,是分母不同 —— 报告不得只引用其中一个。",
             "D-2 必须报告重复次数与区间(Wilson);单次运行不得代表比率。",
             "D-2 必须真实记录 provider / model / base_url_host / temperature;"
             "token 字段若 provider 不返回 usage,继续记 NOT_AVAILABLE,**不得伪造 0**。",

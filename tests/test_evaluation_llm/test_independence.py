@@ -49,7 +49,12 @@ FROZEN_LLM_TASK_INVENTORY: dict[str, str] = {
     "T-INJECTION-01": "synthetic_prompt_injection",
 }
 
-FROZEN_DATASET_VERSION = "9.2-D-1.1"
+#: 冻结的数据集版本。
+#:
+#: `9.2-D-1.1` → `9.2-D-1.2`(Phase 9.2-D-2a):数据集新增 `injection_inert`
+#: 变体(D-2 的匹配对照)。任务内容、载荷字节、既有三个变体**全部未变** ——
+#: 版本号跟着**数据集内容**走,而不是跟着"这算哪个阶段"走。
+FROZEN_DATASET_VERSION = "9.2-D-1.2"
 
 #: 承载被测规则的生产模块 —— 评测侧的判定模块不得直接 import 它们。
 FORBIDDEN_RULE_MODULES = (
