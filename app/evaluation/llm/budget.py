@@ -18,6 +18,14 @@ B0 恰好 1 次,而图条件可能 1~5 次。把它们设成相等会掩盖"图�
 SDK 的 `max_retries=2` 会让一次 `ainvoke` 最多发 3 个 HTTP 请求。
 `972 = 324 × 3` 是**在这个 provider 默认值成立的前提下的理论上界**,
 不是实测值 —— 清单里必须写明它是假设,而不是把它当成观测。
+
+两个作用域(**D-2b**)
+--------------------
+    本次进程(process)   本次进程实际执行了什么 —— 报告的样本量口径
+    实验级(experiment)   继承的已消费量 + 本次进程 —— **硬上界只对实验级生效**
+
+预算是实验级的:续跑时若重新发一份完整额度,上界就不再是上界。
+两个作用域**不得合并**:合并会让"本次进程执行了几个单元"凭空变大。
 """
 from dataclasses import dataclass, field
 from typing import Any
@@ -162,41 +170,180 @@ def pilot_budget(
 
 
 @dataclass
-class BudgetGovernor:
-    """离线预算治理器。
+class InheritedConsumption:
+    """**继承的**已消费量(来自上一次运行留下的完整记录)。
 
-    **不重跑任何东西** —— 它只记账、告警、必要时中止。
+    为什么不直接加进 `counters`:`counters` 描述"**本次进程**执行了什么",
+    而预算是**实验级**的。把继承量并进 `counters` 会让报告里的
+    "本次进程执行单元"凭空变大 —— 那是 F-3 的同一类失真。
+    """
+
+    experimental_runs: int = 0
+    experimental_run_attempts: int = 0
+    logical_llm_invocations: int = 0
+    provider_http_attempts_unobservable: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "experimental_runs",
+            "experimental_run_attempts",
+            "logical_llm_invocations",
+            "provider_http_attempts_unobservable",
+        ):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"继承量 {name} 不得为负:{value!r}")
+
+
+def budget_from_plan(plan: Any) -> PilotBudget:
+    """从计划的**已声明**上限构建预算对象(**不重算**)。
+
+    刻意不调用 `pilot_budget()` 重算:重算会**忽略调用方显式声明的上限**,
+    于是"把上界写小一点"这种自检会被静默抵消 —— 预算就退化成装饰品。
+    """
+    return PilotBudget(
+        baseline_labels=tuple(plan.baselines),
+        repetition_count=plan.repetition_count,
+        task_count=plan.task_count,
+        injection_task_count=plan.injection_task_count,
+        treatment_runs=plan.treatment_runs,
+        control_runs=plan.control_runs,
+        total_runs=plan.total_runs,
+        logical_invocation_floor=plan.logical_invocation_floor,
+        logical_invocation_hard_ceiling=plan.logical_invocation_hard_ceiling,
+        provider_http_attempt_ceiling=plan.provider_http_attempt_ceiling,
+        provider_http_attempt_ceiling_basis=plan.provider_http_attempt_ceiling_basis,
+        soft_call_ceiling=plan.soft_call_ceiling,
+    )
+
+
+@dataclass
+class BudgetGovernor:
+    """预算治理器。**它不重跑任何东西** —— 只记账、告警、必要时中止。
+
+    两个作用域,刻意分开
+    -------------------
+        本次进程(process)    `counters`         报告里的"本次进程执行单元"
+        实验级(experiment)   继承 + 本次进程    **硬上界只对实验级生效**
+
+    预算必须是实验级的:续跑时若重新发一份完整额度,上界就不再是上界。
+
+    谁写哪个计数器(**硬分工**)
+    --------------------------
+        `reserve()`          唯一写 `logical_llm_invocations` 的地方,每次调用 +1
+        `record_unit()`      只写单元级与物理尝试级,`logical_*` 一个字都不碰
+        `seed_inherited()`   只写继承量
+
+    这条分工不是风格问题:`logical_llm_invocations` 若同时被"每次调用"和
+    "每个单元汇总"各加一次,账会翻倍,而两份数字看起来都很合理。
     """
 
     budget: PilotBudget
     counters: BudgetCounters = field(default_factory=BudgetCounters)
+    inherited: InheritedConsumption = field(default_factory=InheritedConsumption)
     warnings: list[str] = field(default_factory=list)
 
-    def record_run(
-        self,
-        *,
-        logical_invocations: int,
-        provider_http_attempts: int | None = None,
-    ) -> None:
-        """登记**一个已执行的实验单元**。
+    # ---- 实验级视图 ----
+
+    @property
+    def experiment_experimental_runs(self) -> int:
+        return self.inherited.experimental_runs + self.counters.experimental_runs
+
+    @property
+    def experiment_logical_llm_invocations(self) -> int:
+        return self.inherited.logical_llm_invocations + self.counters.logical_llm_invocations
+
+    @property
+    def experiment_provider_http_attempts(self) -> int | str:
+        """任一单元不可观测,总数就是 `UNKNOWN` —— **不部分求和**。"""
+        if (
+            self.counters.provider_http_attempts_unobservable
+            or self.inherited.provider_http_attempts_unobservable
+        ):
+            return UNKNOWN
+        return self.counters.provider_http_attempts_observed
+
+    # ---- 播种 / 准入 / 预留 / 登记 ----
+
+    def seed_inherited(self, consumption: InheritedConsumption) -> None:
+        """播种**已消费**量。刻意不经过 `record_unit()`。
+
+        走 `record_unit()` 会把继承的单元记成本次进程新执行的单元,
+        报告里的样本量于是凭空变大 —— 正是 F-3 要防的那类失真。
+        """
+        if self.inherited != InheritedConsumption():
+            raise AssertionError(
+                "继承量只能播种一次 —— 重复播种会让上界凭空变紧,"
+                "而报告看起来完全正常"
+            )
+        self.inherited = consumption
+
+    def admit_unit(self, *, min_invocations: int = 1) -> None:
+        """**Tier 1:实验单元准入闸门。**
+
+        在一个单元开始做任何工作**之前**调用。它**不消费**额度 ——
+        只回答"现在开始这个单元,是否连它的结构性下界都装不下"。
+        装不下就立刻拒绝,不产生任何调用。
+        """
+        if min_invocations < 1:
+            raise ValueError(f"min_invocations 至少为 1,收到 {min_invocations!r}")
+        projected = self.experiment_logical_llm_invocations + min_invocations
+        if projected > self.budget.logical_invocation_hard_ceiling:
+            raise BudgetExceeded(
+                f"单元准入被拒:已消费 {self.experiment_logical_llm_invocations}"
+                f"(继承 {self.inherited.logical_llm_invocations} + 本次进程 "
+                f"{self.counters.logical_llm_invocations}),再执行一个单元至少需要 "
+                f"{min_invocations} 次逻辑调用,将超过硬上界 "
+                f"{self.budget.logical_invocation_hard_ceiling} —— 立即 ABORT"
+            )
+
+    def reserve(self, *, invocations: int = 1) -> None:
+        """**Tier 2:每次逻辑调用之前的硬检查。**
+
+        这是**唯一**写 `logical_llm_invocations` 的地方。
+        越界即抛,且**在抛出前不改变任何计数器** ——
+        "先记账再拒绝"会让上界自己把自己撑破。
+        """
+        if invocations < 1:
+            raise ValueError(f"invocations 至少为 1,收到 {invocations!r}")
+        projected = self.experiment_logical_llm_invocations + invocations
+        if projected > self.budget.logical_invocation_hard_ceiling:
+            raise BudgetExceeded(
+                f"逻辑 LLM 调用被拒:已消费 {self.experiment_logical_llm_invocations}"
+                f"(继承 {self.inherited.logical_llm_invocations} + 本次进程 "
+                f"{self.counters.logical_llm_invocations}),再调用 {invocations} 次将超过"
+                f"硬上界 {self.budget.logical_invocation_hard_ceiling} —— "
+                "调用**未发生**,立即 ABORT"
+            )
+        self.counters.logical_llm_invocations += invocations
+
+    def record_unit(self, *, provider_http_attempts: int | None = None) -> None:
+        """登记**一个已结束的实验单元**。
 
         `experimental_run_attempts` 每次 +1 且只 +1 —— 因为
         `HARNESS_LEVEL_RETRY = 0`,单元不会被执行第二次。
-        它与 `logical_invocations` **是两个量**,刻意不互相赋值。
+
+        **刻意不接受 `logical_invocations` 入参**:那个量由 `reserve()`
+        逐次累计。留一个"顺便把逻辑调用也加一遍"的入口,迟早会有人用它,
+        然后账目翻倍而两份数字都自洽。
         """
         self.counters.experimental_runs += 1
         self.counters.experimental_run_attempts += 1
-        self.counters.logical_llm_invocations += logical_invocations
         if provider_http_attempts is None:
             self.counters.provider_http_attempts_unobservable += 1
         else:
             self.counters.provider_http_attempts_observed += provider_http_attempts
 
+    # ---- 事后断言 ----
+
     def check(self) -> None:
-        """超限即抛。**每次登记后都应调用**。"""
-        if self.counters.logical_llm_invocations > self.budget.logical_invocation_hard_ceiling:
+        """超限即抛。**每次登记后都应调用** —— 它是兜底,不是主防线。"""
+        if (
+            self.experiment_logical_llm_invocations
+            > self.budget.logical_invocation_hard_ceiling
+        ):
             raise BudgetExceeded(
-                f"逻辑 LLM 调用 {self.counters.logical_llm_invocations} 超过硬上界 "
+                f"逻辑 LLM 调用 {self.experiment_logical_llm_invocations} 超过硬上界 "
                 f"{self.budget.logical_invocation_hard_ceiling} —— 立即 ABORT"
             )
         observed = self.counters.provider_http_attempts_observed
@@ -206,17 +353,25 @@ class BudgetGovernor:
                 f"{self.budget.provider_http_attempt_ceiling} —— 立即 ABORT"
             )
         if (
-            self.counters.logical_llm_invocations > self.budget.soft_call_ceiling
+            self.experiment_logical_llm_invocations > self.budget.soft_call_ceiling
             and not self.warnings
         ):
             self.warnings.append(
-                f"逻辑 LLM 调用 {self.counters.logical_llm_invocations} 已超过软上限 "
+                f"逻辑 LLM 调用 {self.experiment_logical_llm_invocations} 已超过软上限 "
                 f"{self.budget.soft_call_ceiling}(继续,但需在报告中说明)"
             )
 
     def snapshot(self) -> dict[str, Any]:
         return {
             **self.counters.snapshot(),
+            "inherited_experimental_runs": self.inherited.experimental_runs,
+            "inherited_experimental_run_attempts": (
+                self.inherited.experimental_run_attempts
+            ),
+            "inherited_logical_llm_invocations": self.inherited.logical_llm_invocations,
+            "experiment_experimental_runs": self.experiment_experimental_runs,
+            "experiment_logical_llm_invocations": self.experiment_logical_llm_invocations,
+            "experiment_provider_http_attempts": self.experiment_provider_http_attempts,
             "ceilings": self.budget.as_manifest_fields(),
             "soft_call_ceiling": self.budget.soft_call_ceiling,
             "harness_level_retry": 0,

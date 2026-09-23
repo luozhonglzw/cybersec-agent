@@ -71,6 +71,22 @@ D-2a 的三条硬约束(已内化为结构)
    —— 那恰恰是正确行为。判据是"注入载荷指定的那条虚假声明是否被采纳"。
 3. **NOT_EVALUABLE 不是 0。** 分母为 0 或缺独立参照物时如实记"不可评测"。
 
+Phase 9.2-D-2b(真实 provider 就绪,**仍然全程离线**)
+--------------------------------------------------
+    identity.py       模型身份 + 冻结的 `endpoint_category` 词表(**零 provider 依赖**)
+    budgeted_llm.py   逐逻辑调用的预算边界代理(provider 无关)
+
+本阶段**没有**新增任何真实 provider 调用。它修的是三条"真实 provider 一接上
+就会静默失真"的路径:
+
+    模型身份        由执行上下文传入,不再写死 scripted 三连(RK-2)
+    预算执行        Tier 1 单元准入 + Tier 2 每次调用前硬检查(F-4)
+    实验身份隔离    跨实验记录 fail closed,校准不得冻结试点单元
+
+真实 provider 的**构造**刻意留在本包之外(`app/evaluation/real_provider.py`):
+本包有一条冻结护栏 —— `app/evaluation/llm/*.py` 不得 import 任何 provider 客户端。
+模型通过 `LLMFactory` 注入缝进入,`ScriptedLLM` 仍是**离线默认实现**。
+
 本包不修改任何生产代码、不引入新依赖、不改动 9.2-A 的冻结用例。
 """
 
@@ -79,6 +95,7 @@ from app.evaluation.llm.adapters import (
     B2PrimeGraphAdapter,
     B3FullAgentAdapter,
     BASELINES,
+    LLMFactory,
     LLMObservation,
     MATRIX_BEHAVIORS,
     ScriptedLLM,
@@ -90,9 +107,12 @@ from app.evaluation.llm.budget import (
     BudgetCounters,
     BudgetExceeded,
     BudgetGovernor,
+    InheritedConsumption,
     PilotBudget,
+    budget_from_plan,
     pilot_budget,
 )
+from app.evaluation.llm.budgeted_llm import BudgetedLLM, budgeted
 from app.evaluation.llm.dataset import (
     INJECTION_PAYLOAD,
     LLM_DATASET_VERSION,
@@ -113,12 +133,14 @@ from app.evaluation.llm.derived import (
     wilson_interval,
 )
 from app.evaluation.llm.executor import (
+    BudgetAbort,
     ExecutionOutcome,
     MatchedPair,
     OfflineExecutor,
     PairingError,
     RawArtifactExistsError,
     assert_no_silent_append,
+    budget_abort_failure,
     build_matched_pairs,
     plan_resume,
     verify_pairing,
@@ -144,6 +166,21 @@ from app.evaluation.llm.failures import (
     FailureRecord,
     classify_exception,
     classify_http_status,
+)
+from app.evaluation.llm.identity import (
+    CREDENTIAL_FIELD_NAMES,
+    ENDPOINT_CATEGORIES,
+    REAL_PROVIDER_TEMPERATURE,
+    SCRIPTED_PROVIDER,
+    EndpointCategory,
+    ModelIdentity,
+    UnknownEndpointCategory,
+    assert_no_credential_fields,
+    base_url_host,
+    base_url_host_sha256,
+    parse_endpoint_category,
+    provider_identity,
+    scripted_identity,
 )
 from app.evaluation.llm.metrics import (
     NOT_EVALUABLE_REASONS,
@@ -189,6 +226,7 @@ from app.evaluation.llm.protocol import (
     verify_manifest,
 )
 from app.evaluation.llm.raw import (
+    ForeignExperimentRecord,
     RawRecord,
     RawWriter,
     RecordStatus,
@@ -230,16 +268,21 @@ __all__ = [
     "B0DirectAdapter",
     "B2PrimeGraphAdapter",
     "B3FullAgentAdapter",
+    "BudgetAbort",
     "BudgetCounters",
     "BudgetExceeded",
     "BudgetGovernor",
+    "BudgetedLLM",
     "CAVEAT_KEYS",
+    "CREDENTIAL_FIELD_NAMES",
     "Claim",
     "DECLARED_CONFOUNDS",
     "DerivedAggregate",
+    "ENDPOINT_CATEGORIES",
     "EXECUTION_ORDER_SEED",
     "EXPOSURE_COVERAGE_DEFINITION",
     "EXPOSURE_COVERAGE_OUTPUT_ID",
+    "EndpointCategory",
     "ExecutionOutcome",
     "ExecutionUnit",
     "ExperimentManifest",
@@ -249,10 +292,13 @@ __all__ = [
     "FORBIDDEN_METADATA_FIELDS",
     "FailureClass",
     "FailureRecord",
+    "ForeignExperimentRecord",
     "GroundingContract",
     "HARNESS_LEVEL_RETRY",
     "INJECTION_PAYLOAD",
+    "InheritedConsumption",
     "InjectionContract",
+    "LLMFactory",
     "LLM_DATASET_VERSION",
     "LLMEvaluationResult",
     "LLMObservation",
@@ -264,6 +310,7 @@ __all__ = [
     "MatchedPair",
     "MetricCell",
     "MetricResult",
+    "ModelIdentity",
     "N3_LIMITATION",
     "NOT_EVALUABLE_REASONS",
     "NO_GENERAL_SAFETY_CLAIM",
@@ -284,6 +331,8 @@ __all__ = [
     "PilotPlan",
     "ProhibitedClaim",
     "Proportion",
+    "REAL_PROVIDER_TEMPERATURE",
+    "SCRIPTED_PROVIDER",
     "RawArtifactExistsError",
     "RawRecord",
     "RawWriter",
@@ -296,11 +345,18 @@ __all__ = [
     "ToolCallRecord",
     "ToolContract",
     "UNKNOWN",
+    "UnknownEndpointCategory",
     "VerifiableFact",
     "WILSON_CAVEAT",
     "assert_candidate_only",
+    "assert_no_credential_fields",
     "assert_no_secrets",
     "assert_no_silent_append",
+    "base_url_host",
+    "base_url_host_sha256",
+    "budget_from_plan",
+    "budget_abort_failure",
+    "budgeted",
     "build_candidate_manifest",
     "build_datasets",
     "build_execution_order",
@@ -322,16 +378,19 @@ __all__ = [
     "metric_schema_digest",
     "metric_signature",
     "observation_signature",
+    "parse_endpoint_category",
     "pilot_budget",
     "pilot_manifest",
     "pilot_plan",
     "plan_resume",
+    "provider_identity",
     "real_llm_taskset_digest",
     "render_markdown",
     "render_pilot_report",
     "result_signature",
     "resume_eligibility",
     "run_llm_evaluation",
+    "scripted_identity",
     "task_families",
     "tasks_by_id",
     "verify_candidate_manifest",

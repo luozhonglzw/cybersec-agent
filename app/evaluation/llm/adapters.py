@@ -23,6 +23,21 @@ D-1 全程离线
 它的作用不是"模拟得像真 LLM",而是**把已知的失败模式精确注入**,
 从而证明评测工装确实能把这些失败测出来(反同义反复)。
 
+可注入的模型边界(**D-2b**)
+--------------------------
+`ScriptedLLM` 是**离线默认实现**,不再是**唯一**实现:三个适配器都通过
+`BaseLLMAdapter._budgeted_llm()` 取模型,构造来源由 `llm_factory` 决定
+(省略 = `ScriptedLLM`,离线行为逐字节不变)。
+
+真实 provider 的构造**刻意不放在本包内** —— 本包有一条冻结护栏:
+`app/evaluation/llm/*.py` 不得 import 任何 provider 客户端
+(见 `tests/test_evaluation_llm/test_d2a_pipeline.py` 的
+`test_no_evaluation_module_imports_a_provider_client`)。
+因此真实构造放在 `app/evaluation/real_provider.py`(**包外**),由调用方注入。
+
+取模型一律经 `BudgetedLLM` 代理:`invocations` 是 provider 无关的调用计数,
+预算硬检查就在代理里、**在调用之前**发生。
+
 三个基线
 --------
     B0   直连 LLM,无工具            —— 纯 chatbot 对照
@@ -59,6 +74,8 @@ from pydantic import BaseModel, Field
 
 from app.core.agent import SECURITY_ANALYST_SYSTEM_PROMPT
 from app.core.graph import HITL_TOOLS, HitlConfig, create_agent_graph
+from app.evaluation.llm.budget import BudgetExceeded, BudgetGovernor
+from app.evaluation.llm.budgeted_llm import BudgetedLLM, budgeted
 from app.evaluation.llm.dataset import VARIANT_INJECTION
 from app.evaluation.llm.tasks import INJECTION_PAYLOAD_MARKER, LLMTask
 from app.security.audit import compute_plan_digest
@@ -353,6 +370,14 @@ def _exposure(dataset_variant: str, messages: list) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 Step = tuple[str, Any, Any]  # ("tool", name, args) | ("final", text_or_callable, None)
+
+#: 模型工厂:接收运行上下文,返回任何提供 `bind_tools` / `ainvoke` 的对象。
+#:
+#: **这是 D-2b 的注入缝。** 省略时适配器构造 `ScriptedLLM`(离线默认实现);
+#: 传入时由调用方决定模型来源。真实 provider 的构造刻意留在本包**之外**
+#: (见 `app/evaluation/real_provider.py`)—— 本包有一条冻结护栏:
+#: 包内任何模块都不得 import provider 客户端。
+LLMFactory = Callable[..., Any]
 
 
 class ScriptedLLM:
@@ -661,7 +686,17 @@ def _tokens_from(messages: list) -> tuple[int | None, int | None, int | None]:
 
 
 class BaseLLMAdapter:
-    """三个基线共用的契约。"""
+    """三个基线共用的契约。
+
+    **可注入的模型边界(D-2b)**
+    --------------------------
+    `llm_factory` 省略时构造 `ScriptedLLM` —— 离线行为逐字节不变。
+    传入时由调用方提供模型构造(真实 provider,或测试用的假模型)。
+
+    也就是说:`ScriptedLLM` 仍是**离线默认实现**,但不再是**唯一**实现 ——
+    适配器不再在内部把模型写死。D-2b 之前,`B2'`/`B3` 的 `run()` 里直接写着
+    `llm = ScriptedLLM(...)`,真实模型**没有**任何注入点。
+    """
 
     baseline: str = "?"
 
@@ -670,14 +705,69 @@ class BaseLLMAdapter:
         *,
         dataset_paths: dict[str, str],
         audit_db_path: str | None = None,
+        llm_factory: LLMFactory | None = None,
+        governor: BudgetGovernor | None = None,
     ) -> None:
         self.dataset_paths = dataset_paths
         self.audit_db_path = audit_db_path
+        self._llm_factory = llm_factory
+        self._governor = governor
 
     @property
     def authorized_paths(self) -> set[str]:
         return {str(Path(value).resolve()) for value in self.dataset_paths.values()} | set(
             self.dataset_paths.values()
+        )
+
+    def _build_llm(
+        self,
+        *,
+        behavior: str,
+        task: LLMTask,
+        dataset_paths: dict[str, str] | None,
+        decoy_paths: dict[str, str] | None,
+        emit_usage: bool,
+    ) -> Any:
+        """构造**原始**模型对象。离线默认 = `ScriptedLLM`。"""
+        if self._llm_factory is None:
+            return ScriptedLLM(
+                behavior=behavior,
+                task=task,
+                dataset_paths=dataset_paths,
+                decoy_paths=decoy_paths,
+                emit_usage=emit_usage,
+            )
+        return self._llm_factory(
+            behavior=behavior,
+            task=task,
+            dataset_paths=dataset_paths,
+            decoy_paths=decoy_paths,
+            emit_usage=emit_usage,
+        )
+
+    def _budgeted_llm(
+        self,
+        *,
+        behavior: str,
+        task: LLMTask,
+        dataset_paths: dict[str, str] | None,
+        decoy_paths: dict[str, str] | None,
+        emit_usage: bool,
+    ) -> BudgetedLLM:
+        """构造模型并套上预算边界。
+
+        返回值**始终**是代理:`invocations` 是 provider 无关的调用计数,
+        不再依赖某个假 LLM 的 `call_count`。`governor=None` 时只计数、不拒绝。
+        """
+        return budgeted(
+            self._build_llm(
+                behavior=behavior,
+                task=task,
+                dataset_paths=dataset_paths,
+                decoy_paths=decoy_paths,
+                emit_usage=emit_usage,
+            ),
+            self._governor,
         )
 
     async def run(self, task: LLMTask, behavior: str, **kwargs: Any) -> LLMObservation:
@@ -715,7 +805,7 @@ class B0DirectAdapter(BaseLLMAdapter):
         system_prompt = (
             NO_TOOL_SYSTEM_PROMPT if prompt_variant == "no_tool_prompt" else SHARED_SYSTEM_PROMPT
         )
-        llm = ScriptedLLM(
+        llm = self._budgeted_llm(
             behavior=behavior,
             task=task,
             dataset_paths=dataset_paths,
@@ -729,13 +819,19 @@ class B0DirectAdapter(BaseLLMAdapter):
         started = time.perf_counter()
         try:
             reply = await llm.ainvoke(messages)
+        except BudgetExceeded:
+            # 预算拒绝**不是**模型失败,而是实验停止条件。下面那条兜底
+            # `except Exception` 会把它吞成 `llm_failed`,进而被
+            # `classify_error_name` 归到 `HARNESS_ERROR` —— 于是"我们主动停下了"
+            # 被报告成"工装坏了"。必须原样上抛,由执行器统一分类。
+            raise
         except Exception as exc:
             return LLMObservation(
                 task_id=task.task_id, baseline=self.baseline, behavior=behavior,
                 dataset_variant=variant, prompt_variant=prompt_variant,
                 condition=condition,
                 run_status="llm_failed", error=type(exc).__name__,
-                llm_call_count=llm.call_count,
+                llm_call_count=llm.invocations,
                 wall_clock_ms=round((time.perf_counter() - started) * 1000, 3),
                 **_exposure(variant, messages),
             )
@@ -751,7 +847,7 @@ class B0DirectAdapter(BaseLLMAdapter):
             condition=condition,
             run_status="not_gated",
             answer=answer,
-            llm_call_count=llm.call_count,
+            llm_call_count=llm.invocations,
             wall_clock_ms=elapsed,
             input_tokens=inp,
             output_tokens=out,
@@ -788,7 +884,7 @@ class B2PrimeGraphAdapter(BaseLLMAdapter):
         **_: Any,
     ) -> LLMObservation:
         variant = dataset_variant_override or task.dataset_variant
-        llm = ScriptedLLM(
+        llm = self._budgeted_llm(
             behavior=behavior,
             task=task,
             dataset_paths=dataset_paths,
@@ -805,12 +901,15 @@ class B2PrimeGraphAdapter(BaseLLMAdapter):
                 ],
                 "iteration_count": 0,
             })
+        except BudgetExceeded:
+            # 见 `B0DirectAdapter.run` 的同类说明:预算拒绝不得被兜底分支吞掉。
+            raise
         except Exception as exc:
             return LLMObservation(
                 task_id=task.task_id, baseline=self.baseline, behavior=behavior,
                 dataset_variant=variant, run_status="llm_failed",
                 condition=condition,
-                error=type(exc).__name__, llm_call_count=llm.call_count,
+                error=type(exc).__name__, llm_call_count=llm.invocations,
                 wall_clock_ms=round((time.perf_counter() - started) * 1000, 3),
                 **_exposure(variant, []),
             )
@@ -829,7 +928,7 @@ class B2PrimeGraphAdapter(BaseLLMAdapter):
             tool_calls=records,
             tool_call_count=len(records),
             graph_iterations=final_state.get("iteration_count"),
-            llm_call_count=llm.call_count,
+            llm_call_count=llm.invocations,
             wall_clock_ms=elapsed,
             input_tokens=inp,
             output_tokens=out,
@@ -881,7 +980,7 @@ class B3FullAgentAdapter(BaseLLMAdapter):
         **_: Any,
     ) -> LLMObservation:
         variant = dataset_variant_override or task.dataset_variant
-        llm = ScriptedLLM(
+        llm = self._budgeted_llm(
             behavior=behavior,
             task=task,
             dataset_paths=dataset_paths,
@@ -919,12 +1018,15 @@ class B3FullAgentAdapter(BaseLLMAdapter):
                 config,
             )
             snapshot = await graph.aget_state(config)
+        except BudgetExceeded:
+            # 见 `B0DirectAdapter.run` 的同类说明:预算拒绝不得被兜底分支吞掉。
+            raise
         except Exception as exc:
             return LLMObservation(
                 task_id=task.task_id, baseline=self.baseline, behavior=behavior,
                 dataset_variant=variant, run_status="llm_failed",
                 condition=condition,
-                error=type(exc).__name__, llm_call_count=llm.call_count,
+                error=type(exc).__name__, llm_call_count=llm.invocations,
                 wall_clock_ms=round((time.perf_counter() - started) * 1000, 3),
                 **_exposure(variant, []),
             )
@@ -951,7 +1053,7 @@ class B3FullAgentAdapter(BaseLLMAdapter):
             "tool_call_count": len(records),
             "audit_events": [record.event for record in audit_records],
             "graph_iterations": values.get("iteration_count"),
-            "llm_call_count": llm.call_count,
+            "llm_call_count": llm.invocations,
             "wall_clock_ms": elapsed,
             "input_tokens": inp,
             "output_tokens": out,

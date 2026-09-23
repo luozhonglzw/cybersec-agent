@@ -46,7 +46,13 @@ from app.evaluation.llm.adapters import (
     SHARED_SYSTEM_PROMPT,
     LLMObservation,
 )
-from app.evaluation.llm.budget import UNKNOWN
+from app.evaluation.llm.budget import (
+    UNKNOWN,
+    BudgetExceeded,
+    BudgetGovernor,
+    InheritedConsumption,
+    budget_from_plan,
+)
 from app.evaluation.llm.dataset import (
     INJECTION_INERT_TEXT,
     INJECTION_PAYLOAD,
@@ -63,6 +69,7 @@ from app.evaluation.llm.failures import (
     FailureRecord,
     classify_error_name,
 )
+from app.evaluation.llm.identity import ModelIdentity, scripted_identity
 from app.evaluation.llm.metrics import MetricResult, compute_llm_metrics
 from app.evaluation.llm.offline_guard import NetworkEgressGuard
 from app.evaluation.llm.ordering import ExecutionUnit
@@ -101,8 +108,32 @@ class HarnessAbort(RuntimeError):
     """工装自身失败 —— 记录已落盘(标记 incomplete),但流水线必须停下。"""
 
 
+class BudgetAbort(RuntimeError):
+    """预算耗尽。
+
+    **刻意与 `HarnessAbort` 分开**:预算耗尽不是工装故障,而是
+    **实验停止条件**(`FailureClass.BUDGET_EXHAUSTED` 的规则是
+    `classification="ABORT"` / `aborts_pilot=True`)。若让它落进
+    `HARNESS_ERROR`,报告会把"我们主动停下来了"说成"工装坏了" ——
+    两者对下游的处置完全不同。
+    """
+
+
 class RawArtifactExistsError(RuntimeError):
     """目标原始文件已存在,而调用方没有声明要继承它 —— 拒绝静默追加。"""
+
+
+def budget_abort_failure(error_type: str) -> FailureRecord:
+    """预算耗尽的**唯一**分类落点(Tier 1 与 Tier 2 共用)。
+
+    为什么必须是一个函数而不是两处各写一遍:`BudgetExceeded` 是
+    `AssertionError` 子类,一旦某条路径漏掉了它、落进通用 `except Exception`,
+    记录就会被标成 `HARNESS_ERROR` —— 于是"我们主动停下来了"被说成"工装坏了"。
+    两条路径共用同一个落点,才能保证它们不会分叉。
+    """
+    return FailureRecord.from_class(
+        FailureClass.BUDGET_EXHAUSTED, error_type=error_type
+    )
 
 
 def assert_no_silent_append(
@@ -322,11 +353,16 @@ def verify_pairing(
 def plan_resume(
     units: Iterable[ExecutionUnit],
     existing: dict[tuple[str, str, str, int], RawRecord],
+    *,
+    experiment_id: str,
 ) -> dict[str, list[str]]:
     """把单元按续跑资格分成三类。
 
     **判定依据只有"记录是否完整"** —— 结果好坏完全不参与。
     一旦允许按结果选择重跑,实验就从"测量"退化成"挑样本"。
+
+    `experiment_id` **必填**:记录的身份键不含实验,所以跨实验的记录必须
+    在**判定边界**上被拒绝,而不是靠调用方记得先过滤。
     """
     plan: dict[str, list[str]] = {
         ResumeEligibility.FROZEN.value: [],
@@ -337,7 +373,7 @@ def plan_resume(
         record = existing.get(
             (unit.condition, unit.task_id, unit.baseline_label, unit.repetition_id)
         )
-        plan[resume_eligibility(record).value].append(unit.key)
+        plan[resume_eligibility(record, experiment_id=experiment_id).value].append(unit.key)
     return plan
 
 
@@ -389,7 +425,17 @@ class ExecutionOutcome(BaseModel):
 
 
 class OfflineExecutor:
-    """离线执行器。**不创建任何 provider 客户端、不读 `.env`、不发请求。**"""
+    """试点执行器。默认**不创建任何 provider 客户端、不读 `.env`、不发请求**。
+
+    D-2b 的可注入边界
+    -----------------
+        `llm_factory`  省略 ⇒ 适配器构造 `ScriptedLLM`(离线行为逐字节不变)
+        `identity`     省略 ⇒ 由行为推出的 scripted 身份
+        `budget`       由**计划已声明**的上限构建(`budget_from_plan`,不重算)
+
+    **注入自定义工厂却不给真实身份会被拒绝**:那会让每一条真实记录都
+    声称自己是脚本化运行 —— 正是 D-2b 要修的失真。
+    """
 
     def __init__(
         self,
@@ -403,6 +449,8 @@ class OfflineExecutor:
         repetition_count: int | None = None,
         manifest_digest: str = "",
         guard: NetworkEgressGuard | None = None,
+        llm_factory: Any | None = None,
+        identity: ModelIdentity | None = None,
     ) -> None:
         self.workdir = Path(workdir)
         self.experiment_id = experiment_id
@@ -425,6 +473,18 @@ class OfflineExecutor:
         self.repetition_count = repetition_count or self.plan.repetition_count
         self.manifest_digest = manifest_digest
         self.guard = guard
+        # ---- D-2b:可注入模型边界 + 实验级预算 ----
+        self.llm_factory = llm_factory
+        self.identity = identity or scripted_identity(self.behavior)
+        self.identity.assert_consistent()
+        if llm_factory is not None and self.identity.is_scripted:
+            raise ValueError(
+                "注入了自定义模型工厂,身份却仍是 SCRIPTED_OFFLINE —— "
+                "这会让每一条真实记录都声称自己是脚本化运行。"
+                "请同时传入与之一致的 identity(见 identity.provider_identity)。"
+            )
+        self.budget = budget_from_plan(self.plan)
+        self.governor = BudgetGovernor(budget=self.budget)
         self._records: list[RawRecord] = []
         self._observations: dict[int, list[LLMObservation]] = {}
         self._control_observations: dict[int, list[LLMObservation]] = {}
@@ -434,11 +494,18 @@ class OfflineExecutor:
     def _adapter_for(self, label: str, cache: dict[str, Any]) -> Any:
         if label in cache:
             return cache[label]
+        # 模型边界与预算治理器在**每个**适配器上一致:预算必须覆盖全部基线,
+        # 否则换一个基线就能绕开上界。
+        common: dict[str, Any] = {
+            "dataset_paths": {},
+            "llm_factory": self.llm_factory,
+            "governor": self.governor,
+        }
         if label.startswith("B0"):
-            adapter = BASELINES["B0"](dataset_paths={})
+            adapter = BASELINES["B0"](**common)
         else:
             adapter = BASELINES[label](
-                dataset_paths={},
+                **common,
                 audit_db_path=str(
                     self.workdir / f"audit-{label.replace(chr(39), 'p')}.db"
                 ),
@@ -470,7 +537,15 @@ class OfflineExecutor:
         status: RecordStatus,
         failure: FailureRecord,
         resume: dict[str, Any] | None,
+        identity: ModelIdentity,
     ) -> RawRecord:
+        """构造原始记录。
+
+        `identity` 是**必填**入参:`provider` / `model` / `endpoint_category` /
+        `usage.source` 全部由执行上下文给出。D-2b 之前这里写死 scripted 三连,
+        于是真实 provider 复用同一条路径时,每一条真实记录都会**静默地**
+        声称自己是脚本化运行。
+        """
         return RawRecord(
             run_id=f"{self.experiment_id}:{execution_index:04d}",
             experiment_id=self.experiment_id,
@@ -487,11 +562,13 @@ class OfflineExecutor:
             # 与该次执行里的 `ainvoke` 次数**不是同一个量**:B0 恰好 1,图 1~5
             logical_llm_invocations=observation.llm_call_count,
             provider_http_attempts=UNKNOWN,
-            provider="scripted",
-            model=f"deterministic-scripted-{self.behavior}",
-            provider_reported_model_id=None,
-            base_url_host_sha256=None,
-            provider_default_parameters={},
+            provider=identity.provider,
+            model=identity.model,
+            endpoint_category=identity.endpoint_category.value,
+            provider_reported_model_id=identity.provider_reported_model_id,
+            temperature=identity.temperature,
+            base_url_host_sha256=identity.base_url_host_sha256,
+            provider_default_parameters=dict(identity.provider_default_parameters),
             system_prompt_sha256=sha256_hex(system_prompt),
             user_prompt_sha256=sha256_hex(task.user_prompt),
             tool_schema_sha256=tool_schema_sha256(),
@@ -531,13 +608,7 @@ class OfflineExecutor:
                     "repetition_id": unit.repetition_id,
                 },
             },
-            usage={
-                "input_tokens": observation.input_tokens,
-                "output_tokens": observation.output_tokens,
-                "total_tokens": observation.total_tokens,
-                "source": "scripted",
-                "note": "脚本化运行不产生 usage;None = NOT_AVAILABLE,不是 0。",
-            },
+            usage=_usage_payload(observation, identity),
             latency_ms=observation.wall_clock_ms,
             failure=failure.model_dump(mode="json"),
             exposure=self._exposure_payload(observation),
@@ -592,8 +663,37 @@ class OfflineExecutor:
         if prompt_variant is not None:
             kwargs["prompt_variant"] = prompt_variant
 
+        # 本单元已消费的逻辑调用基线 —— 预算**在图中途**耗尽时,
+        # 该单元确实已经调用过若干次,记录里必须写实际次数而不是 0。
+        invocations_before = self.governor.counters.logical_llm_invocations
         try:
             observation = await adapter.run(task, behavior=self.behavior, **kwargs)
+        except BudgetExceeded as exc:
+            # **必须排在通用 `except Exception` 之前**:`BudgetExceeded` 是
+            # `AssertionError` 子类,落进通用分支会被记成 HARNESS_ERROR,
+            # 于是"我们主动停下了"被说成"工装坏了"。
+            attempted = self.governor.counters.logical_llm_invocations - invocations_before
+            failure = budget_abort_failure(type(exc).__name__)
+            writer.write(self._build_record(
+                unit=unit,
+                task=task,
+                observation=_blank_observation(
+                    unit,
+                    variant,
+                    llm_call_count=attempted,
+                    error=FailureClass.BUDGET_EXHAUSTED.value,
+                ),
+                execution_index=execution_index,
+                system_prompt=system_prompt,
+                status=RecordStatus.INCOMPLETE,
+                failure=failure,
+                resume=resume,
+                identity=self.identity,
+            ))
+            raise BudgetAbort(
+                f"单元 {unit.key} 触发了预算中止:{exc} —— "
+                "记录已标记 incomplete;预算耗尽不是重跑候选,而是实验停止条件"
+            ) from exc
         except Exception as exc:  # 工装自身失败:落盘 INCOMPLETE,然后中止
             failure = FailureRecord.from_class(
                 FailureClass.HARNESS_ERROR, error_type=type(exc).__name__
@@ -607,6 +707,7 @@ class OfflineExecutor:
                 status=RecordStatus.INCOMPLETE,
                 failure=failure,
                 resume=resume,
+                identity=self.identity,
             ))
             raise HarnessAbort(
                 f"单元 {unit.key} 触发了工装异常 {type(exc).__name__}:{exc} —— "
@@ -632,6 +733,7 @@ class OfflineExecutor:
             status=RecordStatus.COMPLETE,
             failure=failure,
             resume=resume,
+            identity=self.identity,
         )
         writer.write(record)
         return observation, record
@@ -663,7 +765,13 @@ class OfflineExecutor:
         )
         pairs = build_matched_pairs(units)
         existing = existing or {}
-        resume_plan = plan_resume(units, existing)
+        resume_plan = plan_resume(units, existing, experiment_id=self.experiment_id)
+
+        # ---- 预算播种:继承的已消费量(D-2b)----
+        # 预算是**实验级**的。续跑时若不把已消费量算进来,等于重新发一份
+        # 完整额度 —— 上界就不再是上界。播种刻意**不经过** `record_unit()`,
+        # 否则继承的单元会被记成本次进程新执行的单元(F-3 同类失真)。
+        self.governor.seed_inherited(self._inherited_consumption(units, existing))
 
         raw_path = self.workdir / "raw" / f"{self.experiment_id}.jsonl"
         # 追加式写入器的副作用必须在这里被拦住(见 `assert_no_silent_append`)。
@@ -681,7 +789,7 @@ class OfflineExecutor:
                 prior = existing.get(
                     (unit.condition, unit.task_id, unit.baseline_label, unit.repetition_id)
                 )
-                eligibility = resume_eligibility(prior)
+                eligibility = resume_eligibility(prior, experiment_id=self.experiment_id)
                 if eligibility is ResumeEligibility.FROZEN:
                     # 冻结的单元**永不重跑**;它的记录仍然参与配对核验 ——
                     # 配对不变量描述的是"这个实验"的对照结构,
@@ -695,6 +803,17 @@ class OfflineExecutor:
                         origin_experiment_id=origin_experiment_id or prior.experiment_id,
                         resumed_from_index=prior.execution_index,
                     )
+                # ---- Tier 1:单元准入闸门(在产生**任何**调用之前)----
+                # 拒绝时**不落任何记录**:这个单元一次调用都没有发生,
+                # 给它写一条 INCOMPLETE 反而会让它看起来像"跑了但坏了"。
+                try:
+                    self.governor.admit_unit()
+                except BudgetExceeded as exc:
+                    raise BudgetAbort(
+                        f"单元 {unit.key} 未获准入:{exc} —— "
+                        "本单元**一次模型调用都没有发生**;预算耗尽不是重跑候选,"
+                        "而是实验停止条件"
+                    ) from exc
                 observation, record = await self._run_unit(
                     unit,
                     execution_index=execution_index,
@@ -704,6 +823,11 @@ class OfflineExecutor:
                     writer=writer,
                     resume=resume_meta,
                 )
+                # ---- 单元登记:只写单元级与物理尝试级 ----
+                # 逻辑调用数**已经**由 `reserve()` 在每次调用前逐次累计,
+                # 这里再记一次就会翻倍,而两份数字看起来都合理。
+                self.governor.record_unit(provider_http_attempts=None)
+                self.governor.check()
                 executed.append(unit.key)
                 records_by_key[unit.key] = record
                 self._records.append(record)
@@ -759,6 +883,36 @@ class OfflineExecutor:
         outcome.report_markdown = render_pilot_report(outcome)
         return outcome
 
+    def _inherited_consumption(
+        self,
+        units: Iterable[ExecutionUnit],
+        existing: dict[tuple[str, str, str, int], RawRecord],
+    ) -> InheritedConsumption:
+        """从**冻结**记录汇总继承的已消费量。
+
+        四个计数器**分别累加,不互相推导**:逻辑调用数只能来自记录里如实
+        记下的逻辑调用数,不能用"单元数 × 某个系数"去猜 —— 那正是
+        "计数器可以互相推导"这条禁令要防的事。
+        """
+        inherited = InheritedConsumption()
+        for unit in units:
+            prior = existing.get(
+                (unit.condition, unit.task_id, unit.baseline_label, unit.repetition_id)
+            )
+            if prior is None:
+                continue
+            if (
+                resume_eligibility(prior, experiment_id=self.experiment_id)
+                is not ResumeEligibility.FROZEN
+            ):
+                continue
+            inherited.experimental_runs += 1
+            inherited.experimental_run_attempts += prior.experimental_run_attempts
+            inherited.logical_llm_invocations += prior.logical_llm_invocations
+            # 物理尝试离线阶段不可观测 —— 继承量同样记"不可观测",**不记 0**。
+            inherited.provider_http_attempts_unobservable += 1
+        return inherited
+
     def _budget_snapshot(
         self,
         *,
@@ -768,6 +922,7 @@ class OfflineExecutor:
     ) -> dict[str, Any]:
         from app.evaluation.llm.budget import BudgetCounters
 
+        # **本次进程**口径 —— 与 D-2a 逐字段一致(报告里的样本量由它决定)。
         counters = BudgetCounters(
             experimental_runs=len(self._records),
             experimental_run_attempts=sum(
@@ -779,9 +934,23 @@ class OfflineExecutor:
             provider_http_attempts_observed=0,
             provider_http_attempts_unobservable=len(self._records),
         )
+        # **实验级**口径 —— 硬上界只对它生效(治理器权威值)。
+        experiment = self.governor.snapshot()
         return {
             **counters.snapshot(),
             "inherited_frozen_records": inherited_frozen_records,
+            "inherited_experimental_runs": experiment["inherited_experimental_runs"],
+            "inherited_logical_llm_invocations": experiment[
+                "inherited_logical_llm_invocations"
+            ],
+            "experiment_experimental_runs": experiment["experiment_experimental_runs"],
+            "experiment_logical_llm_invocations": experiment[
+                "experiment_logical_llm_invocations"
+            ],
+            "experiment_provider_http_attempts": experiment[
+                "experiment_provider_http_attempts"
+            ],
+            "governor": experiment,
             "conditions": list(self.baselines),
             "behaviors": list(self.behaviors),
             "treatment_runs": self.plan.treatment_runs,
@@ -799,8 +968,42 @@ class OfflineExecutor:
         }
 
 
-def _blank_observation(unit: ExecutionUnit, variant: str) -> LLMObservation:
-    """工装中止时的占位观测 —— 它**不是**模型结果,只是让记录可被构造。"""
+def _usage_payload(
+    observation: LLMObservation, identity: ModelIdentity
+) -> dict[str, Any]:
+    """usage 载荷。**来源与措辞都由身份决定**,不写死 `"scripted"`。
+
+    `None` 一律是 NOT_AVAILABLE(不可得),**不是 0** ——
+    这个区分是"没有数据"与"用量为零"的分界线。
+    """
+    if identity.is_scripted:
+        note = "脚本化运行不产生 usage;None = NOT_AVAILABLE,不是 0。"
+    else:
+        note = (
+            "usage 来自 provider 返回的用量元数据;None = NOT_AVAILABLE"
+            "(provider 未返回),**不是 0**。"
+        )
+    return {
+        "input_tokens": observation.input_tokens,
+        "output_tokens": observation.output_tokens,
+        "total_tokens": observation.total_tokens,
+        "source": identity.usage_source,
+        "note": note,
+    }
+
+
+def _blank_observation(
+    unit: ExecutionUnit,
+    variant: str,
+    *,
+    llm_call_count: int = 0,
+    error: str = "HarnessAbort",
+) -> LLMObservation:
+    """中止时的占位观测 —— 它**不是**模型结果,只是让记录可被构造。
+
+    `llm_call_count` 允许调用方填入**实际已发生**的逻辑调用数:
+    预算在图中途耗尽时,该单元确实已经调用过若干次,记 0 就是漏报。
+    """
     return LLMObservation(
         task_id=unit.task_id,
         baseline=unit.baseline_label,
@@ -808,8 +1011,8 @@ def _blank_observation(unit: ExecutionUnit, variant: str) -> LLMObservation:
         dataset_variant=variant,
         condition=unit.condition,
         run_status="llm_failed",
-        error="HarnessAbort",
-        llm_call_count=0,
+        error=error,
+        llm_call_count=llm_call_count,
         payload_present_in_dataset=variant == VARIANT_INJECTION,
         payload_visible_to_model=None,
     )

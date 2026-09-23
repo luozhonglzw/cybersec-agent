@@ -167,8 +167,8 @@ def test_8_a_complete_bad_result_is_not_resumable():
         final_narrative="完全错误的结论:风险等级 none,无需任何处置。",
         metric_outputs={"note": "很差"},
     )
-    assert resume_eligibility(bad) is ResumeEligibility.FROZEN
-    assert is_resumable(bad) is False
+    assert resume_eligibility(bad, experiment_id="e1") is ResumeEligibility.FROZEN
+    assert is_resumable(bad, experiment_id="e1") is False
 
 
 def test_9_an_incomplete_infrastructure_record_is_resumable():
@@ -176,8 +176,8 @@ def test_9_an_incomplete_infrastructure_record_is_resumable():
         record_status=RecordStatus.INCOMPLETE,
         failure={"failure_class": "PROCESS_CRASH", "count_as_model_result": False},
     )
-    assert resume_eligibility(crashed) is ResumeEligibility.RESUMABLE
-    assert is_resumable(crashed) is True
+    assert resume_eligibility(crashed, experiment_id="e1") is ResumeEligibility.RESUMABLE
+    assert is_resumable(crashed, experiment_id="e1") is True
 
 
 def test_9b_resume_plan_separates_the_three_states(d2a_plan):
@@ -200,7 +200,7 @@ def test_9b_resume_plan_separates_the_three_states(d2a_plan):
         (units[1].condition, units[1].task_id, units[1].baseline_label, units[1].repetition_id):
             incomplete,
     }
-    plan = plan_resume(units, existing)
+    plan = plan_resume(units, existing, experiment_id="e1")
     assert len(plan[ResumeEligibility.FROZEN.value]) == 1
     assert len(plan[ResumeEligibility.RESUMABLE.value]) == 1
     assert len(plan[ResumeEligibility.NEVER_EXECUTED.value]) == 106

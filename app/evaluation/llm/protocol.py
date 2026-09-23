@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.evaluation.llm.dataset import (
     LLM_DATASET_VERSION,
@@ -35,6 +35,7 @@ from app.evaluation.llm.dataset import (
     VARIANT_INJECTION,
     VARIANT_INJECTION_INERT,
 )
+from app.evaluation.llm.identity import parse_endpoint_category
 from app.evaluation.llm.metrics import NOT_EVALUABLE_REASONS
 from app.evaluation.llm.tasks import LLMTask
 
@@ -439,7 +440,14 @@ class ExperimentManifest(BaseModel):
 
     provider: str = TO_BE_FROZEN_AFTER_PROVIDER_SELECTION
     model: str = TO_BE_FROZEN_AFTER_PROVIDER_SELECTION
-    endpoint_category: str = TO_BE_FROZEN_AFTER_PROVIDER_SELECTION
+    endpoint_category: str = Field(
+        default=TO_BE_FROZEN_AFTER_PROVIDER_SELECTION,
+        description=(
+            "端点类别。**已填写时必须落在冻结词表内**;候选清单仍可用占位符,"
+            "但一旦填了值就必须是 SCRIPTED_OFFLINE / OPENAI_OFFICIAL / "
+            "OPENAI_COMPATIBLE 之一 —— 不得用端点 URL 代替本字段"
+        ),
+    )
     base_url_host_sha256: str | None = Field(
         default=None,
         description="**只记主机名的摘要**;完整 URL 可能内嵌凭据,一律不记",
@@ -486,6 +494,41 @@ class ExperimentManifest(BaseModel):
     manifest_digest: str = Field(
         default="", description="清单自身的摘要;计算时排除本字段"
     )
+
+    @field_validator("endpoint_category")
+    @classmethod
+    def _validate_endpoint_category(cls, value: str) -> str:
+        """`endpoint_category` 必须落在**冻结词表**内。
+
+        占位符放行是刻意的:§7 明确"候选清单仍是候选",本阶段**不得**冻结
+        真实 provider 清单,因此占位符必须仍然合法。但一旦有人填了值,
+        就必须是词表内的三个取值之一 —— 不得把 `https://api.deepseek.com`
+        这类端点 URL 塞进本字段(URL 会随 region/灰度/代理漂移,而且可能
+        内嵌凭据;类别不会)。
+
+        注意:这里**只做词表校验**,不做"猜测纠正"。未知取值一律拒绝。
+        """
+        if value.startswith(TO_BE_FROZEN):
+            return value
+        return parse_endpoint_category(value).value
+
+    @field_validator("provider", "model")
+    @classmethod
+    def _validate_provider_identity_fields(cls, value: str) -> str:
+        """`provider` / `model` 同样允许占位符,但不允许**空串或纯空白**。
+
+        一个空白的 provider 标签比一个显式占位符危险得多:占位符会在
+        `verify_manifest(require_frozen=True)` 处被机械拒绝,而空串看起来
+        "已经填过了"。
+        """
+        if value.startswith(TO_BE_FROZEN):
+            return value
+        if not value.strip():
+            raise ValueError(
+                "provider / model 不得为空串或纯空白 —— "
+                f"未冻结请显式使用 {TO_BE_FROZEN_AFTER_PROVIDER_SELECTION!r}"
+            )
+        return value
 
 
 def manifest_digest_domain(manifest: ExperimentManifest) -> dict[str, Any]:

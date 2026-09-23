@@ -21,6 +21,16 @@
 
 未执行(完全没有记录)的单元当然要跑 —— 那是恢复,不是挑样本。
 两者在 `resume_eligibility()` 里被**分开报告**,不合并成一个布尔值。
+
+实验身份(**D-2b**)
+----------------
+记录的单元身份键 `(condition, task_id, baseline_label, repetition_id)` **不含实验**。
+因此 `resume_eligibility()` / `is_resumable()` / `index_by_unit()` 都把
+`experiment_id` 作为**必填** keyword 参数:跨实验的记录不是完成状态,
+而是必须被**拒绝**的输入。
+
+否则校准实验的完整记录会让试点实验的对应单元**静默地永不执行** ——
+少测了一个单元,而报告看起来完全正常。
 """
 import hashlib
 import json
@@ -33,6 +43,7 @@ from typing import Any, Iterable
 from pydantic import BaseModel, Field
 
 from app.evaluation.llm.budget import UNKNOWN
+from app.evaluation.llm.identity import EndpointCategory
 from app.evaluation.llm.protocol import canonical_json, sha256_hex
 
 # ---------------------------------------------------------------------------
@@ -114,17 +125,47 @@ class ResumeEligibility(str, Enum):
     NEVER_EXECUTED = "NEVER_EXECUTED"  # 完全没有记录 —— 属于恢复,不是重跑
 
 
-def resume_eligibility(record: "RawRecord | None") -> ResumeEligibility:
+class ForeignExperimentRecord(RuntimeError):
+    """记录属于**另一个实验** —— 拒绝把它当作本实验的完成状态。"""
+
+
+def resume_eligibility(
+    record: "RawRecord | None", *, experiment_id: str
+) -> ResumeEligibility:
+    """续跑判定。**实验身份是判定的一部分。**
+
+    为什么 `experiment_id` 必须进入判定边界
+    --------------------------------------
+    记录的身份键是 `(condition, task_id, baseline_label, repetition_id)` ——
+    **不含实验**。于是 D-2c 校准实验里某个同名单元的完整记录,会被试点实验
+    当成"已完成"而冻结继承:那个单元**再也不会被执行**,而报告看起来完全正常。
+    这是"静默少测了一个单元",与 F-1 / F-3 同类。
+
+    因此记录不属于本实验时**直接拒绝**(fail closed),而不是静默忽略 ——
+    静默忽略会让"传错了文件"这种错误永远不被发现。
+
+    参数是**必填 keyword**:留默认值等于允许调用方忘记传,
+    而"忘记传"正是这条守卫要防的失效模式。
+    """
     if record is None:
         return ResumeEligibility.NEVER_EXECUTED
+    if record.experiment_id != experiment_id:
+        raise ForeignExperimentRecord(
+            f"记录属于实验 {record.experiment_id!r},而本次实验是 {experiment_id!r} —— "
+            f"单元 {record.identity_key()!r} 不得被当作已完成状态继承。"
+            "跨实验的完成状态不是完成状态。"
+        )
     if record.record_status == RecordStatus.COMPLETE:
         return ResumeEligibility.FROZEN
     return ResumeEligibility.RESUMABLE
 
 
-def is_resumable(record: "RawRecord | None") -> bool:
+def is_resumable(record: "RawRecord | None", *, experiment_id: str) -> bool:
     """只有 `FROZEN` 不可续跑。**结果好坏不参与判定。**"""
-    return resume_eligibility(record) is not ResumeEligibility.FROZEN
+    return (
+        resume_eligibility(record, experiment_id=experiment_id)
+        is not ResumeEligibility.FROZEN
+    )
 
 
 def build_resume_metadata(
@@ -172,10 +213,24 @@ class RawRecord(BaseModel):
         default=UNKNOWN, description="可观测时为 int,否则 UNKNOWN",
     )
 
-    # ---- provider 元数据(D-2a 只能是 provider_default / UNKNOWN)----
+    # ---- provider 元数据(由 `ModelIdentity` 显式给出,不再写死)----
     provider: str = "scripted"
     model: str = ""
+    endpoint_category: str = Field(
+        default=EndpointCategory.SCRIPTED_OFFLINE.value,
+        description=(
+            "端点类别(冻结词表)。默认值只为了让 D-2a 既有记录仍可解析 —— "
+            "新写入的记录一律由 `ModelIdentity` 显式给出。"
+        ),
+    )
     provider_reported_model_id: str | None = None
+    temperature: float | None = Field(
+        default=None,
+        description=(
+            "显式温度;`None` = 未显式设定(离线脚本化即如此)。"
+            "真实试点固定为 0(见 `identity.REAL_PROVIDER_TEMPERATURE`)。"
+        ),
+    )
     base_url_host_sha256: str | None = Field(
         default=None, description="只记主机名摘要;完整 URL 可能内嵌凭据",
     )
@@ -283,9 +338,25 @@ class RawWriter:
         return records
 
 
-def index_by_unit(records: Iterable[RawRecord]) -> dict[tuple[str, str, str, int], RawRecord]:
-    """按实验单元身份索引。同键后写覆盖先写(不应发生;发生了说明有重复)。"""
-    return {record.identity_key(): record for record in records}
+def index_by_unit(
+    records: Iterable[RawRecord], *, experiment_id: str
+) -> dict[tuple[str, str, str, int], RawRecord]:
+    """按实验单元身份索引,**只收录属于本实验的记录**。
+
+    同键后写覆盖先写(不应发生;发生了说明有重复)。
+
+    跨实验的记录**直接拒绝**而不是丢弃:静默丢弃会让"传错了文件"永远不被
+    发现,而那个错误的后果恰恰是"某个单元静默地没被测到"。
+    """
+    indexed: dict[tuple[str, str, str, int], RawRecord] = {}
+    for record in records:
+        if record.experiment_id != experiment_id:
+            raise ForeignExperimentRecord(
+                f"记录属于实验 {record.experiment_id!r},而本次实验是 {experiment_id!r} —— "
+                f"单元 {record.identity_key()!r} 不得进入本实验的已完成状态索引。"
+            )
+        indexed[record.identity_key()] = record
+    return indexed
 
 
 def digest_file(path: Path | str) -> str:

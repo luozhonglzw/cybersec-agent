@@ -490,20 +490,25 @@ def test_fresh_run_plan_is_all_never_executed(d2a_plan):
         )
         for key in d2a_plan.ordered_unit_keys
     ]
-    plan = plan_resume(units, {})
+    plan = plan_resume(units, {}, experiment_id="session-e2e")
     assert len(plan[ResumeEligibility.NEVER_EXECUTED.value]) == 108
     assert plan[ResumeEligibility.FROZEN.value] == []
     assert plan[ResumeEligibility.RESUMABLE.value] == []
 
 
 def test_rerunning_with_complete_records_executes_nothing(d2a_outcome, tmp_path):
-    """**已完成**的单元永不重跑 —— 这是本阶段唯一的不可协商条款。"""
+    """**已完成**的单元永不重跑 —— 这是本阶段唯一的不可协商条款。
+
+    D-2b 起 `experiment_id` 是续跑判定边界的一部分,因此这里必须与产出记录的
+    实验同名 —— 跨实验的完成状态**不是**完成状态(见 `test_d2b_isolation.py`)。
+    """
     existing = index_by_unit(
-        RawWriter(d2a_outcome.raw_path, experiment_id="x").read_all()
+        RawWriter(d2a_outcome.raw_path, experiment_id="x").read_all(),
+        experiment_id="session-e2e",
     )
     executor = OfflineExecutor(
         workdir=tmp_path / "resume-all-frozen",
-        experiment_id="resume-all-frozen",
+        experiment_id="session-e2e",
         guard=NetworkEgressGuard(strict=True),
     )
     resumed = asyncio.run(executor.run(existing=existing))
@@ -518,11 +523,12 @@ def test_rerunning_with_complete_records_executes_nothing(d2a_outcome, tmp_path)
 def test_resumed_run_still_verifies_pairing(d2a_outcome, tmp_path):
     """冻结记录仍参与配对核验 —— 配对描述的是"这个实验",不是"这个进程"。"""
     existing = index_by_unit(
-        RawWriter(d2a_outcome.raw_path, experiment_id="x").read_all()
+        RawWriter(d2a_outcome.raw_path, experiment_id="x").read_all(),
+        experiment_id="session-e2e",
     )
     executor = OfflineExecutor(
         workdir=tmp_path / "resume-pairing",
-        experiment_id="resume-pairing",
+        experiment_id="session-e2e",
         guard=NetworkEgressGuard(strict=True),
     )
     resumed = asyncio.run(executor.run(existing=existing))
@@ -542,11 +548,12 @@ def test_partial_resume_skips_complete_and_reruns_incomplete(d2a_outcome, tmp_pa
     ]
     executor = OfflineExecutor(
         workdir=tmp_path / "resume-one",
-        experiment_id="resume-one",
+        experiment_id="session-e2e",
         guard=NetworkEgressGuard(strict=True),
     )
     resumed = asyncio.run(executor.run(
-        existing=index_by_unit(mutated), origin_experiment_id="session-e2e"
+        existing=index_by_unit(mutated, experiment_id="session-e2e"),
+        origin_experiment_id="session-e2e",
     ))
     assert resumed.executed_keys == [target_key(target)]
     assert len(resumed.skipped_frozen_keys) == 107
@@ -565,13 +572,14 @@ def test_resumed_record_carries_origin_metadata(d2a_outcome, tmp_path):
     ]
     executor = OfflineExecutor(
         workdir=tmp_path / "resume-meta",
-        experiment_id="resume-meta",
+        experiment_id="session-e2e",
         guard=NetworkEgressGuard(strict=True),
     )
     resumed = asyncio.run(executor.run(
-        existing=index_by_unit(mutated), origin_experiment_id="session-e2e"
+        existing=index_by_unit(mutated, experiment_id="session-e2e"),
+        origin_experiment_id="session-e2e",
     ))
-    written = RawWriter(resumed.raw_path, experiment_id="resume-meta").read_all()
+    written = RawWriter(resumed.raw_path, experiment_id="session-e2e").read_all()
     assert len(written) == 1
     assert written[0].resume == {
         "origin_experiment_id": "session-e2e",
@@ -714,7 +722,7 @@ def test_resume_into_the_same_workdir_is_still_allowed(tmp_path, reduced_plan):
 
     resumed = asyncio.run(
         _reduced_executor(workdir, "exp", reduced_plan).run(
-            existing=index_by_unit(records), origin_experiment_id="exp"
+            existing=index_by_unit(records, experiment_id="exp"), origin_experiment_id="exp"
         )
     )
 
@@ -781,7 +789,7 @@ def test_resumed_report_states_the_inherited_frozen_records(tmp_path, reduced_pl
 
     resumed = asyncio.run(
         _reduced_executor(workdir, "exp", reduced_plan).run(
-            existing=index_by_unit(records), origin_experiment_id="exp"
+            existing=index_by_unit(records, experiment_id="exp"), origin_experiment_id="exp"
         )
     )
     text = resumed.report_markdown
