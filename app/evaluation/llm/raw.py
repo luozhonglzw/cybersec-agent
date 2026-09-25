@@ -227,8 +227,10 @@ class RawRecord(BaseModel):
     temperature: float | None = Field(
         default=None,
         description=(
-            "显式温度;`None` = 未显式设定(离线脚本化即如此)。"
-            "真实试点固定为 0(见 `identity.REAL_PROVIDER_TEMPERATURE`)。"
+            "显式温度;`None` = **NOT_SET**(请求体里没有该字段;"
+            "离线脚本化与 D-2c 标定均如此)。"
+            "`identity.REAL_PROVIDER_TEMPERATURE` 是 D-2a/D-2b 真实 provider"
+            "身份的历史默认值,**不是** D-2c 的策略。"
         ),
     )
     base_url_host_sha256: str | None = Field(

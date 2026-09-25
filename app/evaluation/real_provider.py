@@ -170,9 +170,12 @@ def build_chat_model(
     candidate: ProviderCandidate,
     api_key: str,
     base_url: str | None = None,
-    temperature: float = REAL_PROVIDER_TEMPERATURE,
+    temperature: float | None = REAL_PROVIDER_TEMPERATURE,
     timeout: float | None = None,
     max_tokens: int | None = None,
+    max_retries: int | None = None,
+    streaming: bool | None = None,
+    extra_body: dict[str, Any] | None = None,
     allow_network: bool = False,
 ) -> Any:
     """构造一个 OpenAI-compatible 聊天模型。**唯一的 provider 客户端落点。**
@@ -184,6 +187,21 @@ def build_chat_model(
     两者都是拒绝,但前者把注意力引向真正的配置问题。
 
     `langchain_openai` 的 import 在函数体内:导入本模块**不会**加载 provider SDK。
+
+    D-2c 新增的四个可选旋钮(**全部默认 `None` ⇒ 与 D-2b 逐字段一致**)
+    ------------------------------------------------------------------
+    `temperature`  传 `None` 表示 **NOT_SET**:该字段**完全不进入**请求体。
+                   这与"传 0.0"是两件不同的事 —— 前者表示"请求不依赖温度",
+                   后者是一个被显式设定的采样参数。调用方**不得**用 0.0
+                   冒充 NOT_SET(见 `app/evaluation/calibration/config.py`)。
+    `max_retries`  显式设定 SDK 层重试次数。不传 ⇒ 沿用 SDK 默认值。
+                   SDK 重试对 `BudgetGovernor` **不可见**:一次逻辑调用可能
+                   产生多次物理 HTTP 尝试,因此标定阶段必须显式声明。
+    `streaming`    显式设定,不依赖 SDK 默认值 —— 便于溯源。
+    `extra_body`   原样透传给 provider 请求体的**通用**逃生口。
+                   本模块**不理解**其中任何键的语义:provider 专属参数
+                   (如关闭思考模式)由调用方以数据形式提供,因此这里
+                   **不引入任何模型专属分支**。
     """
     if not api_key or not api_key.strip():
         raise MissingCredentialError(
@@ -201,8 +219,11 @@ def build_chat_model(
     kwargs: dict[str, Any] = {
         "model": candidate.model,
         "api_key": api_key,
-        "temperature": temperature,
     }
+    # NOT_SET 就是"不发这个字段"。用 `is not None` 而不是真值判断:
+    # `temperature=0.0` 是合法且**必须**被送出的显式取值。
+    if temperature is not None:
+        kwargs["temperature"] = temperature
     resolved_base_url = base_url or candidate.default_base_url
     if resolved_base_url:
         kwargs["base_url"] = resolved_base_url
@@ -210,6 +231,13 @@ def build_chat_model(
         kwargs["timeout"] = timeout
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    if streaming is not None:
+        kwargs["streaming"] = streaming
+    if extra_body is not None:
+        # 拷一份:调用方的 dict 之后被改动不应影响已构造的客户端。
+        kwargs["extra_body"] = dict(extra_body)
     return ChatOpenAI(**kwargs)
 
 
@@ -218,9 +246,12 @@ def make_llm_factory(
     candidate: ProviderCandidate,
     api_key: str,
     base_url: str | None = None,
-    temperature: float = REAL_PROVIDER_TEMPERATURE,
+    temperature: float | None = REAL_PROVIDER_TEMPERATURE,
     timeout: float | None = None,
     max_tokens: int | None = None,
+    max_retries: int | None = None,
+    streaming: bool | None = None,
+    extra_body: dict[str, Any] | None = None,
     allow_network: bool = False,
 ) -> Callable[..., Any]:
     """返回一个符合 `adapters.LLMFactory` 协议的工厂。
@@ -239,6 +270,9 @@ def make_llm_factory(
             temperature=temperature,
             timeout=timeout,
             max_tokens=max_tokens,
+            max_retries=max_retries,
+            streaming=streaming,
+            extra_body=extra_body,
             allow_network=allow_network,
         )
 
@@ -251,11 +285,15 @@ def identity_for_candidate(
     base_url: str | None = None,
     provider_reported_model_id: str | None = None,
     provider_default_parameters: dict[str, Any] | None = None,
-    temperature: float = REAL_PROVIDER_TEMPERATURE,
+    temperature: float | None = REAL_PROVIDER_TEMPERATURE,
 ) -> ModelIdentity:
     """构造与候选一致的 `ModelIdentity`。
 
     `base_url` 只被用来算**主机名摘要**;完整 URL(可能内嵌凭据)**不进入**身份对象。
+
+    `temperature` 传 `None` 表示 **NOT_SET**(请求体里根本没有这个字段)。
+    它必须与**实际送出的请求**取自同一个来源 —— 见
+    `app/evaluation/calibration/config.py` 的单一事实来源约束。
     """
     return provider_identity(
         provider=candidate.provider,
@@ -266,3 +304,45 @@ def identity_for_candidate(
         provider_default_parameters=provider_default_parameters,
         temperature=temperature,
     )
+
+
+# ---------------------------------------------------------------------------
+# 响应侧读取(**纯 getattr,不 import 任何 SDK**)
+# ---------------------------------------------------------------------------
+
+
+def provider_reported_model_id_of(message: Any) -> str | None:
+    """从 `AIMessage.response_metadata["model_name"]` 取 provider **自报**的模型标识。
+
+    为什么必须与"请求的模型"分开记录:provider 完全可能回一个别名、一个
+    版本化标识,或一个家族名。把两者合并会让"我们请求了什么"与
+    "provider 实际用了什么"无法区分 —— 而后者正是标定要确认的东西之一。
+
+    缺失 / 空串一律返回 `None`(= NOT_AVAILABLE),**不猜**。
+    """
+    metadata = getattr(message, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("model_name")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def raw_token_usage_of(message: Any) -> dict[str, Any] | None:
+    """从 `AIMessage.response_metadata["token_usage"]` 取 provider **原始**用量字典。
+
+    为什么需要原始字典:LangChain 的归一化 `usage_metadata` 只映射
+    OpenAI 形状的嵌套字段。provider 的**顶层**专属计数器(例如缓存命中/未命中)
+    不会出现在归一化结果里,却会原样保留在这个原始字典中。
+    把它丢掉等于把"provider 报了什么"降级成"我们认得什么"。
+
+    缺失 / 非字典一律返回 `None`,**不伪造 `{}` 或 0**。
+    """
+    metadata = getattr(message, "response_metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    usage = metadata.get("token_usage")
+    if isinstance(usage, dict):
+        return dict(usage)
+    return None

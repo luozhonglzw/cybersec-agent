@@ -135,14 +135,24 @@ def base_url_host_sha256(base_url: str | None) -> str | None:
 #: 离线脚本化 provider 的标签(与 D-1 / D-2a 保持一致,不得改写)。
 SCRIPTED_PROVIDER = "scripted"
 
-#: 真实试点的温度策略:**0**。
+#: 真实 provider 身份构造的**历史默认值**:`0`。
 #:
-#: 这不是"provider 默认值",而是**实验设计参数**:n=3 的重复运行若各自采样
-#: 温度不同,"同一个条件的两次运行差异"就同时包含采样噪声与真实差异。
-#: 重复性优先于"发挥模型能力" —— 后者不是本试点的目的。
+#: 作用域(D-2c 更正)
+#: ------------------
+#: 这是 D-2a / D-2b 时代"真实 provider 身份"的默认温度,也是
+#: `provider_identity()` / `identity_for_candidate()` 的默认入参。保留它是为了
+#: 让**已冻结的 D-2b 记录与测试逐字段不变**,不是因为它仍是当前策略。
 #:
-#: 注意:它**不是**清单里的冻结值。清单冻结在 D-2b 之后的独立闸门完成;
-#: 本阶段只把"温度 = 0"这条策略做成代码里的单一事实来源。
+#: 它**不是** D-2c 标定的温度策略。D-2c 冻结的是 **NOT_SET**:请求体里根本
+#: 不带 `temperature` 字段,记录里写 `None`。两者不可互相冒充 ——
+#: "不发送该参数"与"显式设为 0"在溯源上是两件事,把前者记成后者是伪造。
+#: 见 `app/evaluation/calibration/config.py`。
+#:
+#: 原始理由(D-2a/D-2b 仍然成立):这不是"provider 默认值",而是**实验设计
+#: 参数** —— n=3 的重复运行若各自采样温度不同,"同一个条件的两次运行差异"
+#: 就同时包含采样噪声与真实差异。重复性优先于"发挥模型能力"。
+#:
+#: 注意:它**不是**清单里的冻结值。
 REAL_PROVIDER_TEMPERATURE: float = 0.0
 
 
@@ -171,8 +181,10 @@ class ModelIdentity(BaseModel):
     temperature: float | None = Field(
         default=None,
         description=(
-            "显式温度;`None` = 未显式设定(离线脚本化即如此)。"
-            f"真实试点固定为 {REAL_PROVIDER_TEMPERATURE}。"
+            "显式温度;`None` = **NOT_SET** —— 请求体里根本没有该字段"
+            "(离线脚本化如此,D-2c 标定亦如此)。"
+            f"`{REAL_PROVIDER_TEMPERATURE}` 是 D-2a/D-2b 真实 provider 身份的"
+            "历史默认值,**不是** D-2c 的策略。"
         ),
     )
     base_url_host_sha256: str | None = Field(
