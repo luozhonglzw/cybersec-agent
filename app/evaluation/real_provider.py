@@ -176,6 +176,7 @@ def build_chat_model(
     max_retries: int | None = None,
     streaming: bool | None = None,
     extra_body: dict[str, Any] | None = None,
+    http_async_client: Any | None = None,
     allow_network: bool = False,
 ) -> Any:
     """构造一个 OpenAI-compatible 聊天模型。**唯一的 provider 客户端落点。**
@@ -202,6 +203,24 @@ def build_chat_model(
                    本模块**不理解**其中任何键的语义:provider 专属参数
                    (如关闭思考模式)由调用方以数据形式提供,因此这里
                    **不引入任何模型专属分支**。
+    `http_async_client`
+                   在**构造期**注入的异步 HTTP 客户端(**F8 修复**,
+                   见 `app/evaluation/calibration/` 的标定证据缺口)。
+                   用途:调用方传入一个自带记录钩子的真实
+                   `httpx.AsyncClient`,即可观测**最终序列化的请求体**;
+                   传入 `httpx.MockTransport` 客户端则可做完全离线的
+                   形状验证。默认 `None` ⇒ 该 kwarg 完全不传 ⇒
+                   与 D-2b / D-2c 的既有行为逐字段一致。
+
+    **为什么必须是"构造期",而不是"构造后赋值"**
+    --------------------------------------------
+    已实测(见 `tests/test_evaluation_llm/test_d2c_f8_payload_seam.py`):
+    `langchain_openai` 的 `BaseChatOpenAI` 在**构造期**就把
+    `root_client` / `client` / `root_async_client` / `async_client` 全部物化
+    (`chat_models/base.py:827-846`),并在这一刻读取 `self.http_async_client`。
+    构造之后再赋值虽然会被存进实例,却**永远不会被读取** —— 于是
+    "我挂上了拦截器"与"请求真的走了拦截器"分叉,而两边看起来都正常。
+    因此本参数**只在构造期生效**;本模块**不提供**任何构造后替换入口。
     """
     if not api_key or not api_key.strip():
         raise MissingCredentialError(
@@ -238,6 +257,9 @@ def build_chat_model(
     if extra_body is not None:
         # 拷一份:调用方的 dict 之后被改动不应影响已构造的客户端。
         kwargs["extra_body"] = dict(extra_body)
+    if http_async_client is not None:
+        # **必须**在这里传入:见 docstring —— SDK 客户端在构造期即被物化。
+        kwargs["http_async_client"] = http_async_client
     return ChatOpenAI(**kwargs)
 
 
@@ -252,6 +274,7 @@ def make_llm_factory(
     max_retries: int | None = None,
     streaming: bool | None = None,
     extra_body: dict[str, Any] | None = None,
+    http_async_client: Any | None = None,
     allow_network: bool = False,
 ) -> Callable[..., Any]:
     """返回一个符合 `adapters.LLMFactory` 协议的工厂。
@@ -273,6 +296,7 @@ def make_llm_factory(
             max_retries=max_retries,
             streaming=streaming,
             extra_body=extra_body,
+            http_async_client=http_async_client,
             allow_network=allow_network,
         )
 
