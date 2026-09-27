@@ -6,6 +6,7 @@
     C0a  provider 握手        —— 只回答"能不能连上、能不能读懂响应形状"
     C0b  长输出上限探针       —— 只回答"我们请求的输出上限有没有被执行"
     C1   工具调用形状         —— 只回答"模型给的 tool call 形状合不合法"
+                                 (前提:声明的工具契约真的到了 provider)
     C2   工具往返             —— 只回答"tool_call_id 能不能原样往返"
     C3   真实图代码路径       —— 在**真实** LangGraph 路径上跑合成模型
     C4   一个代表性评测单元   —— 走一次完整适配器,合成模型 + 真实工具
@@ -15,6 +16,7 @@
 
     请求的模型            ≠  provider 自报的模型
     声明的输出上限        ≠  观测到的输出用量
+    声明的工具绑定        ≠  请求体里观测到的工具
     阶段调用上限          ≠  实际发生的调用数
     理论 HTTP 尝试上界    ≠  观测到的物理尝试数
 
@@ -102,6 +104,17 @@ class CalibrationRequest:
 
     `model_kwargs` 一律由 `CalibrationConfig` 派生 —— 这是"请求溯源与记录
     溯源不得分叉"的落点。调用器不得往里面加任何东西。
+
+    `tool_binding` 是这条纪律的**唯一例外**,而且不是例外
+    --------------------------------------------------
+    工具**不是** `model_kwargs` 里的一条参数:它不经过构造器,而是在
+    `bind_tools()` 那一刻才落到线上。因此它必须与"我们打算发什么"一起被
+    请求对象携带,否则调用器就有一个**无人观测**的自由度 —— 它可以绑任何
+    工具集,而记录里看不出区别。
+
+    所以这里记的是**声明**:调用器只被允许绑 `tool_binding` 声明的东西
+    (见 `bind_declared_tools`),而线上实际出现了什么由 C1 从请求体里
+    **观测**。声明与观测各自记录,永不互相顶替。
     """
 
     stage: Stage
@@ -109,6 +122,7 @@ class CalibrationRequest:
     model_kwargs: Mapping[str, Any]
     output_token_cap: int
     demanded_output_tokens: int | None = None
+    tool_binding: "ToolBinding | None" = None
 
     def extra_body(self) -> dict[str, Any]:
         body = self.model_kwargs.get("extra_body")
@@ -145,6 +159,87 @@ class ToolContract:
     arg_schemas: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
 
+#: `CalibrationConfig.request_shape()` 的 11 个键**不含** `tools`,
+#: 因此 `request_digest` **覆盖不到**工具绑定。这是一个**已知的覆盖缺口**,
+#: 不是"已覆盖"。
+#:
+#: 把它记成一个常量、并让每一份 C1 证据都带上它,是为了让缺口**可被审阅**:
+#: 缺口一旦只存在于文档里,下一个人会理所当然地把 `request_digest` 读成
+#: "整条请求的形状指纹",而它只覆盖了 11 个键。
+REQUEST_DIGEST_COVERS_TOOL_BINDING = False
+
+
+@dataclass(frozen=True)
+class ToolBinding:
+    """一次请求**声明**要绑定的工具 —— 绑上线的东西与拿来校验的东西的**共同祖先**。
+
+    为什么持有**工具对象本身**,而不是它们的 schema 副本
+    --------------------------------------------------
+    `bind_tools()` 要的是工具对象;校验要的是 schema。若为了校验而复制一份
+    schema,同一件事就立刻有了两个事实来源:工具对象改了而副本没改时,
+    **发出去的是新工具集、校验用的是旧契约** —— 两边看起来都合理,而
+    "模型给的 tool call 合不合法"这个问题的答案会变得毫无意义。
+
+    因此这里只存工具对象,schema 由 `as_contract()` **现场派生**。
+    于是:
+
+        binding.source ──> bindable_tools(binding) ──> bind_tools() ──> 线上
+                       └─> as_contract()            ──> 校验
+
+    两条路径出自**同一个元组**,不存在可以各自漂移的第二份事实。
+    """
+
+    tools: tuple[Any, ...]
+    #: 绑定的出处(只用于溯源;**不**参与判定,也不替代 `tool_names`)。
+    source: str
+
+    @property
+    def tool_names(self) -> tuple[str, ...]:
+        """声明要绑的工具名,**按绑定顺序**。"""
+        return tuple(getattr(tool, "name", "") for tool in self.tools)
+
+    def as_contract(self) -> ToolContract:
+        """由绑定**派生**校验契约。验证侧的唯一来源。"""
+        schemas: dict[str, Mapping[str, Any]] = {}
+        for tool in self.tools:
+            name = getattr(tool, "name", "")
+            call_schema = getattr(tool, "tool_call_schema", None)
+            if call_schema is not None and hasattr(call_schema, "model_json_schema"):
+                schemas[name] = call_schema.model_json_schema()
+            else:  # pragma: no cover - 回退:至少保留 properties
+                schemas[name] = {"properties": dict(getattr(tool, "args", {}) or {})}
+        return ToolContract(allowed_tool_names=self.tool_names, arg_schemas=schemas)
+
+
+def bindable_tools(binding: ToolBinding) -> tuple[Any, ...]:
+    """交给 `bind_tools()` 的工具元组 —— 与 `as_contract()` 同源。
+
+    刻意做成一个具名接缝而不是直接暴露 `binding.tools`:这样"绑什么"
+    只有一个可被替换、也可被测试观察的落点。
+    """
+    return binding.tools
+
+
+def bind_declared_tools(model: Any, request: CalibrationRequest) -> Any:
+    """把请求**声明**的工具绑到模型上。
+
+    这是调用器**唯一**被允许的绑定入口:只绑 `request.tool_binding` 里声明的
+    东西,既不增也不减。任何额外的绑定都会让"线上请求体里的工具"与"声明"
+    分叉 —— 而 C1 的判定正是建立在这两者一致的前提上。
+
+    未声明绑定(或声明为空)时**原样返回模型**,不调用 `bind_tools`:
+    `bind_tools([])` 会在线上留下一个 `tools: []` 字段,那是"我们绑了个空集",
+    与"我们根本没绑"是两件不同的事,记录里必须分得开。
+    """
+    binding = request.tool_binding
+    if binding is None:
+        return model
+    tools = bindable_tools(binding)
+    if not tools:
+        return model
+    return model.bind_tools(tools)
+
+
 @dataclass(frozen=True)
 class EvaluationUnit:
     """C4 的"一个代表性评测单元"。"""
@@ -166,6 +261,12 @@ class StageDeps:
     `graph_model` 与 `unit_model` **刻意分开**:它们是两份独立的合成脚本。
     共用一个实例会让先跑的 C3 把脚本耗尽,于是 C4 拿到的是"(脚本已耗尽)"
     —— 一个看起来跑通了、实际上什么都没测的评测单元。
+
+    `tool_binding` 与 `tool_contract` 的分工
+    --------------------------------------
+    `tool_binding` 是 C1 的**唯一**工具事实来源(工具对象 → 绑定 → 校验契约)。
+    `tool_contract` 保留下来做**交叉核对**:调用方若另外给了一份契约,它必须
+    与绑定同源,否则 C1 判定为 FAIL(同一件事不许有两个事实来源)。
     """
 
     invoke: InvokeFn | None = None
@@ -174,6 +275,7 @@ class StageDeps:
     graph_model: SyntheticProviderModel | None = None
     unit_model: SyntheticProviderModel | None = None
     evaluation_unit: EvaluationUnit | None = None
+    tool_binding: ToolBinding | None = None
 
 
 class StageDependencyMissing(RuntimeError):
@@ -248,8 +350,15 @@ class StageContext:
         messages: Sequence[Any],
         output_token_cap: int | None = None,
         demanded_output_tokens: int | None = None,
+        tool_binding: ToolBinding | None = None,
     ) -> CalibrationRequest:
-        """构造请求。`model_kwargs` **只**来自冻结配置。"""
+        """构造请求。`model_kwargs` **只**来自冻结配置。
+
+        `tool_binding` 是**声明**要绑的工具。它进请求对象而不是进
+        `model_kwargs`,理由见 `CalibrationRequest`:工具不是配置里的一条
+        参数,它由调用器在 `bind_tools()` 那一刻落到线上,因此只有跟着
+        请求走才可能被观测核验。
+        """
         kwargs = self.config.model_kwargs(output_token_cap=output_token_cap)
         cap = (
             self.config.output_token_cap
@@ -262,6 +371,7 @@ class StageContext:
             model_kwargs=kwargs,
             output_token_cap=cap,
             demanded_output_tokens=demanded_output_tokens,
+            tool_binding=tool_binding,
         )
 
     async def invoke_once(self, invoke: InvokeFn, request: CalibrationRequest) -> InvocationResult:
@@ -374,6 +484,53 @@ def _payload_cap(payload: Mapping[str, Any] | None) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     return None
+
+
+def _payload_tools_present(payload: Mapping[str, Any] | None) -> bool | None:
+    """请求体里**有没有** `tools` 字段。无法观测返回 `None`。
+
+    与"字段在、但里面没有工具"是两件事:`bind_tools([])` 与"根本没绑"
+    在线上都是"没有工具",但只有后者说明**绑定这一步没有被执行**。
+    两者都判 FAIL,理由却不同 —— 理由不同就要分得开。
+    """
+    if payload is None:
+        return None
+    return "tools" in payload
+
+
+def _payload_tool_names(payload: Mapping[str, Any] | None) -> list[str] | None:
+    """**观测到的**线上工具名。无法观测返回 `None`。
+
+    三条纪律:
+
+        1. **只读名字** —— 不读、不记任何 schema 内容(参数 schema 属于
+           工具自身的形状,不是"发给了谁"的证据,记进证据只会让证据里
+           多出与判定无关的大块内容);
+        2. **只从线上字节里读** —— 绝不拿声明回填。回填会让"声明-观测
+           一致"退化成一个恒真的判断,而那正是本阶段要防的东西;
+        3. 形状不符(不是列表 / 条目里没有可读的名字)**如实少记**,
+           不猜、不补。少记会让一致性核对失败 ⇒ FAIL,方向是安全的:
+           它不可能把"没发出去"读成"发出去了"。
+    """
+    if payload is None:
+        return None
+    field_value = payload.get("tools")
+    if not isinstance(field_value, (list, tuple)):
+        return []
+    names: list[str] = []
+    for item in field_value:
+        if not isinstance(item, Mapping):
+            continue
+        # OpenAI 兼容的线上形状是 `{"type": "function", "function": {...}}`;
+        # 也接受扁平的 `{"name": ...}` —— 两种都只取名字。
+        target: Any = item
+        function = item.get("function")
+        if isinstance(function, Mapping):
+            target = function
+        name = target.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +845,129 @@ def c1_verdict(findings: Sequence[Mapping[str, Any]], *, call_count: int) -> Ver
     )
 
 
+def c1_evidence(
+    *,
+    request: CalibrationRequest,
+    result: InvocationResult,
+    contract: ToolContract,
+    binding: ToolBinding,
+    config: cal_config.CalibrationConfig,
+    supplied_contract: ToolContract | None = None,
+) -> dict[str, Any]:
+    """C1 的捕获项。**声明侧 / 校验侧 / 观测侧** 三类分开记,外加两侧关系。
+
+        tool_binding_declared        声明:我们打算绑什么
+        allowed_tool_names           校验:判定用的是哪份契约
+        observed_tools_in_payload    观测:线上真的出现了什么
+        binding_agreement            两侧关系(算出来的,不是声明的)
+
+    `observed_tools_in_payload` **只从请求体读**;观测不到时记 `None`,
+    `binding_agreement` 随之记 `None` —— 不是 `True`。"没看见"永远不等于
+    "一致"。
+
+    `supplied_contract` 是调用方**另外**给的一份契约(若有)。它必须与绑定
+    同源:同一件事有两个事实来源时,校验结果不可解释。
+    """
+    message = result.message
+    payload = result.request_payload
+    calls = [dict(call) for call in (getattr(message, "tool_calls", None) or [])]
+    invalid = invalid_tool_calls_of(message)
+    findings = tool_call_findings(
+        tool_calls=calls, invalid_tool_calls=invalid, contract=contract
+    )
+    declared = binding.tool_names
+    contract_names = tuple(contract.allowed_tool_names)
+    observed = _payload_tool_names(payload)
+    return {
+        # ---- 声明侧:我们打算绑什么 ----
+        "tool_binding_declared": list(declared),
+        "tool_binding_source": binding.source,
+        "tool_binding_size": len(binding.tools),
+        # ---- 校验侧:判定用的是哪份契约 ----
+        "allowed_tool_names": list(contract_names),
+        "contract_agreement": contract_names == declared,
+        "supplied_contract_agreement": (
+            None
+            if supplied_contract is None
+            else tuple(supplied_contract.allowed_tool_names) == declared
+        ),
+        # ---- 观测侧:线上真的出现了什么 ----
+        "request_payload_available": payload is not None,
+        "tools_field_present_in_payload": _payload_tools_present(payload),
+        "observed_tools_in_payload": observed,
+        # ---- 两侧关系(算出来的) ----
+        "binding_agreement": (
+            None if observed is None else tuple(observed) == declared
+        ),
+        # ---- 已知的覆盖缺口(记账,不是"已覆盖") ----
+        "request_digest_covers_tool_binding": REQUEST_DIGEST_COVERS_TOOL_BINDING,
+        # ---- 模型响应形状 ----
+        "tool_call_count": len(calls),
+        "tool_calls": calls,
+        "invalid_tool_calls": invalid,
+        "findings": findings,
+        "finish_reason": metadata_field(message, "finish_reason"),
+        # ---- 凭据无关的请求溯源 ----
+        "request_digest": config.request_shape_digest(),
+    }
+
+
+def c1_evidence_verdict(evidence: Mapping[str, Any]) -> Verdict:
+    """由 C1 证据得出判定。
+
+    前置核验(**排在形状判定之前**)回答一个更基本的问题:
+"我们到底有没有把工具契约问出去?"
+
+        请求体不可观测                        → INCONCLUSIVE
+        判定用的契约与绑定不同源              → FAIL
+        调用方另外给的契约与绑定不同源        → FAIL
+        声明了工具,请求体里却没有 tools 字段  → FAIL
+        请求体里的工具与声明的工具不一致      → FAIL
+
+    这五条不排在最前面的话,会出现两种错法,而且**两种都不会被察觉**:
+
+        模型没调工具 → `c1_verdict` 判 FAIL。结论碰巧对,**理由完全错**:
+            它失败于"模型没调工具",而真相是"我们根本没给模型工具"。
+        模型碰巧调了一个恰好合法的名字 → 旧口径判 **PASS**,
+            而工具契约从未离开过本进程。
+
+    第二行才是真正危险的:一个从未被问出的问题,得到了一个"通过"的答案。
+    """
+    if not evidence.get("request_payload_available"):
+        return inconclusive(
+            "传输层没有暴露请求体 —— 无法核验声明的工具契约是否真的发给了 "
+            "provider;在前提无法核验的情况下,'模型给的 tool call 形状合不合法'"
+            "问的就不是我们声明的那份契约"
+        )
+    if not evidence.get("contract_agreement", False):
+        return failed(
+            f"判定用的契约 {evidence.get('allowed_tool_names')!r} 与声明的绑定 "
+            f"{evidence.get('tool_binding_declared')!r} 不同源 —— "
+            "被校验的契约不是被发出去的那一个"
+        )
+    if evidence.get("supplied_contract_agreement") is False:
+        return failed(
+            "调用方另外提供的工具契约与本次绑定不同源 —— 同一件事有了两个"
+            "事实来源,校验结果因此不可解释"
+        )
+    declared = tuple(evidence.get("tool_binding_declared") or ())
+    if declared and evidence.get("tools_field_present_in_payload") is not True:
+        return failed(
+            f"声明了 {len(declared)} 个工具,但观测到的请求体里**没有** tools "
+            "字段 —— 工具契约从未到达 provider,因此'模型给的 tool call 形状"
+            "合不合法'这个问题根本没有被问到"
+        )
+    if evidence.get("binding_agreement") is not True:
+        return failed(
+            f"请求体里的工具 {evidence.get('observed_tools_in_payload')!r} 与"
+            f"声明的 {list(declared)!r} 不一致 —— 请求在到达 provider 之前"
+            "被改写过"
+        )
+    return c1_verdict(
+        evidence["findings"], call_count=int(evidence.get("tool_call_count") or 0)
+    )
+
+
 # ---------------------------------------------------------------------------
 # C2 —— 工具往返
 # ---------------------------------------------------------------------------
@@ -892,37 +1172,62 @@ async def run_c0b(ctx: StageContext, deps: StageDeps) -> StageOutcome:
     )
 
 
+def resolve_tool_binding(deps: StageDeps) -> ToolBinding:
+    """本次 C1 **声明**的工具绑定。
+
+    只认 `deps.tool_binding`。缺失时**拒绝执行**(ABORT),而不是退回到
+    `deps.tool_contract`,更不是退回到生产工具集 —— 一次"调用方以为绑了
+    工具、实际上什么都没绑"的运行,最不该得到的结果就是一个看起来正常的
+    判定。缺依赖是**配置错误**,必须表现成配置错误。
+
+    `deps.tool_contract` 不作退路,只作**交叉核对**(见 `run_c1`)。
+    """
+    if deps.tool_binding is None:
+        raise StageDependencyMissing(
+            "C1 需要注入的工具绑定(`StageDeps.tool_binding`)—— "
+            "只有契约、没有工具对象的配置**不能**静默通过:那样绑定这一步"
+            "根本没有执行,而判定会照常给出一个结论"
+        )
+    return deps.tool_binding
+
+
 async def run_c1(ctx: StageContext, deps: StageDeps) -> StageOutcome:
-    """C1:工具调用形状。让模型给出一个 tool call,校验其形状。"""
+    """C1:工具调用形状。
+
+    绑定 → `bind_tools()` → 校验契约,**三者同源**
+    -------------------------------------------
+    本阶段只有一个工具事实来源:`deps.tool_binding`。
+
+        request.tool_binding = binding      ← 调用器据此 `bind_tools()`
+        contract = binding.as_contract()    ← 判定据此校验形状
+
+    调用器**只被允许**绑 `request.tool_binding` 声明的东西(见
+    `bind_declared_tools`)。但它绑了什么**不由它自己说** —— 由**线上请求体**
+    说:`tools` 字段里的工具名必须与声明逐个一致。声明是声明,观测是观测,
+    `c1_evidence_verdict` 拿观测去核对声明。
+    """
     from langchain_core.messages import HumanMessage, SystemMessage
 
     invoke = _require_invoke(deps)
-    contract = deps.tool_contract or ToolContract(
-        allowed_tool_names=(), arg_schemas={}
-    )
+    binding = resolve_tool_binding(deps)
+    contract = binding.as_contract()
     request = ctx.request(
         messages=(
             SystemMessage(content="D-2c 标定:工具形状探针。请调用一个工具。"),
             HumanMessage(content="请调用一个可用工具来完成一次查询。"),
-        )
+        ),
+        tool_binding=binding,
     )
     result = await ctx.invoke_once(invoke, request)
-    message = result.message
-    calls = [dict(call) for call in (getattr(message, "tool_calls", None) or [])]
-    findings = tool_call_findings(
-        tool_calls=calls,
-        invalid_tool_calls=invalid_tool_calls_of(message),
+    evidence = c1_evidence(
+        request=request,
+        result=result,
         contract=contract,
+        binding=binding,
+        config=ctx.config,
+        supplied_contract=deps.tool_contract,
     )
-    evidence = {
-        "allowed_tool_names": list(contract.allowed_tool_names),
-        "tool_call_count": len(calls),
-        "tool_calls": calls,
-        "invalid_tool_calls": invalid_tool_calls_of(message),
-        "findings": findings,
-        "request_digest": ctx.config.request_shape_digest(),
-    }
-    return _outcome(ctx, c1_verdict(findings, call_count=len(calls)), evidence)
+    return _outcome(ctx, c1_evidence_verdict(evidence), evidence)
 
 
 async def run_c2(ctx: StageContext, deps: StageDeps) -> StageOutcome:
@@ -1147,6 +1452,20 @@ DEFAULT_STAGE_RUNNERS: dict[Stage, Callable[..., Awaitable[StageOutcome]]] = {
 }
 
 
+def production_tool_binding() -> ToolBinding:
+    """从**生产**工具集派生绑定(只读,不执行任何工具)。
+
+    `app.tools` 的 import 放在函数体内,保持本模块导入期零副作用。
+
+    它是 C1 与 C4 两个绑定点的**共同上游**:两处今天都落到
+    `DEFAULT_TOOLS`,但那是巧合而非强制 —— 本函数把"生产工具集"这件事
+    收进一个具名入口,让"两处同源"可以被一条断言机械核验,而不是靠约定。
+    """
+    from app.tools import DEFAULT_TOOLS
+
+    return ToolBinding(tools=tuple(DEFAULT_TOOLS), source="app.tools.DEFAULT_TOOLS")
+
+
 def production_tool_contract() -> ToolContract:
     """从**生产**工具集派生工具契约(只读 schema,不执行任何工具)。
 
@@ -1154,18 +1473,7 @@ def production_tool_contract() -> ToolContract:
     后者只返回 `properties`,**不含 `required`** —— 用它做校验会让
     "必填参数缺失"这类最典型的形状缺陷恒测不出来(一个恒真的护栏)。
 
-    `app.tools` 的 import 放在函数体内,保持本模块导入期零副作用。
+    本函数是 `production_tool_binding().as_contract()` 的薄封装:契约与绑定
+    **同源**,不给"两份各自漂移的 schema"留位置。
     """
-    from app.tools import DEFAULT_TOOLS
-
-    schemas: dict[str, Mapping[str, Any]] = {}
-    for tool in DEFAULT_TOOLS:
-        call_schema = getattr(tool, "tool_call_schema", None)
-        if call_schema is not None and hasattr(call_schema, "model_json_schema"):
-            schemas[tool.name] = call_schema.model_json_schema()
-        else:  # pragma: no cover - 回退:至少保留 properties
-            schemas[tool.name] = {"properties": dict(getattr(tool, "args", {}) or {})}
-    return ToolContract(
-        allowed_tool_names=tuple(tool.name for tool in DEFAULT_TOOLS),
-        arg_schemas=schemas,
-    )
+    return production_tool_binding().as_contract()

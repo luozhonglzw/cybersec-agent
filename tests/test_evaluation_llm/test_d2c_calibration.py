@@ -139,14 +139,47 @@ def tool_contract():
 
     走 `stages.production_tool_contract()` —— 它取的是**完整** JSON schema
     (含 `required`),而不是只有 `properties` 的 `tool.args`。
+    它由 `tool_binding.as_contract()` 派生,因此两者**同源**。
     """
     return S.production_tool_contract()
+
+
+@pytest.fixture(scope="session")
+def tool_binding():
+    """生产工具绑定(工具对象本身 + 由它派生的契约)。
+
+    C1 的唯一工具事实来源:调用器据此 `bind_tools()`,判定据此 `as_contract()`。
+    """
+    return S.production_tool_binding()
+
+
+def wire_tools_field(request: S.CalibrationRequest) -> list | None:
+    """模拟"调用器按**声明**绑定之后,线上会多出的 `tools` 字段"。
+
+    走 `S.bindable_tools()` —— 与 `bind_declared_tools()` 同一个接缝,因此
+    合成调用器与真实调用器在"绑什么"这件事上不可能分叉。
+
+    声明为空(或未声明)时返回 `None`,即**不加该字段**:线上"根本没有 tools
+    字段"与"tools 是空列表"是两件不同的事,合成传输也必须分得开。
+    """
+    binding = request.tool_binding
+    if binding is None:
+        return None
+    tools = S.bindable_tools(binding)
+    if not tools:
+        return None
+    return [
+        {"type": "function", "function": {"name": getattr(tool, "name", "")}}
+        for tool in tools
+    ]
 
 
 def request_payload(request: S.CalibrationRequest, config: C.CalibrationConfig) -> dict:
     """把一次请求的 kwargs 折成"传输层会看到的请求体"(**凭据无关**)。
 
     刻意把 `temperature=None` 当作"字段不存在"处理 —— 与真实传输一致。
+    工具字段按**声明**折算(见 `wire_tools_field`),这样"声明 → 绑定 → 线上"
+    这条链在合成传输里同样成立。
     """
     payload: dict = {"model": config.requested_model}
     for key, value in request.model_kwargs.items():
@@ -155,6 +188,9 @@ def request_payload(request: S.CalibrationRequest, config: C.CalibrationConfig) 
         elif key in ("temperature", "streaming"):
             if value is not None:
                 payload[key] = value
+    tools_field = wire_tools_field(request)
+    if tools_field is not None:
+        payload["tools"] = tools_field
     return payload
 
 
@@ -237,12 +273,17 @@ def build_deps(
     *,
     representative_unit,
     tool_contract,
+    tool_binding=None,
     invoker=None,
     roundtrip=None,
     graph_turns=None,
     unit_turns=None,
 ) -> S.StageDeps:
-    """装配六个阶段的全部合成依赖。"""
+    """装配六个阶段的全部合成依赖。
+
+    `tool_binding` 缺省时取生产绑定;`tool_contract` 仍被传入,作为 C1 的
+    **交叉核对**(它必须与绑定同源)。
+    """
     graph_turns = graph_turns or (
         SyntheticTurn(
             content="",
@@ -274,6 +315,7 @@ def build_deps(
     return S.StageDeps(
         invoke=invoker or make_invoker(),
         tool_contract=tool_contract,
+        tool_binding=tool_binding or S.production_tool_binding(),
         roundtrip=roundtrip or roundtrip_messages(),
         graph_model=SyntheticProviderModel(turns=graph_turns),
         unit_model=SyntheticProviderModel(turns=unit_turns),

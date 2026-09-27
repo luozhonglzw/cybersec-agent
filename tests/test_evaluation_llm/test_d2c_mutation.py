@@ -22,6 +22,15 @@
     10  标定记录成为试点完成资格
     11  阴性对照:无操作变异**不得**被判为"检出"
 
+F10 追加的五个变异(12–16)
+--------------------------
+
+    12  请求体里没有 `tools` 字段也照样判通过(F10 前置核验被拆掉)
+    13  生产绑定的工具名与生产工具集漂移(两个绑定点各自为政)
+    14  观测侧从声明回填(声明-观测一致因此变成恒真)
+    15  验证契约不由绑定派生(同一件事有了两个事实来源)
+    16  digest 覆盖缺口标志被移除(缺口变成"不存在")
+
 全程离线:零真实 provider 调用、零凭据、零网络出口。
 """
 from __future__ import annotations
@@ -238,6 +247,15 @@ def _representative_deps(tmp_path, *, c0b_message=None, invoker=None):
     async def default_invoke(request):
         payload = {"model": cfg.requested_model}
         payload.update(request.model_kwargs.get("extra_body") or {})
+        # 合成传输按**声明**折算 `tools` 字段 —— 与 `bind_declared_tools()`
+        # 走同一个接缝(`S.bindable_tools`),因此"声明 → 绑定 → 线上"这条链
+        # 在合成传输里同样成立。
+        binding = request.tool_binding
+        if binding is not None and S.bindable_tools(binding):
+            payload["tools"] = [
+                {"type": "function", "function": {"name": getattr(tool, "name", "")}}
+                for tool in S.bindable_tools(binding)
+            ]
         if request.stage is S.Stage.C0A:
             message = synthetic_ai_message(content="OK")
         elif request.stage is S.Stage.C0B:
@@ -271,6 +289,7 @@ def _representative_deps(tmp_path, *, c0b_message=None, invoker=None):
     deps = S.StageDeps(
         invoke=invoker or default_invoke,
         tool_contract=contract,
+        tool_binding=S.production_tool_binding(),
         roundtrip=[
             synthetic_ai_message(
                 content="",
@@ -401,6 +420,131 @@ def probe_finish_reason_is_not_the_criterion() -> None:
     assert verdict_for("length", 3) is not C.StageVerdict.PASS
 
 
+# ---- F10 探针:C1 工具绑定路径(纯离线,不需要跑门) ----
+
+#: 一个**合法**的 tool call(参数符合 `analyze_risk_tool` 的契约)。
+_F10_LEGAL_CALL = synthetic_tool_call(
+    name="analyze_risk_tool", args={"indicator": "1.2.3.4"}, call_id="f10-c1-1"
+)
+
+
+def _f10_request(binding: S.ToolBinding) -> S.CalibrationRequest:
+    cfg = C.default_calibration_config()
+    return S.CalibrationRequest(
+        stage=S.Stage.C1,
+        messages=(),
+        model_kwargs=cfg.model_kwargs(),
+        output_token_cap=cfg.output_token_cap,
+        tool_binding=binding,
+    )
+
+
+def _f10_wire_payload(binding: S.ToolBinding) -> dict:
+    """声明 `binding` 时合成传输上"应当"出现的请求体(**按声明折算**)。"""
+    cfg = C.default_calibration_config()
+    payload: dict = {"model": cfg.requested_model}
+    payload.update(cfg.model_kwargs()["extra_body"])
+    if binding.tools:
+        payload["tools"] = [
+            {"type": "function", "function": {"name": getattr(tool, "name", "")}}
+            for tool in S.bindable_tools(binding)
+        ]
+    return payload
+
+
+def _f10_evidence(
+    *,
+    binding: S.ToolBinding,
+    payload,
+    contract=None,
+    supplied=None,
+) -> dict:
+    message = synthetic_ai_message(
+        content="", tool_calls=[dict(_F10_LEGAL_CALL)], finish_reason="tool_calls"
+    )
+    return S.c1_evidence(
+        request=_f10_request(binding),
+        result=S.InvocationResult(message=message, request_payload=payload),
+        contract=contract or binding.as_contract(),
+        binding=binding,
+        config=C.default_calibration_config(),
+        supplied_contract=supplied,
+    )
+
+
+def probe_c1_missing_tools_field_is_a_failure() -> None:
+    """声明了工具而请求体里没有 `tools` 字段 ⇒ **FAIL**。
+
+    工具契约从未到达 provider,所以"模型给的 tool call 形状合不合法"
+    这个问题根本没有被问到 —— 它绝不能因此得到一个"通过"。
+    """
+    binding = S.production_tool_binding()
+    payload = _f10_wire_payload(binding)
+    del payload["tools"]
+    evidence = _f10_evidence(binding=binding, payload=payload)
+    assert evidence["tools_field_present_in_payload"] is False
+    assert evidence["binding_agreement"] is False
+    verdict = S.c1_evidence_verdict(evidence)
+    assert verdict.verdict is C.StageVerdict.FAIL, (
+        f"工具契约没发出去,判定却是 {verdict.verdict.value}:{verdict.reason}"
+    )
+
+
+def probe_c1_production_binding_names_are_not_drifted() -> None:
+    """生产绑定的工具名必须与生产工具集逐个一致。
+
+    C1 与 C4 是**两个**绑定点;今天同源是巧合而非强制。这条断言把"同源"
+    从约定变成可核验的事实。
+    """
+    from app.tools import DEFAULT_TOOLS
+
+    expected = tuple(tool.name for tool in DEFAULT_TOOLS)
+    binding = S.production_tool_binding()
+    assert binding.tool_names == expected, (
+        f"绑定声明的工具 {binding.tool_names!r} 与生产工具集 {expected!r} 漂移了"
+    )
+    assert S.production_tool_contract().allowed_tool_names == expected
+
+
+def probe_c1_observation_is_never_filled_from_the_declaration() -> None:
+    """观测侧只从请求体读。回填会让"声明-观测一致"变成一个恒真的判断。"""
+    binding = S.production_tool_binding()
+    payload = _f10_wire_payload(binding)
+    del payload["tools"]
+    evidence = _f10_evidence(binding=binding, payload=payload)
+    assert evidence["observed_tools_in_payload"] == [], (
+        "观测侧被声明回填了 —— 一致性核对因此失去意义"
+    )
+    assert evidence["observed_tools_in_payload"] != evidence["tool_binding_declared"]
+    assert evidence["binding_agreement"] is False
+    assert S.c1_evidence_verdict(evidence).verdict is C.StageVerdict.FAIL
+
+
+def probe_c1_verifier_contract_is_derived_from_the_binding() -> None:
+    """验证契约与绑定必须同源 —— 否则被校验的不是发出去的那一份。"""
+    binding = S.production_tool_binding()
+    supplied = S.production_tool_contract()
+    assert supplied.allowed_tool_names == binding.tool_names
+    evidence = _f10_evidence(
+        binding=binding, payload=_f10_wire_payload(binding), supplied=supplied
+    )
+    assert evidence["contract_agreement"] is True
+    assert evidence["supplied_contract_agreement"] is True
+    verdict = S.c1_evidence_verdict(evidence)
+    assert verdict.verdict is C.StageVerdict.PASS, verdict.reason
+
+
+def probe_c1_digest_coverage_gap_is_recorded() -> None:
+    """`request_digest` **不**覆盖工具绑定 —— 缺口必须被记账,不能消失。"""
+    binding = S.production_tool_binding()
+    evidence = _f10_evidence(binding=binding, payload=_f10_wire_payload(binding))
+    assert "request_digest_covers_tool_binding" in evidence, (
+        "覆盖缺口标志消失了 —— 缺口会被读成'没有缺口'"
+    )
+    assert evidence["request_digest_covers_tool_binding"] is False
+    assert S.REQUEST_DIGEST_COVERS_TOOL_BINDING is False
+
+
 # ---------------------------------------------------------------------------
 # 变异
 # ---------------------------------------------------------------------------
@@ -441,6 +585,68 @@ def _mutate_temperature(mp: pytest.MonkeyPatch) -> None:
     mp.setattr(
         cal_config.CalibrationConfig, "recorded_temperature", lambda self: 0.0
     )
+
+
+def _mutate_missing_tools_field_accepted(mp: pytest.MonkeyPatch) -> None:
+    """把 F10 的前置核验整段拆掉:直接落到形状判定。"""
+    mp.setattr(
+        S,
+        "c1_evidence_verdict",
+        lambda evidence: S.c1_verdict(
+            evidence["findings"], call_count=int(evidence.get("tool_call_count") or 0)
+        ),
+    )
+
+
+def _mutate_production_binding_drift(mp: pytest.MonkeyPatch) -> None:
+    """让生产绑定少一个工具 —— 两个绑定点各自为政。"""
+    original = S.production_tool_binding
+    mp.setattr(
+        S,
+        "production_tool_binding",
+        lambda: S.ToolBinding(tools=original().tools[:-1], source="mutated"),
+    )
+
+
+def _mutate_declaration_observation_fallback(mp: pytest.MonkeyPatch) -> None:
+    """观测不到 `tools` 字段时,拿**声明**回填。"""
+    original = S.c1_evidence
+
+    def patched(**kwargs):
+        evidence = original(**kwargs)
+        if evidence["tools_field_present_in_payload"] is False:
+            evidence["tools_field_present_in_payload"] = True
+            evidence["observed_tools_in_payload"] = list(
+                evidence["tool_binding_declared"]
+            )
+            evidence["binding_agreement"] = True
+        return evidence
+
+    mp.setattr(S, "c1_evidence", patched)
+
+
+def _mutate_contract_divergence(mp: pytest.MonkeyPatch) -> None:
+    """生产契约从**别处**派生,与绑定不同源。"""
+    original = S.production_tool_binding
+    mp.setattr(
+        S,
+        "production_tool_contract",
+        lambda: S.ToolContract(
+            allowed_tool_names=original().tool_names[:-1], arg_schemas={}
+        ),
+    )
+
+
+def _mutate_digest_coverage_flag_removal(mp: pytest.MonkeyPatch) -> None:
+    """把 digest 覆盖缺口标志从证据里抹掉。"""
+    original = S.c1_evidence
+
+    def patched(**kwargs):
+        evidence = original(**kwargs)
+        evidence.pop("request_digest_covers_tool_binding", None)
+        return evidence
+
+    mp.setattr(S, "c1_evidence", patched)
 
 
 MUTATIONS: tuple[Mutation, ...] = (
@@ -540,6 +746,41 @@ MUTATIONS: tuple[Mutation, ...] = (
         probe=probe_temperature_not_set,
         note="若这个被判为'检出',说明变异工装本身在误报",
     ),
+    Mutation(
+        key="12",
+        name="请求体里没有 tools 字段也照样判通过",
+        apply=_mutate_missing_tools_field_accepted,
+        probe=probe_c1_missing_tools_field_is_a_failure,
+        note="工具契约从未到达 provider,而'形状合不合法'却得到了一个通过",
+    ),
+    Mutation(
+        key="13",
+        name="生产绑定与生产工具集漂移",
+        apply=_mutate_production_binding_drift,
+        probe=probe_c1_production_binding_names_are_not_drifted,
+        note="C1 与 C4 两个绑定点各自为政,而两边看起来都正常",
+    ),
+    Mutation(
+        key="14",
+        name="观测侧从声明回填",
+        apply=_mutate_declaration_observation_fallback,
+        probe=probe_c1_observation_is_never_filled_from_the_declaration,
+        note="'声明-观测一致'退化成恒真 —— 它正是'工具发出去没有'的唯一答案来源",
+    ),
+    Mutation(
+        key="15",
+        name="验证契约不由绑定派生",
+        apply=_mutate_contract_divergence,
+        probe=probe_c1_verifier_contract_is_derived_from_the_binding,
+        note="被校验的契约不是被发出去的那一个,而校验结果照常给出",
+    ),
+    Mutation(
+        key="16",
+        name="digest 覆盖缺口标志被移除",
+        apply=_mutate_digest_coverage_flag_removal,
+        probe=probe_c1_digest_coverage_gap_is_recorded,
+        note="缺口一旦不被记账,就会被读成'request_digest 覆盖了整条请求形状'",
+    ),
 )
 
 
@@ -626,4 +867,4 @@ def test_d2c_mutation_03_report_every_mutation_and_detection_status(
     undetected = [row for row in rows if row[2] == "not detected"]
     assert len(undetected) == 1
     assert undetected[0][0] == "11"
-    assert len(rows) == len(MUTATIONS) == 11
+    assert len(rows) == len(MUTATIONS) == 16
