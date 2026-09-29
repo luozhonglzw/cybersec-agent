@@ -579,6 +579,7 @@ class OfflineExecutor:
             tool_call_trace=[
                 record.model_dump(mode="json") for record in observation.tool_calls
             ],
+            path_bindings=[dict(item) for item in observation.path_bindings],
             final_narrative=observation.answer,
             final_narrative_sha256=sha256_hex(observation.answer),
             metric_inputs={

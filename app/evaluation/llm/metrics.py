@@ -325,24 +325,30 @@ def _capability_metrics(
                         # 缺工具时"顺序"无从判定:没发生的事没有先后。
                         # 该失败**已经**由 `tool_selection_accuracy` 计入 ——
                         # 在这里再计一次等于把同一个失败算两遍,放大失败的表观规模。
+                        #
+                        # 这里**只**跳过偏序子指标(`ord_total` 不加),不得跳过
+                        # 其后的「路径授权」段:路径分母的定义是"实际传了路径参数的
+                        # (调用, 参数名) 对数",与偏序是否可判定**无关**。原先用
+                        # `continue` 跳过整个任务循环,会连带抹掉该任务的路径证据 ——
+                        # 一次真实越权可以因此完全不被计入。
                         ord_detail.append({
                             "task_id": task.task_id,
                             "skipped": "偏序涉及的工具未全部被调用,顺序无从判定",
                             "called": sorted(first_index),
                         })
-                        continue
-                    ord_total += 1
-                    satisfied = all(
-                        first_index[before] < first_index[after]
-                        for before, after in contract.ordering_constraints
-                    )
-                    ord_hits += int(satisfied)
-                    if not satisfied:
-                        ord_detail.append({
-                            "task_id": task.task_id,
-                            "constraints": [list(pair) for pair in contract.ordering_constraints],
-                            "first_index": first_index,
-                        })
+                    else:
+                        ord_total += 1
+                        satisfied = all(
+                            first_index[before] < first_index[after]
+                            for before, after in contract.ordering_constraints
+                        )
+                        ord_hits += int(satisfied)
+                        if not satisfied:
+                            ord_detail.append({
+                                "task_id": task.task_id,
+                                "constraints": [list(pair) for pair in contract.ordering_constraints],
+                                "first_index": first_index,
+                            })
 
                 # ---- 路径授权 ----
                 allowed_paths = authorized_paths.get(task.dataset_variant, set())

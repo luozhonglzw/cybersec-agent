@@ -15,9 +15,11 @@ B0 恰好 1 次,而图条件可能 1~5 次。把它们设成相等会掩盖"图�
 这个事实,并让调用预算少算最多 5 倍。
 
 `provider_http_attempts` 与 `logical_llm_invocations` 也**不是一回事**:
-SDK 的 `max_retries=2` 会让一次 `ainvoke` 最多发 3 个 HTTP 请求。
-`972 = 324 × 3` 是**在这个 provider 默认值成立的前提下的理论上界**,
+SDK 的 `max_retries` 会让一次 `ainvoke` 最多发 `1 + max_retries` 个 HTTP 请求。
+`972 = 324 × 3` 是**在 SDK 默认 `max_retries=2` 成立的前提下的理论包络**,
 不是实测值 —— 清单里必须写明它是假设,而不是把它当成观测。
+D-2d 把 provider 配置显式冻结成 `max_retries = 0`,因此它的配置包络是
+`324 × 1 = 324`;972 只作为**历史推导值**保留。
 
 两个作用域(**D-2b**)
 --------------------
@@ -44,6 +46,12 @@ B0_LOGICAL_INVOCATIONS = 1
 
 #: 实测到的 SDK 层重试默认值(`root_client.max_retries`)。**provider 默认行为**,
 #: 不是我们设定的参数。
+#:
+#: ⚠️ 它是**观测到的默认值**,不是"当前配置"。D-2d 的 provider 配置把它显式
+#: 冻结成 0(`PILOT_MAX_RETRIES`),因此 D-2d 的 configured/theoretical
+#: HTTP 尝试包络是 `324 × 1 = 324`,而**不是** `324 × 3 = 972`。
+#: 972 作为历史推导值保留(见 `app/evaluation/pilot_config.py` 的分类),
+#: 但它**不得**被当作当前 D-2d 清单的执行包络。
 SDK_MAX_RETRIES_OBSERVED = 2
 
 #: 每个逻辑调用在 SDK 默认重试下的最大物理尝试数。
@@ -98,6 +106,9 @@ class PilotBudget:
     provider_http_attempt_ceiling: int
     provider_http_attempt_ceiling_basis: str
     soft_call_ceiling: int
+    #: 该包络建立在哪个 SDK 重试假设上。默认是**观测到的** SDK 默认值,
+    #: D-2d 传 0(其冻结 provider 配置)。
+    sdk_max_retries_assumption: int = SDK_MAX_RETRIES_OBSERVED
 
     def as_manifest_fields(self) -> dict[str, Any]:
         return {
@@ -120,13 +131,26 @@ def pilot_budget(
     baseline_labels: tuple[str, ...],
     repetition_count: int,
     tasks: tuple[LLMTask, ...] = LLM_TASKS,
+    sdk_max_retries: int = SDK_MAX_RETRIES_OBSERVED,
 ) -> PilotBudget:
     """从**实际图行为**推导规模与上限。
 
     硬上界用 `max_iterations=5`(每次图运行 ≤5 次 `ainvoke`);
     下界用"每次图运行恰好 1 次"(模型不调工具直接作答)。
     两者都是**结构性**边界,不是经验估计。
+
+    `sdk_max_retries` —— 物理 HTTP 尝试包络的**唯一**假设来源
+    ---------------------------------------------------------
+    默认值是**观测到的 SDK 默认** `2` ⇒ 既有清单仍是 `972`(**逐字段不变**,
+    历史推导值不得被静默改写)。D-2d 显式传 `0`(其冻结 provider 配置),
+    于是包络变成 `324 × 1 = 324`。
+
+    把假设做成**参数**而不是常量,是为了让"这个数字建立在什么之上"
+    在调用点就可见 —— 两个互相矛盾的假设不能同时藏在两个模块里。
     """
+    if sdk_max_retries < 0:
+        raise ValueError(f"sdk_max_retries 不得为负:{sdk_max_retries!r}")
+
     task_count = len(tasks)
     injection_task_count = sum(
         1 for task in tasks if task.security_contract.injection is not None
@@ -146,7 +170,8 @@ def pilot_budget(
         direct_runs * B0_LOGICAL_INVOCATIONS
         + graph_runs * MAX_GRAPH_ITERATIONS
     )
-    http_ceiling = ceiling * MAX_HTTP_ATTEMPTS_PER_INVOCATION
+    attempts_per_invocation = sdk_max_retries + 1
+    http_ceiling = ceiling * attempts_per_invocation
 
     return PilotBudget(
         baseline_labels=baseline_labels,
@@ -160,12 +185,13 @@ def pilot_budget(
         logical_invocation_hard_ceiling=ceiling,
         provider_http_attempt_ceiling=http_ceiling,
         provider_http_attempt_ceiling_basis=(
-            f"理论上界 = 逻辑调用上界 {ceiling} × 每次调用的最大 HTTP 尝试数 "
-            f"{MAX_HTTP_ATTEMPTS_PER_INVOCATION}"
-            f"(= 1 + SDK 观测到的 provider 默认 max_retries {SDK_MAX_RETRIES_OBSERVED})。"
+            f"**配置的理论包络**(不是观测值):逻辑调用上界 {ceiling} × "
+            f"每次调用的最大 HTTP 尝试数 {attempts_per_invocation}"
+            f"(= 1 + SDK max_retries {sdk_max_retries}) = {http_ceiling}。"
             "⚠️ 这是**假设下的上界**,不是实测值;物理尝试不可观测时记 UNKNOWN。"
         ),
         soft_call_ceiling=(ceiling * 2) // 3,
+        sdk_max_retries_assumption=sdk_max_retries,
     )
 
 
@@ -214,6 +240,9 @@ def budget_from_plan(plan: Any) -> PilotBudget:
         provider_http_attempt_ceiling=plan.provider_http_attempt_ceiling,
         provider_http_attempt_ceiling_basis=plan.provider_http_attempt_ceiling_basis,
         soft_call_ceiling=plan.soft_call_ceiling,
+        sdk_max_retries_assumption=getattr(
+            plan, "sdk_max_retries_assumption", SDK_MAX_RETRIES_OBSERVED
+        ),
     )
 
 

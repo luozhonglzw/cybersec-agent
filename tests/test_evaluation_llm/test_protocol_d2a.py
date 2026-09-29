@@ -315,8 +315,10 @@ def test_freeze_blockers_enumerate_what_d2b_must_resolve(d2a_manifest):
     assert "provider" in blockers
     assert "model" in blockers
     assert "endpoint_category" in blockers
-    assert "token_budget" in blockers
-    assert "cost_budget" in blockers
+    # 资源预算不再是"占位符字符串",而是**未决定的资源维度**:
+    # 路径形如 `token_budget.boundedness(当前为 UNRESOLVED)`。
+    assert any(item.startswith("token_budget.") for item in blockers)
+    assert any(item.startswith("cost_budget.") for item in blockers)
     assert any("manifest_status" in item for item in blockers)
 
 

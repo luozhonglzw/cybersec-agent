@@ -24,10 +24,11 @@ Phase 9.2-A 的教训:自拼 JSON 会算出与官方函数不同的 golden 摘�
 import hashlib
 import json
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.evaluation.llm.dataset import (
     LLM_DATASET_VERSION,
@@ -44,13 +45,26 @@ from app.evaluation.llm.tasks import LLMTask
 # ---------------------------------------------------------------------------
 
 #: D-2 协议版本。**D-2a 只能产出 `candidate` 清单**;`frozen` 是 D-2b 的闸门。
-PROTOCOL_VERSION = "9.2-D-2.1"
+#:
+#: `9.2-D-2.1` → `9.2-D-2.2`:资源预算由**自由文本**改为**类型化声明**
+#: (`ResourceBudget`)。旧版本用裸 `str` 字段表达"还没定",而
+#: `placeholder_paths()` 只认得 `TO_BE_FROZEN*` 前缀 —— 于是任何一句
+#: **描述性的话**都会静默地把 freeze blocker 清空。类型化之后,
+#: "是否已决定"由**封闭词表**回答,不再由字符串前缀回答。
+PROTOCOL_VERSION = "9.2-D-2.2"
 
 #: 任务集版本 —— 与数据集版本**同一个事实来源**,不允许各写一份。
 REAL_LLM_TASKSET_VERSION = LLM_DATASET_VERSION
 
 #: 指标 schema 版本。
 METRIC_SCHEMA_VERSION = "9.2-D-2.1"
+
+#: **资源预算 schema 版本**。
+#:
+#: 它记录"`token_budget` / `cost_budget` 是类型化资源声明"这一事实,
+#: 并**进清单摘要域**(见 `ExperimentManifest.budget_schema_version`)——
+#: 否则将来改一次预算语义,旧的冻结清单会被用新语义重新解读,而摘要不变。
+BUDGET_SCHEMA_VERSION = "9.2-D-2.2"
 
 #: 失败分类表版本。
 FAILURE_TAXONOMY_VERSION = "9.2-D-2.1"
@@ -406,6 +420,150 @@ def metric_schema_digest() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 资源预算(**类型化**)
+# ---------------------------------------------------------------------------
+#
+# 为什么必须是类型而不是字符串
+# ----------------------------
+# 旧版清单里 `token_budget` / `cost_budget` 是裸 `str`,默认值是
+# `TO_BE_FROZEN_*` 占位符,而 `placeholder_paths()` **只**认这个前缀。
+# 于是"我把它填成一句描述"就能静默地让 freeze blocker 消失 —— 清单看起来
+# 已冻结,而"到底有没有数值上界"从未被回答过。
+#
+# 类型化之后,"是否已决定"由**封闭词表**回答;数值、单位、溯源各占一个字段,
+# 没有地方可以塞一句含糊的话来蒙混过关。
+
+
+class BudgetBoundedness(str, Enum):
+    """资源维度的**边界状态**。**封闭四值词表** —— 加第五值即协议变更。"""
+
+    #: 存在**协议级**的数值上界,且上界值可溯源。
+    NUMERICALLY_BOUNDED = "NUMERICALLY_BOUNDED"
+
+    #: 协议**本身**不提供数值上界(不是"我们没算",而是"它不存在")。
+    NOT_NUMERICALLY_BOUNDED_BY_PROTOCOL = "NOT_NUMERICALLY_BOUNDED_BY_PROTOCOL"
+
+    #: 没有任何权威溯源可以用来推出数值上界。
+    #: 它与 `UNRESOLVED` 的区别是**已决定**的:我们已确认推不出上界,
+    #: 因此它**允许**出现在冻结清单里 —— 冻结的是一份诚实的"无上界"声明,
+    #: 不是一份伪造的上界。
+    NO_NUMERIC_BOUND_NO_PROVENANCE = "NO_NUMERIC_BOUND_NO_PROVENANCE"
+
+    #: **尚未决定**。**唯一**阻止冻结的状态。
+    UNRESOLVED = "UNRESOLVED"
+
+
+#: 已决定的状态集合。只有落在这个集合里,清单才可能被冻结。
+DECIDED_BOUNDEDNESS = frozenset({
+    BudgetBoundedness.NUMERICALLY_BOUNDED,
+    BudgetBoundedness.NOT_NUMERICALLY_BOUNDED_BY_PROTOCOL,
+    BudgetBoundedness.NO_NUMERIC_BOUND_NO_PROVENANCE,
+})
+
+
+class ScopedEnvelope(BaseModel):
+    """**分量**包络 —— 覆盖某个分量(如输出 token)的数值上界。
+
+    它**不是**总量上界。`is_total_bound` 只有 `False` 一个合法取值:
+    把一个分量包络说成总量上界,会让"总量无上界"这一事实被一个看起来
+    很像上界的数字盖掉。要表达"总量有上界",只能用
+    `BudgetBoundedness.NUMERICALLY_BOUNDED` + `ResourceBudget.value`。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    scope: str = Field(min_length=1, description="被覆盖的**分量**(如 output)")
+    value: int = Field(gt=0, description="该分量的数值上界")
+    unit: str = Field(min_length=1)
+    provenance: str = Field(
+        min_length=1,
+        description="该数值**从哪来**;必须写明它是分量包络而非总量上界",
+    )
+    is_total_bound: bool = Field(
+        default=False, description="恒为 False —— 分量包络不得声明为总量上界",
+    )
+
+    @model_validator(mode="after")
+    def _reject_total_bound_claim(self) -> "ScopedEnvelope":
+        if self.is_total_bound:
+            raise ValueError(
+                "scoped envelope 是**分量**包络,不得声明为总量上界 —— "
+                "把输出分量写成 total-token budget 是明确的措辞禁忌"
+            )
+        return self
+
+
+class ResourceBudget(BaseModel):
+    """一个资源维度(token / cost)的**类型化**声明。
+
+    三条机械不变式(全部在构造期强制):
+
+    1. **非数值状态不得携带数值**。`value` / `unit` / `provenance` 必须同时
+       为 `None` —— 否则"没有上界"会被读成"上界是那个数"。
+    2. **已决定的状态必须写明理由**。`UNRESOLVED` 可以没有理由(它的理由
+       就是"还没决定"),其余三值必须给出 `reason`。
+    3. **不得参与执行准入**。`execution_admission` 只有 `False` 一个合法取值:
+       准入只有 `experimental_run_attempts` 与 `logical_llm_invocations`
+       两个权威计数器。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    boundedness: BudgetBoundedness
+    value: int | None = None
+    unit: str | None = None
+    provenance: str | None = None
+    reason: str = ""
+    envelopes: tuple[ScopedEnvelope, ...] = ()
+    execution_admission: bool = Field(default=False)
+
+    @model_validator(mode="after")
+    def _validate_declaration(self) -> "ResourceBudget":
+        if self.execution_admission:
+            raise ValueError(
+                "token / cost 声明**不得**参与执行准入 —— 准入只有 "
+                "`experimental_run_attempts` 与 `logical_llm_invocations` "
+                "两个权威计数器"
+            )
+        if self.boundedness is BudgetBoundedness.NUMERICALLY_BOUNDED:
+            if self.value is None or self.value <= 0:
+                raise ValueError("NUMERICALLY_BOUNDED 必须携带正数 value")
+            if not (self.unit or "").strip():
+                raise ValueError("NUMERICALLY_BOUNDED 必须携带非空 unit")
+            if not (self.provenance or "").strip():
+                raise ValueError("NUMERICALLY_BOUNDED 必须携带非空 provenance")
+        elif (
+            self.value is not None
+            or self.unit is not None
+            or self.provenance is not None
+        ):
+            raise ValueError(
+                f"{self.boundedness.value} 表示**没有**数值边界,因此 "
+                "value / unit / provenance 必须全部为 None —— "
+                "留下一个数值会让「没有上界」被读成「上界是那个数」"
+            )
+        if self.boundedness in DECIDED_BOUNDEDNESS and not self.reason.strip():
+            raise ValueError(
+                f"{self.boundedness.value} 是**已决定**状态,必须写明 reason"
+                "(为什么它就是这个状态)"
+            )
+        return self
+
+    @property
+    def decided(self) -> bool:
+        """该维度是否**已决定**(即不再阻止冻结)。"""
+        return self.boundedness in DECIDED_BOUNDEDNESS
+
+
+def unresolved_resource_budget(dimension: str) -> ResourceBudget:
+    """**未决定**的默认声明。裸清单的 `token_budget` / `cost_budget` 用它。"""
+    return ResourceBudget(
+        boundedness=BudgetBoundedness.UNRESOLVED,
+        reason=f"{dimension} 尚未决定 —— 见 budget_freeze_blockers()",
+    )
+
+
+# ---------------------------------------------------------------------------
 # 实验清单
 # ---------------------------------------------------------------------------
 
@@ -476,8 +634,24 @@ class ExperimentManifest(BaseModel):
         description="该上界**依据什么假设**得出 —— 不得当成实测值",
     )
 
-    token_budget: str = TO_BE_FROZEN_AT_IMPLEMENTATION
-    cost_budget: str = TO_BE_FROZEN_AFTER_PROVIDER_SELECTION
+    token_budget: ResourceBudget = Field(
+        default_factory=lambda: unresolved_resource_budget("token_budget"),
+        description=(
+            "**类型化** token 资源声明。裸清单默认 UNRESOLVED(阻止冻结);"
+            "D-2d 冻结为 NOT_NUMERICALLY_BOUNDED_BY_PROTOCOL + 一个**输出分量**包络"
+        ),
+    )
+    cost_budget: ResourceBudget = Field(
+        default_factory=lambda: unresolved_resource_budget("cost_budget"),
+        description=(
+            "**类型化** cost 资源声明。D-2d 冻结为 NO_NUMERIC_BOUND_NO_PROVENANCE"
+            " —— 含义是「monetary cost 没有数值上界」,**不是**「cost 已受控」"
+        ),
+    )
+    budget_schema_version: str = Field(
+        default=BUDGET_SCHEMA_VERSION,
+        description="资源预算 schema 版本 —— 进摘要域,防止预算语义被静默重新解读",
+    )
 
     harness_level_retry: int = Field(
         default=0, description="首个试点固定为 0 —— 不自动重跑实验单元",
@@ -557,6 +731,21 @@ def placeholder_paths(payload: Any, prefix: str = "") -> list[str]:
     return found
 
 
+def budget_freeze_blockers(manifest: ExperimentManifest) -> list[str]:
+    """仍**未决定**的资源维度。空列表 = 资源预算不阻止冻结。
+
+    它**刻意**与 `placeholder_paths()` 分开:
+    后者回答"还有没有占位符字符串",前者回答"每个资源维度是否已决定"。
+    把两者合并成一个"完备性"检查,会让将来某次修改悄悄放宽其中一条。
+    """
+    blockers: list[str] = []
+    for name in ("token_budget", "cost_budget"):
+        resource: ResourceBudget = getattr(manifest, name)
+        if not resource.decided:
+            blockers.append(f"{name}.boundedness(当前为 {resource.boundedness.value})")
+    return sorted(blockers)
+
+
 def verify_manifest(
     manifest: ExperimentManifest,
     *,
@@ -590,9 +779,14 @@ def verify_manifest(
                 "D-2a 只能产出 candidate;冻结是 D-2b 的闸门"
             )
         unresolved = placeholder_paths(manifest_digest_domain(manifest))
-        if unresolved:
+        undecided = budget_freeze_blockers(manifest)
+        # 两条检查**合并成一条**报错:占位符与"未决定的资源维度"是**同一类**
+        # 阻断原因(清单还没准备好),分成两条会让人只修看得见的那一条,
+        # 然后以为冻结只剩最后一步。
+        if unresolved or undecided:
             raise ManifestError(
                 f"冻结清单仍含未解析占位符:{sorted(unresolved)} —— "
+                f"未决定的资源维度:{undecided} —— "
                 "先解决它们,再谈冻结"
             )
 

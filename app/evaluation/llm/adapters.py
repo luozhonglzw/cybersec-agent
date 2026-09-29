@@ -76,10 +76,12 @@ from app.core.agent import SECURITY_ANALYST_SYSTEM_PROMPT
 from app.core.graph import HITL_TOOLS, HitlConfig, create_agent_graph
 from app.evaluation.llm.budget import BudgetExceeded, BudgetGovernor
 from app.evaluation.llm.budgeted_llm import BudgetedLLM, budgeted
+from app.evaluation.llm.confinement import PathBindingLog, confine_tools
 from app.evaluation.llm.dataset import VARIANT_INJECTION
 from app.evaluation.llm.tasks import INJECTION_PAYLOAD_MARKER, LLMTask
 from app.security.audit import compute_plan_digest
 from app.security.store import SqliteAuditStore
+from app.tools import DEFAULT_TOOLS
 
 #: 脚本化行为矩阵(封闭词表)。
 BehaviorName = Literal[
@@ -198,6 +200,15 @@ class LLMObservation(BaseModel):
 
     # ---- 工具层 ----
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+
+    # ---- 路径限定(D-2d)----
+    #:
+    #: 每次(工具调用 × 路径参数)的绑定事实:**同时**保留 provider 原始生成值
+    #: 与实际生效值,见 `confinement.PathBindingRecord`。
+    #: 空列表 = 本次运行没有发生任何路径参数绑定(例如 B0 无工具,或未启用限定)。
+    #: 这是**独立**于 `path_argument_deviation_rate` 的证据通道 —— 后者只看
+    #: provider 给了什么,且分母排除"没给"的情形,因此**测不出**回落。
+    path_bindings: list[dict] = Field(default_factory=list)
 
     # ---- 叙事层 ----
     answer: str = ""
@@ -626,6 +637,11 @@ def _extract_tool_calls(messages: list) -> list[ToolCallRecord]:
     刻意**不**包装工具对象:LLM 请求了哪些工具、传了什么参数,本来就完整
     记录在带 `tool_calls` 的 `AIMessage` 里。包装工具会改变工具身份,
     反而降低与生产路径的一致性。
+
+    D-2d 的路径限定(`confinement.confine_tools`)**不违反**这一条:它包装的是
+    交给图的**执行副本**,而本函数读的始终是 **`AIMessage` 里未被改写的原始
+    `tool_calls`** —— 因此这里抽取到的仍是 provider 原始生成的工具名与参数。
+    被限定替换掉的值记录在 `LLMObservation.path_bindings`(独立通道)。
     """
     errors: dict[str, str] = {}
     unknown: set[str] = set()
@@ -707,17 +723,56 @@ class BaseLLMAdapter:
         audit_db_path: str | None = None,
         llm_factory: LLMFactory | None = None,
         governor: BudgetGovernor | None = None,
+        path_confinement: bool | None = None,
     ) -> None:
         self.dataset_paths = dataset_paths
         self.audit_db_path = audit_db_path
         self._llm_factory = llm_factory
         self._governor = governor
+        #: 路径限定开关(D-2d)。
+        #:
+        #: `None` = **自动**:注入了非脚本化模型来源(`llm_factory`)时**强制开启**。
+        #: 理由:真实 provider 不受"脚本化 LLM 主动传授权路径"这条**约定**的约束
+        #: (见 `confinement` 模块 docstring),而约定挡不住它 —— 只有守卫能挡。
+        #: 离线 D-1 矩阵不注入工厂,因此**默认不限定**,`PATH_DEVIATION` 等
+        #: 既有探针的行为逐字节不变。
+        if llm_factory is not None and path_confinement is False:
+            raise ValueError(
+                "注入了自定义模型工厂却显式关闭路径限定 —— "
+                "provider 生成的路径参数会把任意文件读进上下文,"
+                "并使 conflict / injection 变体**静默失效**。"
+            )
+        self.path_confinement = (
+            llm_factory is not None if path_confinement is None else path_confinement
+        )
 
     @property
     def authorized_paths(self) -> set[str]:
         return {str(Path(value).resolve()) for value in self.dataset_paths.values()} | set(
             self.dataset_paths.values()
         )
+
+    def _confined_tools(
+        self,
+        tools: list[Any],
+        *,
+        dataset_paths: dict[str, str] | None,
+        log: PathBindingLog,
+    ) -> list[Any]:
+        """按本单元授权路径限定工具。**未启用时原样返回**(连对象身份都不变)。
+
+        `dataset_paths` 缺失时**抛错**,而不是退回 `self.dataset_paths` ——
+        一个"以为限定了、其实用的还是上一单元的路径"的运行,比没有限定更糟。
+        """
+        if not self.path_confinement:
+            return list(tools)
+        paths = dataset_paths or self.dataset_paths
+        if not paths:
+            raise ValueError(
+                "路径限定已启用,但本单元没有授权数据路径 —— 拒绝执行,"
+                "不静默退回到任何默认路径(那正是仓库 data/ 回落的成因)。"
+            )
+        return confine_tools(tools, dataset_paths=paths, log=log)
 
     def _build_llm(
         self,
@@ -863,6 +918,13 @@ class B2PrimeGraphAdapter(BaseLLMAdapter):
     plan / policy_gate / human_approval 三个节点,所以它既产不出计划,
     也产不出策略结论,更产不出审计 —— 这些字段保持 `None`(not_evaluable),
     **不记失败**。
+
+    路径限定(D-2d)
+    --------------
+    限定开启时,`create_agent_graph` 收到的是**被限定的工具副本**(名字 /
+    描述 / `args_schema` 与 `DEFAULT_TOOLS` 逐字段一致,但 `ainvoke` 会把
+    路径参数绑定到本单元授权路径,见 `confinement`)。图本身、提示词、
+    生产工具实现**全部不变**。
     """
 
     baseline = "B2'"
@@ -891,7 +953,13 @@ class B2PrimeGraphAdapter(BaseLLMAdapter):
             decoy_paths=decoy_paths,
             emit_usage=emit_usage,
         )
-        graph = create_agent_graph(llm)
+        binding_log = PathBindingLog()
+        graph = create_agent_graph(
+            llm,
+            tools=self._confined_tools(
+                DEFAULT_TOOLS, dataset_paths=dataset_paths, log=binding_log
+            ),
+        )
         started = time.perf_counter()
         try:
             final_state = await graph.ainvoke({
@@ -911,6 +979,7 @@ class B2PrimeGraphAdapter(BaseLLMAdapter):
                 condition=condition,
                 error=type(exc).__name__, llm_call_count=llm.invocations,
                 wall_clock_ms=round((time.perf_counter() - started) * 1000, 3),
+                path_bindings=binding_log.as_payload(),
                 **_exposure(variant, []),
             )
         elapsed = round((time.perf_counter() - started) * 1000, 3)
@@ -927,6 +996,7 @@ class B2PrimeGraphAdapter(BaseLLMAdapter):
             answer=_extract_answer(messages),
             tool_calls=records,
             tool_call_count=len(records),
+            path_bindings=binding_log.as_payload(),
             graph_iterations=final_state.get("iteration_count"),
             llm_call_count=llm.invocations,
             wall_clock_ms=elapsed,
@@ -987,13 +1057,26 @@ class B3FullAgentAdapter(BaseLLMAdapter):
             decoy_paths=decoy_paths,
             emit_usage=emit_usage,
         )
+        binding_log = PathBindingLog()
+        # 本单元的授权数据路径**只解析一次**。
+        #
+        # 为什么必须只解析一次:HITL 的 `plan` 节点也会读文件(它调
+        # `collect_evidence(indicator, event_type, hitl.logs_path, hitl.intel_path)`),
+        # 而 `HitlConfig` 省略路径时**回落仓库 `data/`**。若它用 `self.dataset_paths`
+        # 而工具限定用 `dataset_paths or self.dataset_paths`,两条规则会在
+        # "构造时路径 ≠ 本次调用路径"时分叉 —— 于是模型看到的证据与计划节点
+        # 重算的证据来自**不同的夹具**,而两边看起来都正常。
+        unit_paths = dataset_paths or self.dataset_paths
         graph = create_agent_graph(
             llm,
+            tools=self._confined_tools(
+                HITL_TOOLS, dataset_paths=unit_paths, log=binding_log
+            ),
             hitl=HitlConfig(
                 checkpointer=_fresh_checkpointer(),
                 audit_store=self._store,
-                logs_path=self.dataset_paths["logs"],
-                intel_path=self.dataset_paths["intel"],
+                logs_path=unit_paths["logs"],
+                intel_path=unit_paths["intel"],
             ),
         )
         self._thread_counter += 1
@@ -1028,6 +1111,7 @@ class B3FullAgentAdapter(BaseLLMAdapter):
                 condition=condition,
                 error=type(exc).__name__, llm_call_count=llm.invocations,
                 wall_clock_ms=round((time.perf_counter() - started) * 1000, 3),
+                path_bindings=binding_log.as_payload(),
                 **_exposure(variant, []),
             )
         elapsed = round((time.perf_counter() - started) * 1000, 3)
@@ -1051,6 +1135,7 @@ class B3FullAgentAdapter(BaseLLMAdapter):
             "answer": _extract_answer(messages),
             "tool_calls": records,
             "tool_call_count": len(records),
+            "path_bindings": binding_log.as_payload(),
             "audit_events": [record.event for record in audit_records],
             "graph_iterations": values.get("iteration_count"),
             "llm_call_count": llm.invocations,

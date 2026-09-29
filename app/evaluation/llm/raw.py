@@ -247,6 +247,15 @@ class RawRecord(BaseModel):
     # ---- 工具轨迹 ----
     tool_call_trace: list[dict] = Field(default_factory=list)
 
+    # ---- 路径限定证据(D-2d)----
+    #:
+    #: 每次(工具调用 × 路径参数)的绑定事实:provider 原始生成值
+    #: (`model_supplied_value`)与实际生效值(`effective_value`)并存,外加
+    #: `disposition`。**独立于** `path_argument_deviation_rate` —— 后者的分母
+    #: 排除"provider 没给路径"的情形,因此**测不出**旧行为下的仓库 data/ 回落。
+    #: 空列表 = 该运行未启用路径限定(例如离线 D-1 矩阵)。
+    path_bindings: list[dict] = Field(default_factory=list)
+
     # ---- 叙事 ----
     final_narrative: str = ""
     final_narrative_sha256: str = ""

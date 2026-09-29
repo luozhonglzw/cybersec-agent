@@ -36,9 +36,10 @@ from app.evaluation.llm.exposure import EXPOSURE_COVERAGE_DEFINITION
 #: 顺序即阅读顺序:先讲"这是什么",再讲"不能读出什么"。
 PILOT_REPORT_CAVEATS: tuple[tuple[str, str], ...] = (
     ("candidate_status", (
-        "本报告由 **Phase 9.2-D-2a 离线基础设施**产出,清单状态为 `candidate`。"
-        "候选清单**不可**用于执行真实 provider 调用:provider / model / 端点类别 / "
-        "token 与 cost 上限仍是占位符,冻结是 D-2b 的独立闸门。"
+        "本报告由 **Phase 9.2-D-2 离线基础设施**产出。清单状态随其来源而定:"
+        "`candidate` 清单**不可**用于执行真实 provider 调用 —— provider / model / "
+        "端点类别仍是占位符,资源预算仍是 `UNRESOLVED`;`frozen` 清单必须"
+        "**零占位符且零未决定资源维度**,且冻结是**独立闸门**,不由本报告授予。"
     )),
     ("no_real_provider_result", (
         "本报告**不含任何真实 provider 结果**。全部运行由 `ScriptedLLM` 产生,"
@@ -129,9 +130,9 @@ def _status_block(outcome: Any) -> list[str]:
         f"(上界 {plan.get('logical_invocation_hard_ceiling')})",
         f"- experimental_run_attempts: **{plan.get('experimental_run_attempts')}**"
         " —— 恒等于运行数,因为 `HARNESS_LEVEL_RETRY = 0`",
-        f"- provider_http_attempts: **{plan.get('provider_http_attempts')}**"
-        " —— 离线阶段不可观测,记 UNKNOWN 而**不记 0**",
-        f"- provider_http_attempt_ceiling(理论上界,非实测):"
+        f"- provider_http_attempts(**实际**,不可观测记 UNKNOWN 而非 0):"
+        f"**{plan.get('provider_http_attempts')}**",
+        f"- provider_http_attempt_ceiling(**配置的理论包络**,非实测、不进入准入):"
         f"{plan.get('provider_http_attempt_ceiling')}",
         f"- execution_order_digest: `{str(plan.get('execution_order_digest', ''))[:16]}…`",
         f"- 顺序摘要与计划一致:{plan.get('execution_order_digest_matches_plan')}",
@@ -163,6 +164,97 @@ def _budget_basis_block(outcome: Any) -> list[str]:
         f"- 逻辑调用下界(结构性):{outcome.budget.get('logical_invocation_floor')}",
         "",
     ]
+
+
+#: 七项**互不混淆**的预算概念。合并其中任何两项都会制造一个具体错觉。
+BUDGET_CONCEPT_ROWS: tuple[str, ...] = (
+    "execution_admission_ceilings",
+    "token_total_boundedness",
+    "output_token_scoped_envelope",
+    "monetary_cost_boundedness",
+    "configured_theoretical_http_attempt_envelope",
+    "actual_provider_http_attempts",
+    "independently_observed_transport_http_attempts",
+)
+
+
+def _budget_separation_block(outcome: Any, manifest: Any | None) -> list[str]:
+    """**七个概念分开陈述** —— 不得合并成一个 "budget" 数字。
+
+    `manifest` 为 `None` 时,token / cost 两行的值记 `N/A(清单未随 outcome 传入)`
+    而**不是**省略该行:省略会让人以为"这个报告里没有资源预算这件事",
+    而事实是"本次调用没有拿到清单"。
+    """
+    budget = outcome.budget or {}
+    if manifest is None:
+        token_boundedness = "N/A(清单未随 outcome 传入)"
+        token_envelopes = "N/A(清单未随 outcome 传入)"
+        cost_boundedness = "N/A(清单未随 outcome 传入)"
+    else:
+        token_boundedness = manifest.token_budget.boundedness.value
+        token_envelopes = (
+            "; ".join(
+                f"{envelope.scope}={envelope.value} {envelope.unit}"
+                for envelope in manifest.token_budget.envelopes
+            )
+            or "(无分量包络)"
+        )
+        cost_boundedness = manifest.cost_budget.boundedness.value
+
+    rows = (
+        (
+            "执行准入上界",
+            f"实验单元 {budget.get('total_runs')} / 逻辑调用 "
+            f"{budget.get('logical_invocation_hard_ceiling')}",
+            "**唯一的准入权威**;token / cost 声明**不参与**准入",
+        ),
+        (
+            "token 总量边界",
+            token_boundedness,
+            "total provider tokens 的边界状态",
+        ),
+        (
+            "输出 token 分量包络",
+            token_envelopes,
+            "**分量**包络 —— **不是** total-token budget",
+        ),
+        (
+            "monetary cost 边界",
+            cost_boundedness,
+            "**禁止**读成「cost 已满足 / 已控制 / ≤ X / 零成本」",
+        ),
+        (
+            "配置的理论 HTTP 尝试包络",
+            str(budget.get("provider_http_attempt_ceiling")),
+            "**配置的**包络,不是观测值,也不进入准入",
+        ),
+        (
+            "**实际** provider HTTP 尝试",
+            str(budget.get("provider_http_attempts")),
+            "运行时观测;不可观测记 UNKNOWN,**不是** 0,"
+            "理论包络**不得**写进这一项",
+        ),
+        (
+            "独立传输层观测的 HTTP 尝试",
+            str(budget.get("transport_observed_http_attempts")),
+            "独立记录通道;清单与执行器都不伪造它",
+        ),
+    )
+    lines = [
+        "### 1.2 预算的七个概念(逐项分开,不得合并)",
+        "",
+        "| 概念 | 值 | 说明 |",
+        "| --- | --- | --- |",
+    ]
+    for name, value, note in rows:
+        lines.append(f"| {name} | {value} | {note} |")
+    lines.extend([
+        "",
+        "> 把这七项合成一个「预算」数字,最直接的后果是读者会拿**配置的理论包络**",
+        "> 去读成**实际发出的请求数**,或拿**输出分量包络**去读成**总 token 上界**。",
+        "",
+    ])
+    return lines
 
 
 def _pairing_block(outcome: Any) -> list[str]:
@@ -342,10 +434,15 @@ def _network_block(outcome: Any) -> list[str]:
     ]
 
 
-def render_pilot_report(outcome: Any) -> str:
-    """渲染离线试点报告(Markdown)。**不产出排行榜,不产出总分。**"""
+def render_pilot_report(outcome: Any, *, manifest: Any | None = None) -> str:
+    """渲染离线试点报告(Markdown)。**不产出排行榜,不产出总分。**
+
+    `manifest` 是**可选**的:传了它,token / cost 两项资源边界才会被填上;
+    不传则如实记 `N/A(清单未随 outcome 传入)`。执行器只持有
+    `manifest_digest`(看不到清单对象),因此既有调用方**逐字节不受影响**。
+    """
     lines = [
-        "# Phase 9.2-D-2a 离线试点报告",
+        "# Phase 9.2-D-2 离线试点报告",
         "",
         "> **状态:OFFLINE / CANDIDATE。** 本报告不含真实 provider 结果。",
         "> 它证明的是「工装能跑通」,不是「模型表现如何」。",
@@ -354,6 +451,7 @@ def render_pilot_report(outcome: Any) -> str:
     lines.extend(_caveat_block())
     lines.extend(_status_block(outcome))
     lines.extend(_budget_basis_block(outcome))
+    lines.extend(_budget_separation_block(outcome, manifest))
     lines.extend(_pairing_block(outcome))
     lines.extend(_exposure_block(outcome))
     lines.extend(_failure_block(outcome))
@@ -362,8 +460,8 @@ def render_pilot_report(outcome: Any) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_pilot_report(outcome: Any, path: Any) -> Path:
+def write_pilot_report(outcome: Any, path: Any, *, manifest: Any | None = None) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_pilot_report(outcome), encoding="utf-8")
+    target.write_text(render_pilot_report(outcome, manifest=manifest), encoding="utf-8")
     return target

@@ -2,15 +2,20 @@
 
 两段式清单
 ----------
-    candidate   D-2a 只允许产出这个。provider / model / 端点类别 / token 与
-                cost 上限仍是 `TO_BE_FROZEN_*` 占位符。
-    frozen      D-2b 的闸门。要求**零占位符**,并且逐项与当前 HEAD、
-                任务清单摘要、指标 schema 摘要对齐。
+    candidate   离线候选。provider / model / 端点类别仍是 `TO_BE_FROZEN_*`
+                占位符;`token_budget` / `cost_budget` 默认 `UNRESOLVED`。
+    frozen      冻结闸门。要求**零占位符**、**零未决定资源维度**,并且逐项与
+                当前 HEAD、任务清单摘要、指标 schema 摘要、冻结计划对齐。
 
-为什么不在 D-2a 直接产出"最终清单"
----------------------------------
+`token_budget` / `cost_budget` 是**类型化**的(`ResourceBudget`)
+----------------------------------------------------------------
+"有没有数值上界"由**封闭词表**回答,不由字符串前缀回答 ——
+旧版的裸 `str` 字段只要填一句描述就能静默清空 freeze blocker。
+
+为什么不在候选阶段直接产出"最终清单"
+------------------------------------
 清单里有一半字段**在选 provider 之前根本无法确定**(端点类别、定价来源、
-provider 侧默认参数的实测快照)。先写一个猜的值,再在 D-2b "更新一下" ——
+provider 侧默认参数的实测快照)。先写一个猜的值,再"更新一下" ——
 那正是"活动实验被静默改动"的经典路径。因此本模块只产出候选清单,
 并把"还差什么才能冻结"做成**可机械枚举**的列表(`manifest_freeze_blockers`)。
 
@@ -23,11 +28,16 @@ provider 侧默认参数的实测快照)。先写一个猜的值,再在 D-2b "�
 """
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from app.evaluation.llm.budget import PilotBudget, pilot_budget
+from app.evaluation.llm.budget import (
+    SDK_MAX_RETRIES_OBSERVED,
+    UNKNOWN,
+    PilotBudget,
+    pilot_budget,
+)
 from app.evaluation.llm.dataset import (
     LLM_DATASET_VERSION,
     LLM_TASKS,
@@ -39,18 +49,23 @@ from app.evaluation.llm.ordering import (
     build_execution_order,
 )
 from app.evaluation.llm.protocol import (
+    BUDGET_SCHEMA_VERSION,
     FAILURE_TAXONOMY_VERSION,
     HARNESS_VERSION,
     METRIC_SCHEMA_VERSION,
     PROTOCOL_VERSION,
     REAL_LLM_TASKSET_VERSION,
+    TO_BE_FROZEN_AFTER_PROVIDER_SELECTION,
     ExperimentManifest,
     ManifestError,
+    ResourceBudget,
+    budget_freeze_blockers,
     compute_manifest_digest,
     metric_schema_digest,
     placeholder_paths,
     real_llm_taskset_digest,
     seal_manifest,
+    unresolved_resource_budget,
     verify_manifest,
 )
 from app.evaluation.llm.runner import (
@@ -113,6 +128,9 @@ class PilotPlan(BaseModel):
     logical_invocation_hard_ceiling: int
     provider_http_attempt_ceiling: int
     provider_http_attempt_ceiling_basis: str
+    #: 该物理包络建立在哪个 SDK 重试假设上。默认 = **观测到的** SDK 默认值
+    #: (⇒ `972`);D-2d 传 0(其冻结 provider 配置,⇒ `324`)。
+    sdk_max_retries_assumption: int = SDK_MAX_RETRIES_OBSERVED
     soft_call_ceiling: int
 
     execution_order_method: str = "sha256-sort"
@@ -152,9 +170,13 @@ def pilot_budget_of(
     baselines: tuple[str, ...] = PILOT_BASELINES,
     repetition_count: int = PILOT_REPETITION_COUNT,
     tasks: tuple[LLMTask, ...] = LLM_TASKS,
+    sdk_max_retries: int = SDK_MAX_RETRIES_OBSERVED,
 ) -> PilotBudget:
     return pilot_budget(
-        baseline_labels=baselines, repetition_count=repetition_count, tasks=tasks
+        baseline_labels=baselines,
+        repetition_count=repetition_count,
+        tasks=tasks,
+        sdk_max_retries=sdk_max_retries,
     )
 
 
@@ -180,10 +202,19 @@ def pilot_plan(
     repetition_count: int = PILOT_REPETITION_COUNT,
     seed: str = EXECUTION_ORDER_SEED,
     tasks: tuple[LLMTask, ...] = LLM_TASKS,
+    sdk_max_retries: int = SDK_MAX_RETRIES_OBSERVED,
 ) -> PilotPlan:
-    """冻结的试点计划。**规模与上限全部由结构推导。**"""
+    """冻结的试点计划。**规模与上限全部由结构推导。**
+
+    `sdk_max_retries` 默认是**观测到的** SDK 默认值 ⇒ 既有计划的
+    `provider_http_attempt_ceiling` 仍是 `972`(**逐字段不变**)。
+    D-2d 传 `0` ⇒ `324`。
+    """
     budget = pilot_budget_of(
-        baselines=baselines, repetition_count=repetition_count, tasks=tasks
+        baselines=baselines,
+        repetition_count=repetition_count,
+        tasks=tasks,
+        sdk_max_retries=sdk_max_retries,
     )
     ordered, order_digest = pilot_units(
         baselines=baselines, repetition_count=repetition_count, seed=seed, tasks=tasks
@@ -201,6 +232,7 @@ def pilot_plan(
         logical_invocation_hard_ceiling=budget.logical_invocation_hard_ceiling,
         provider_http_attempt_ceiling=budget.provider_http_attempt_ceiling,
         provider_http_attempt_ceiling_basis=budget.provider_http_attempt_ceiling_basis,
+        sdk_max_retries_assumption=budget.sdk_max_retries_assumption,
         soft_call_ceiling=budget.soft_call_ceiling,
         execution_order_seed=seed,
         execution_order_digest=order_digest,
@@ -220,12 +252,38 @@ def build_candidate_manifest(
     tasks: tuple[LLMTask, ...] = LLM_TASKS,
     plan: PilotPlan | None = None,
     created_at_utc: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    endpoint_category: str | None = None,
+    manifest_status: Literal["candidate", "frozen"] = "candidate",
+    token_budget: ResourceBudget | None = None,
+    cost_budget: ResourceBudget | None = None,
 ) -> ExperimentManifest:
-    """构建**候选**清单并封上自身摘要。
+    """构建清单并封上自身摘要。
 
-    provider / model / 端点类别 / token 上限 / cost 上限**刻意留占位符** ——
-    它们要等 D-2b 才能确定。留下占位符而不是猜一个值,是为了让
-    "这份清单还不能冻结"成为一个可机械回答的问题。
+    provider / model / 端点类别 / 两个资源预算**默认留占位符或 UNRESOLVED** ——
+    留下"还没定"而不是猜一个值,是为了让"这份清单还不能冻结"成为一个
+    可机械回答的问题。
+
+    D-2d 的**已授权**身份字段
+    -------------------------
+    `provider` / `model` / `endpoint_category` 可由调用方显式传入(控制器已为
+    D-2d 冻结了这三个值,见 `app/evaluation/pilot_config.pilot_identity_fields()`)。
+    不传则保持占位符 —— 既有调用方(D-2a/D-2b 的测试)**行为逐字节不变**。
+
+    `token_budget` / `cost_budget`(**类型化**)
+    ------------------------------------------
+    不传 ⇒ `UNRESOLVED`(阻止冻结)。D-2d 传入两个**已决定**的声明
+    (见 `app/evaluation/pilot_config.token_budget()` / `cost_budget()`)。
+
+    它们**不参与执行准入** —— 准入只有 `experimental_run_attempts` 与
+    `logical_llm_invocations` 两个权威计数器。
+
+    `manifest_status="frozen"`(**fail closed**)
+    -------------------------------------------
+    要求冻结时,函数**立刻**跑一遍 `verify_manifest(require_frozen=True)`:
+    任何占位符或未决定的资源维度都会当场抛 `ManifestError`。
+    这样"标成 frozen 但内容还没准备好"不可能产出一个看起来合法的产物。
 
     `created_at_utc` 与可复现性
     ---------------------------
@@ -234,14 +292,17 @@ def build_candidate_manifest(
 
     这不影响实验正确性(candidate 本就未冻结),但要求:
     - 需要跨机器 / 跨时刻比对产物时,**显式传入** `created_at_utc`;
-    - D-2b 冻结清单时必须把该字段**固定下来** —— 冻结之后,报告才真正可逐字节复现。
+    - 冻结清单时必须把该字段**固定下来** —— 冻结之后,报告才真正可逐字节复现。
     """
     plan = plan or pilot_plan(tasks=tasks)
     manifest = ExperimentManifest(
         protocol_version=PROTOCOL_VERSION,
-        manifest_status="candidate",
+        manifest_status=manifest_status,
         created_at_utc=created_at_utc or datetime.now(timezone.utc).isoformat(),
         git_commit=git_commit,
+        provider=provider or TO_BE_FROZEN_AFTER_PROVIDER_SELECTION,
+        model=model or TO_BE_FROZEN_AFTER_PROVIDER_SELECTION,
+        endpoint_category=endpoint_category or TO_BE_FROZEN_AFTER_PROVIDER_SELECTION,
         taskset_version=REAL_LLM_TASKSET_VERSION,
         taskset_digest=real_llm_taskset_digest(datasets, tasks),
         metric_schema_version=METRIC_SCHEMA_VERSION,
@@ -259,6 +320,9 @@ def build_candidate_manifest(
         logical_invocation_hard_ceiling=plan.logical_invocation_hard_ceiling,
         provider_http_attempt_ceiling=plan.provider_http_attempt_ceiling,
         provider_http_attempt_ceiling_basis=plan.provider_http_attempt_ceiling_basis,
+        token_budget=token_budget or unresolved_resource_budget("token_budget"),
+        cost_budget=cost_budget or unresolved_resource_budget("cost_budget"),
+        budget_schema_version=BUDGET_SCHEMA_VERSION,
         harness_level_retry=0,
         failure_taxonomy_version=FAILURE_TAXONOMY_VERSION,
         system_prompt_sha256=system_prompt_sha256(),
@@ -266,7 +330,11 @@ def build_candidate_manifest(
         harness_version=HARNESS_VERSION,
         declared_confounds=list(DECLARED_CONFOUNDS),
     )
-    return seal_manifest(manifest)
+    sealed = seal_manifest(manifest)
+    if manifest_status == "frozen":
+        # **fail closed**:要冻结就必须当场通过冻结闸门。
+        verify_manifest(sealed, require_frozen=True)
+    return sealed
 
 
 def verify_candidate_manifest(
@@ -293,17 +361,89 @@ def verify_candidate_manifest(
 
 
 def manifest_freeze_blockers(manifest: ExperimentManifest) -> list[str]:
-    """距离"可冻结"还差什么。**D-2b 的前置清单。**
+    """距离"可冻结"还差什么。**D-2b / D-2d 的前置清单。**
 
-    返回的是**占位符字段路径** —— 也就是说,只要这个列表非空,
-    `verify_manifest(require_frozen=True)` 一定会拒绝。
+    返回的是**两类**阻断原因:
+
+        占位符字段路径       `placeholder_paths()` 找出来的(`provider` 等)
+        未决定的资源维度     `budget_freeze_blockers()` 找出来的(`token_budget` 等)
+
+    只要这个列表非空,`verify_manifest(require_frozen=True)` 一定会拒绝。
+    两类**刻意分开标注**:它们修法不同(前者填值,后者做决定),合并成
+    "还差 N 项"会让人以为它们是一回事。
     """
     payload = manifest.model_dump(mode="json")
     payload.pop("manifest_digest", None)
     blockers = placeholder_paths(payload)
+    blockers.extend(budget_freeze_blockers(manifest))
     if manifest.manifest_status != "frozen":
         blockers.append("manifest_status(当前为 candidate)")
     return sorted(blockers)
+
+
+def assert_frozen_pilot_manifest(
+    manifest: ExperimentManifest,
+    *,
+    datasets: dict[str, dict[str, str]],
+    expected_git_commit: str,
+    plan: PilotPlan | None = None,
+    tasks: tuple[LLMTask, ...] = LLM_TASKS,
+    expected_identity: dict[str, str] | None = None,
+    expected_budgets: dict[str, ResourceBudget] | None = None,
+) -> None:
+    """**D-2d 正式执行的冻结闸门。必须在任何 provider 构造之前调用。**
+
+    五条(`frozen` 语义),任何一条不满足都抛 `ManifestError`:
+
+        ① `manifest_status == "frozen"`
+        ② `placeholder_paths(...) == []`
+        ③ `budget_freeze_blockers(...) == []`
+        ④ `manifest_digest` 可重算
+        ⑤ D-2d 执行不变量与冻结计划 / 配置一致
+
+    ①②③④ 由 `verify_manifest(require_frozen=True)` 覆盖;⑤ 是本函数补的:
+    **清单与计划是两份东西**,它们必须逐字段一致 —— 否则"冻结了清单"与
+    "按计划执行"会变成两件互不相干的事。
+
+    `expected_identity` / `expected_budgets` 由调用方传入(它们的事实来源在
+    `app/evaluation/pilot_config.py`,而本模块**不得** import 它 ——
+    那会把 provider 构造边界拉进被护栏覆盖的包内)。
+    """
+    plan = plan or pilot_plan(tasks=tasks)
+
+    verify_manifest(
+        manifest,
+        require_frozen=True,
+        expected_git_commit=expected_git_commit,
+        expected_taskset_digest=real_llm_taskset_digest(datasets, tasks),
+        expected_metric_schema_digest=metric_schema_digest(),
+    )
+
+    # ⑤ 执行不变量 —— 清单必须与冻结计划逐字段一致。
+    for field, expected_value in plan.as_manifest_fields().items():
+        actual_value = getattr(manifest, field)
+        if actual_value != expected_value:
+            raise ManifestError(
+                f"D-2d 执行不变量与冻结计划不一致:{field} "
+                f"清单 {actual_value!r} ≠ 计划 {expected_value!r}"
+            )
+
+    for field, expected_value in (expected_identity or {}).items():
+        actual_value = getattr(manifest, field)
+        if actual_value != expected_value:
+            raise ManifestError(
+                f"D-2d provider 身份与冻结配置不一致:{field} "
+                f"清单 {actual_value!r} ≠ 配置 {expected_value!r}"
+            )
+
+    for field, expected_resource in (expected_budgets or {}).items():
+        actual_resource = getattr(manifest, field)
+        if actual_resource != expected_resource:
+            raise ManifestError(
+                f"D-2d 资源声明与冻结配置不一致:{field} "
+                f"清单 {actual_resource.model_dump(mode='json')} ≠ "
+                f"配置 {expected_resource.model_dump(mode='json')}"
+            )
 
 
 def assert_candidate_only(manifest: ExperimentManifest) -> None:
@@ -317,6 +457,68 @@ def assert_candidate_only(manifest: ExperimentManifest) -> None:
             f"D-2a 只允许产出 candidate 清单,实际为 {manifest.manifest_status!r} —— "
             "最终冻结是 D-2b 的独立闸门"
         )
+
+
+def budget_report(manifest: ExperimentManifest) -> dict[str, Any]:
+    """**七个互不混淆的概念**。**不得**合并成一个 "budget" 数字。
+
+    合并会制造一个具体而危险的错觉:读者会拿"配置的理论包络 324"去读成
+    "实际发了 324 个请求",或拿"输出分量包络"去读成"总 token 有上界"。
+    因此每一项都单独命名、单独取值,并显式写出它与相邻项的区别。
+    """
+    return {
+        "budget_schema_version": manifest.budget_schema_version,
+        "1_execution_admission": {
+            "experimental_run_attempts_ceiling": manifest.total_runs,
+            "logical_llm_invocations_ceiling": (
+                manifest.logical_invocation_hard_ceiling
+            ),
+            "note": (
+                "**唯一的准入权威**:实验单元数与逻辑调用数。"
+                "token / cost 声明**不参与**准入。"
+            ),
+        },
+        "2_token_total_boundedness": {
+            "boundedness": manifest.token_budget.boundedness.value,
+            "value": manifest.token_budget.value,
+            "unit": manifest.token_budget.unit,
+            "reason": manifest.token_budget.reason,
+            "note": "total provider tokens 的边界状态(不是分量包络)",
+        },
+        "3_output_token_scoped_envelope": {
+            "envelopes": [
+                envelope.model_dump(mode="json")
+                for envelope in manifest.token_budget.envelopes
+            ],
+            "note": "**分量**包络 —— 不是 total-token budget",
+        },
+        "4_monetary_cost_boundedness": {
+            "boundedness": manifest.cost_budget.boundedness.value,
+            "value": manifest.cost_budget.value,
+            "unit": manifest.cost_budget.unit,
+            "reason": manifest.cost_budget.reason,
+            "note": (
+                "monetary cost 的边界状态。"
+                "**禁止**读成「cost 已满足 / 已控制 / ≤ X / 零成本」"
+            ),
+        },
+        "5_configured_theoretical_http_attempt_envelope": {
+            "value": manifest.provider_http_attempt_ceiling,
+            "basis": manifest.provider_http_attempt_ceiling_basis,
+            "note": "**配置的理论包络**,不是观测值,也不进入准入",
+        },
+        "6_actual_provider_http_attempts": {
+            "value": UNKNOWN,
+            "note": (
+                "清单层面**不可观测**。观测值只出现在运行记录里;"
+                "UNKNOWN **不是** 0,理论包络**不得**写进这里。"
+            ),
+        },
+        "7_independently_observed_transport_http_attempts": {
+            "value": None,
+            "note": "独立传输层观测。清单不携带运行期观测,故为 None",
+        },
+    }
 
 
 def manifest_report(manifest: ExperimentManifest) -> dict[str, Any]:
@@ -344,6 +546,8 @@ def manifest_report(manifest: ExperimentManifest) -> dict[str, Any]:
         "harness_level_retry": manifest.harness_level_retry,
         "recomputed_manifest_digest": compute_manifest_digest(manifest),
         "freeze_blockers": manifest_freeze_blockers(manifest),
+        # 七个概念**分列**,不合并成一个 budget 数字。
+        "budget": budget_report(manifest),
         "workdir_independent": True,
     }
 
