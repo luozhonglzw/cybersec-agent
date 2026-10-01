@@ -47,6 +47,19 @@
 构造参数的"纵深防御"改动**不在本阶段范围内** —— 驱动入口是唯一能真正保证
 "pre-provider validation"的一层,改共享执行器只会不必要地扩大影响面。
 
+身份接线(F13)
+--------------
+注入真实 provider 工厂却**不给**与之对应的真实身份,会让 `OfflineExecutor`
+**正确地**拒绝构造 —— 它的身份/工厂一致性守卫是
+「`llm_factory is not None` **且** `identity.is_scripted`」⇒ `ValueError`,
+其理由是:那会让每一条真实记录都声称自己是脚本化运行。
+守卫本身是**对的**,因此本驱动修的是**接线**,不是守卫。
+
+本驱动在**闸门之后**从**同一份**冻结 `PilotProviderConfig` 派生执行器身份
+(`identity_for_candidate(...)`,`temperature = recorded_temperature()` ⇒
+`NOT_SET`),使**请求侧**(`model_kwargs()`)与**记录侧**(`identity`)在结构上
+无法分叉 —— 与 `PilotProviderConfig` 的"单一事实来源"约束同源。
+
 本模块**不执行**任何东西:导入它不读环境变量、不构造客户端、不发请求。
 `run_d2d_pilot()` 默认 `allow_network=False` ⇒ 直接拒绝。
 """
@@ -162,10 +175,29 @@ def run_d2d_pilot(
     config = default_pilot_config()
     from app.evaluation.llm.executor import OfflineExecutor  # noqa: PLC0415
     from app.evaluation.llm.offline_guard import NetworkEgressGuard  # noqa: PLC0415
-    from app.evaluation.real_provider import make_llm_factory  # noqa: PLC0415
+    from app.evaluation.real_provider import (  # noqa: PLC0415
+        identity_for_candidate,
+        make_llm_factory,
+    )
+
+    candidate = config.provider_candidate()
+    # F13:执行器身份与 provider 请求必须**同源**。
+    #
+    # 注入真实工厂却不给真实身份,`OfflineExecutor` 会**正确地**拒绝
+    # (工厂非空 + 身份仍是 SCRIPTED_OFFLINE ⇒ ValueError)。这里从**同一份**
+    # 冻结 `config` 派生身份:`base_url` 与 `temperature` 都取自
+    # `PilotProviderConfig`,与 `model_kwargs()` 同源 ⇒ 请求侧与记录侧
+    # 在结构上无法分叉。`recorded_temperature()` 恒为 `None`(NOT_SET)。
+    #
+    # **位置**:在闸门**之后** —— 见本模块 docstring 的 F12 顺序不变量。
+    identity = identity_for_candidate(
+        candidate,
+        base_url=config.base_url,
+        temperature=config.recorded_temperature(),
+    )
 
     factory = make_llm_factory(
-        candidate=config.provider_candidate(),
+        candidate=candidate,
         api_key=api_key,
         allow_network=allow_network,
         **config.model_kwargs(),
@@ -180,6 +212,7 @@ def run_d2d_pilot(
         manifest_digest=manifest.manifest_digest,
         guard=NetworkEgressGuard(strict=True),
         llm_factory=factory,
+        identity=identity,
     )
     import asyncio  # noqa: PLC0415
 
