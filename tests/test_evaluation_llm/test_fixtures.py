@@ -150,6 +150,28 @@ def test_fixture_generation_is_byte_deterministic(tmp_path):
             ), f"{variant}/{key} 两次生成不一致"
 
 
+def test_fixture_bytes_use_the_canonical_newline(tmp_path):
+    """跨平台逐字节一致 —— 冻结摘要 `FROZEN_TASKSET_DIGEST` 的前提。
+
+    `test_fixture_generation_is_byte_deterministic` 只证明"同一台机器上两次生成
+    一致"。但文本模式写文件会把 `\n` 翻译成 `os.linesep`(Windows → CRLF,
+    Linux → LF),于是**同一份逻辑 fixture** 在两个平台上字节不同 → 摘要不同,
+    冻结常量就只能在单个平台上成立。
+
+    这里直接对**字节**断言(刻意不引用 `FIXTURE_NEWLINE` 常量 —— 否则常量一改
+    测试就跟着改,等于没有护栏),因此与宿主机 OS 无关:任何平台上都必须成立。
+    """
+    datasets = build_datasets(tmp_path / "canonical")
+    for variant in sorted(datasets):
+        for key in ("logs", "intel"):
+            payload = Path(datasets[variant][key]).read_bytes()
+            assert b"\r\n" in payload, f"{variant}/{key} 不含规范换行"
+            assert payload.count(b"\n") == payload.count(b"\r\n"), (
+                f"{variant}/{key} 含裸 LF —— fixture 序列化绕过了 "
+                "write_fixture_lines 这一唯一边界"
+            )
+
+
 def test_all_fixture_files_live_outside_the_repository(tmp_path):
     """评测数据**绝不**写进仓库 `data/`。"""
     datasets = build_datasets(tmp_path / "work")

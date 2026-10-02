@@ -29,6 +29,12 @@ fixture 的确定性
 ----------------
 所有 fixture 都由固定时间戳与固定内容构造,不使用 `now()`、不使用随机数,
 因此重复生成逐字节一致(与 `scripts/seed_*.py` 同一纪律)。
+
+**逐字节一致是跨平台的**:全部 fixture 都经 `write_fixture_lines` 写出,换行由
+`FIXTURE_NEWLINE` 显式固定(见 `app/evaluation/runner.py`)。文本模式写文件会把
+`\n` 翻译成 `os.linesep`,那会让同一份逻辑 fixture 在 Windows 与 Linux 上得到
+不同字节、进而不同摘要 —— 冻结摘要 `FROZEN_TASKSET_DIGEST` 就只能在单个平台上
+成立。显式固定换行后,该摘要在两个平台上同时成立。
 """
 import json
 from pathlib import Path
@@ -45,7 +51,7 @@ from app.evaluation.llm.tasks import (
     ToolContract,
     VerifiableFact,
 )
-from app.evaluation.runner import write_seed_dataset
+from app.evaluation.runner import write_fixture_lines, write_seed_dataset
 
 #: 任务集版本。**D-2a 从 `9.2-D-1.1` 升到 `9.2-D-1.2`** —— 原因只有一个:
 #: 数据集新增了 `injection_inert` 变体(见下)。任务**内容**、载荷字节、
@@ -788,25 +794,29 @@ def _write_carrier_variant(
     """
     directory = workdir / variant
     directory.mkdir(parents=True, exist_ok=True)
+
+    base_logs = Path(workdir / VARIANT_BASE / "security_events.jsonl")
+    log_lines = [json.dumps(event, ensure_ascii=False) for event in events]
+    log_lines += [
+        line
+        for line in base_logs.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     logs = directory / "security_events.jsonl"
-    with open(logs, "w", encoding="utf-8") as f:
-        for event in events:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        for line in Path(workdir / VARIANT_BASE / "security_events.jsonl").read_text(
-            encoding="utf-8"
-        ).splitlines():
-            if line.strip():
-                f.write(line + "\n")
+    write_fixture_lines(logs, log_lines)
+
+    base_intel = workdir / VARIANT_BASE / "threat_intel.jsonl"
+    intel_lines: list[str] = []
+    for line in base_intel.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record["indicator"] == "203.0.113.66":
+            record["description"] = description_for(record["description"])
+        intel_lines.append(json.dumps(record, ensure_ascii=False))
     intel = directory / "threat_intel.jsonl"
-    with open(intel, "w", encoding="utf-8") as f:
-        base_intel = workdir / VARIANT_BASE / "threat_intel.jsonl"
-        for line in base_intel.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if record["indicator"] == "203.0.113.66":
-                record["description"] = description_for(record["description"])
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    write_fixture_lines(intel, intel_lines)
+
     return {"logs": str(logs), "intel": str(intel)}
 
 
@@ -828,15 +838,21 @@ def build_datasets(workdir: Path | str) -> dict[str, dict[str, str]]:
     conflict_dir = workdir / VARIANT_CONFLICT
     conflict_dir.mkdir(parents=True, exist_ok=True)
     conflict_logs = conflict_dir / "security_events.jsonl"
-    with open(conflict_logs, "w", encoding="utf-8") as f:
-        for line in Path(base["logs"]).read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                f.write(line + "\n")
-        for event in _conflict_events():
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    conflict_lines = [
+        line
+        for line in Path(base["logs"]).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    conflict_lines += [
+        json.dumps(event, ensure_ascii=False) for event in _conflict_events()
+    ]
+    write_fixture_lines(conflict_logs, conflict_lines)
+
+    # conflict 变体的情报与 base 内容相同 —— 同样经过唯一的序列化边界,
+    # 因此两个文件的字节完全一致。
     conflict_intel = conflict_dir / "threat_intel.jsonl"
-    conflict_intel.write_text(
-        Path(base["intel"]).read_text(encoding="utf-8"), encoding="utf-8"
+    write_fixture_lines(
+        conflict_intel, Path(base["intel"]).read_text(encoding="utf-8").splitlines()
     )
 
     # ---- injection / injection_inert:同一载体,只换自由文本 ----

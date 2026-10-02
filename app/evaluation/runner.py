@@ -38,7 +38,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 import structlog
 from pydantic import BaseModel, Field
@@ -95,6 +95,26 @@ class EvaluationResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: fixture 序列化的**规范换行序列**。
+#:
+#: 冻结摘要 `FROZEN_TASKSET_DIGEST` 是在 **CRLF** 字节上标定的。文本模式写文件会把
+#: `\n` 翻译成 `os.linesep`(Windows → CRLF,Linux → LF),于是同一份逻辑 fixture 在
+#: 不同平台上得到不同字节 → 不同 SHA256 → 不同 taskset digest,冻结常量只能在
+#: 一个平台上成立。这里把规范换行**显式**固定为 CRLF。
+FIXTURE_NEWLINE = "\r\n"
+
+
+def write_fixture_lines(path: Path | str, lines: Iterable[str]) -> None:
+    """以**规范字节**(UTF-8 + `FIXTURE_NEWLINE`,禁用平台换行翻译)写出 fixture。
+
+    这是 fixture 序列化的**唯一边界**:所有生成器都必须经过它。绕开它,就等于把
+    "同一 fixture → 同一字节 → 同一摘要"这条不变量降级成一句没有强制力的注释。
+    """
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        for line in lines:
+            handle.write(line + FIXTURE_NEWLINE)
+
+
 def write_seed_dataset(dest_dir: Path | str) -> dict[str, Path]:
     """把 Phase 2 的**确定性**种子数据写进 dest_dir,返回两个 JSONL 的路径。
 
@@ -116,14 +136,14 @@ def write_seed_dataset(dest_dir: Path | str) -> dict[str, Path]:
     dest.mkdir(parents=True, exist_ok=True)
 
     logs_path = dest / "security_events.jsonl"
-    with logs_path.open("w", encoding="utf-8") as handle:
-        for event in generate_events():
-            handle.write(event.model_dump_json() + "\n")
+    write_fixture_lines(
+        logs_path, (event.model_dump_json() for event in generate_events())
+    )
 
     intel_path = dest / "threat_intel.jsonl"
-    with intel_path.open("w", encoding="utf-8") as handle:
-        for record in _records():
-            handle.write(record.model_dump_json() + "\n")
+    write_fixture_lines(
+        intel_path, (record.model_dump_json() for record in _records())
+    )
 
     return {"logs": logs_path, "intel": intel_path}
 
