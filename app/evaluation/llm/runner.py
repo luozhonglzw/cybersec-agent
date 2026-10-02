@@ -175,12 +175,70 @@ def tool_schema_sha256() -> str:
     return _tool_schema_digest()
 
 
+#: schema 身份里承载**文件系统路径**的字段名。
+#:
+#: 这些字段的默认值来自 `str(Path(...))` —— 在 Windows 上带反斜杠、在 Linux 上带
+#: 正斜杠。身份摘要吃的是序列化后的字节,于是**同一份逻辑 schema** 会在两个平台上
+#: 算出两个摘要,冻结常量 `FROZEN_TOOL_SCHEMA_SHA256` 便只能在单个平台上成立。
+#:
+#: 这些字段在 JSON schema 里是**普通 `string`**(没有 `format: path` 标记),
+#: 所以"是不是路径"只能**显式声明**,不能从类型推断。集合的**完备性**由
+#: `tests/test_evaluation_llm/test_tool_schema_identity.py` 机械核对 ——
+#: 新增路径字段却忘了登记,测试会红。
+_SCHEMA_PATH_FIELDS = frozenset({"data_path", "logs_path", "intel_path"})
+
+#: schema 身份的**规范路径分隔符**。
+#:
+#: 冻结摘要是在反斜杠表示上标定的;固定成同一个表示,使"同一份逻辑 schema →
+#: 同一个身份表示 → 同一个冻结摘要"跨平台成立。它**只作用于身份序列化** ——
+#: 不改变任何运行时 Path 语义、工具默认值或文件系统行为。
+_CANONICAL_PATH_SEPARATOR = "\\"
+
+
+def _canonicalize_schema_path_defaults(
+    schemas: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """把**已声明的路径字段**的默认值规范到 `_CANONICAL_PATH_SEPARATOR`。
+
+    只改写 `_SCHEMA_PATH_FIELDS` 里的字段、且只改写其字符串默认值:
+    不触碰其它字段、不触碰任意字符串、不触碰任何 Path 对象或运行时行为。
+    返回新字典,不修改入参(工具 schema 可能被框架缓存)。
+    """
+    normalized: dict[str, dict[str, Any]] = {}
+    for tool_name, fields in schemas.items():
+        new_fields: dict[str, Any] = {}
+        for field_name, spec in fields.items():
+            if field_name in _SCHEMA_PATH_FIELDS and isinstance(spec, dict):
+                default = spec.get("default")
+                if isinstance(default, str):
+                    spec = {
+                        **spec,
+                        "default": default.replace("/", _CANONICAL_PATH_SEPARATOR),
+                    }
+            new_fields[field_name] = spec
+        normalized[tool_name] = new_fields
+    return normalized
+
+
+def _tool_schema_digest_for(schemas: dict[str, dict[str, Any]]) -> str:
+    """一组工具 schema 的**身份摘要**。
+
+    纯函数:吃 schema、吐摘要,不读全局状态 —— 便于对"跨平台同一性"直接取证。
+    """
+    canonical = json.dumps(
+        _canonicalize_schema_path_defaults(schemas),
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _tool_schema_digest() -> str:
     from app.tools import DEFAULT_TOOLS
 
     schemas = {tool.name: tool.args for tool in DEFAULT_TOOLS}
-    canonical = json.dumps(schemas, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return _tool_schema_digest_for(schemas)
 
 
 def build_metadata(
