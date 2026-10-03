@@ -69,28 +69,41 @@ class SecurityAgent:
             llm_client, tools=self._tools, max_iterations=max_iterations
         )
 
-    async def chat(self, message: str) -> str:
+    async def chat(self, message: str, *, request_id: str | None = None) -> str:
         """执行对话:控制流全部由 graph 完成,这里只做输入组装与输出提取。
 
         LLM 调用失败(LLMClientError)原样抛出,由 API 层统一转 502;
         工具异常已在 graph 的 tools 节点内按安全契约转为 ToolMessage。
+
+        request_id(Phase 9.3-D):一次 HTTP 请求的运维身份,由 API 边界生成。
+        它**不是** agent 推理状态,因此经 graph 的 `configurable` 传入,
+        不放进 AgentState。`/chat` 路径没有 thread_id(图未编译 checkpointer),
+        所以这里只带 request_id。
         """
         logger.info(
             "agent_chat_started",
+            request_id=request_id,
             user_message_length=len(message),
             max_iterations=self._max_iterations,
         )
 
-        final_state = await self._graph.ainvoke({
-            "messages": [
-                SystemMessage(content=SECURITY_ANALYST_SYSTEM_PROMPT),
-                HumanMessage(content=message),
-            ],
-            "iteration_count": 0,
-        })
+        final_state = await self._graph.ainvoke(
+            {
+                "messages": [
+                    SystemMessage(content=SECURITY_ANALYST_SYSTEM_PROMPT),
+                    HumanMessage(content=message),
+                ],
+                "iteration_count": 0,
+            },
+            {"configurable": {"request_id": request_id}},
+        )
 
         answer = self._extract_final_answer(final_state["messages"])
-        logger.info("agent_chat_completed", iterations=final_state.get("iteration_count", 0))
+        logger.info(
+            "agent_chat_completed",
+            request_id=request_id,
+            iterations=final_state.get("iteration_count", 0),
+        )
         return answer
 
     @staticmethod

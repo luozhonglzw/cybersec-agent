@@ -199,6 +199,30 @@ def _thread_id() -> str:
     return thread_id
 
 
+def _correlation_fields() -> dict[str, str]:
+    """运维日志的关联字段:request_id 与 thread_id(存在才带)。
+
+    两者语义**不同,绝不互相派生**(Phase 9.3-D 冻结决定):
+        request_id —— 一次 HTTP 请求的身份,由 API 边界生成;
+        thread_id  —— 一次图执行 / checkpoint 生命周期的身份。
+
+    request_id 属运维元数据,因此走 `configurable` 而非 AgentState
+    (后者是 agent 推理状态,不装运维信息)。
+
+    本函数只**读**运行时配置,不改任何图行为;缺失的键安静省略,
+    使 `/chat`(只有 request_id)与 HITL 路径(两者都有)共用同一份实现。
+    """
+    configurable = get_config().get("configurable") or {}
+    fields: dict[str, str] = {}
+    request_id = configurable.get("request_id")
+    if request_id:
+        fields["request_id"] = request_id
+    thread_id = configurable.get("thread_id")
+    if thread_id:
+        fields["thread_id"] = thread_id
+    return fields
+
+
 def _audit_plan_failed(hitl: HitlConfig, indicator: str, exc: BaseException) -> None:
     """写一条 plan.failed 审计。
 
@@ -218,6 +242,7 @@ def _audit_plan_failed(hitl: HitlConfig, indicator: str, exc: BaseException) -> 
     except Exception as audit_exc:
         logger.error(
             "graph_plan_failed_audit_write_failed",
+            **_correlation_fields(),
             error_type=type(audit_exc).__name__,
         )
 
@@ -260,6 +285,7 @@ def _make_plan_node(hitl: HitlConfig):
             _audit_plan_failed(hitl, indicator, exc)
             logger.error(
                 "graph_plan_failed",
+                **_correlation_fields(),
                 indicator=indicator,
                 error_type=type(exc).__name__,
             )
@@ -281,6 +307,7 @@ def _make_plan_node(hitl: HitlConfig):
         ))
         logger.info(
             "graph_plan_created",
+            **_correlation_fields(),
             risk_level=plan.risk_level,
             action_count=len(plan.actions),
         )
@@ -322,7 +349,11 @@ def _make_policy_gate_node(hitl: HitlConfig):
         ))
 
         if not decision.requires_approval:
-            logger.info("graph_policy_allowed", policy_version=decision.policy_version)
+            logger.info(
+                "graph_policy_allowed",
+                **_correlation_fields(),
+                policy_version=decision.policy_version,
+            )
             return {"policy_decision": decision}
 
         gated = set(decision.gated_actions)
@@ -351,6 +382,7 @@ def _make_policy_gate_node(hitl: HitlConfig):
         ))
         logger.info(
             "graph_approval_requested",
+            **_correlation_fields(),
             gated_actions=decision.gated_actions,
             indicator=plan.indicator,
         )
@@ -394,6 +426,7 @@ def _make_human_approval_node(hitl: HitlConfig):
         ))
         logger.info(
             "graph_approval_decided",
+            **_correlation_fields(),
             status=decision.status,
             operator=decision.operator,
         )
@@ -434,6 +467,7 @@ def create_agent_graph(
         count = state.get("iteration_count", 0) + 1
         logger.info(
             "graph_agent_node",
+            **_correlation_fields(),
             iteration_count=count,
             tool_call_count=len(response.tool_calls) if response.tool_calls else 0,
         )
@@ -470,6 +504,7 @@ def create_agent_graph(
             except Exception as exc:
                 logger.error(
                     "graph_tool_failed",
+                    **_correlation_fields(),
                     tool_name=tc["name"],
                     error_type=type(exc).__name__,
                     tool_call_id=tc["id"],
@@ -495,7 +530,11 @@ def create_agent_graph(
         if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
             return END
         if state.get("iteration_count", 0) >= max_iterations:
-            logger.info("graph_max_iterations_reached", max_iterations=max_iterations)
+            logger.info(
+                "graph_max_iterations_reached",
+                **_correlation_fields(),
+                max_iterations=max_iterations,
+            )
             return END
         return "tools"
 

@@ -17,6 +17,8 @@ core 层只声明依赖(构造函数参数),不自己去找依赖。
 """
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import time
+import uuid
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request
@@ -131,6 +133,15 @@ def _require_service(request: Request) -> TriageService:
     return service
 
 
+def _request_id_of(request: Request) -> str | None:
+    """取出本次请求的 request_id(中间件在入口写入 request.state)。
+
+    中间件缺失时(例如直接调用端点函数而非走 HTTP)安静返回 None ——
+    关联是观测性信息,绝不能成为请求成功与否的前提。
+    """
+    return getattr(request.state, "request_id", None)
+
+
 def _to_response(result: TriageResult) -> TriageResponse:
     """TriageResult → HTTP 响应模型(纯协议转换,无业务判断)。"""
     return TriageResponse(
@@ -165,10 +176,62 @@ def create_app(
     if triage_service is not None:
         app.state.triage_service = triage_service
 
+    @app.middleware("http")
+    async def correlation_middleware(request: Request, call_next):
+        """HTTP 关联边界(Phase 9.3-D)。
+
+        为**每一个**请求生成一个不透明的 request_id(uuid4().hex),写入
+        `request.state` 供端点显式取用,并发两条边界事件:
+
+            http.request.started   /   http.request.completed
+
+        安全约束(冻结):
+        - 绝不记录请求体 / query 值 / 头 / Authorization / cookie / 提示词;
+        - request_id 不从用户输入、thread_id、IP、头或时间戳派生;
+        - 不采信调用方传入的 request id(本阶段无 X-Request-ID 协议);
+        - 异常逃逸时**原样抛出**,HTTP 语义完全交给既有处理器 ——
+          这里只为它记一条带关联的终态事件,不新增状态码映射。
+        """
+        request_id = uuid.uuid4().hex
+        request.state.request_id = request_id
+        started = time.perf_counter()
+        logger.info(
+            "http.request.started",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+        )
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            logger.error(
+                "http.request.completed",
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                status_code=500,
+                duration_ms=round((time.perf_counter() - started) * 1000, 1),
+                error_type=type(exc).__name__,
+            )
+            raise
+        logger.info(
+            "http.request.completed",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+        return response
+
     @app.exception_handler(LLMClientError)
     async def llm_error_handler(request: Request, exc: LLMClientError) -> JSONResponse:
         # LLM 初始化/调用失败是上游依赖问题 → 502,不是客户端的错(4xx)
-        logger.error("chat_failed_upstream", error_type=type(exc).__name__)
+        logger.error(
+            "chat_failed_upstream",
+            request_id=_request_id_of(request),
+            error_type=type(exc).__name__,
+        )
         return JSONResponse(status_code=502, content={"detail": "LLM service unavailable"})
 
     @app.exception_handler(TriageError)
@@ -177,6 +240,7 @@ def create_app(
         status_code = _triage_status_for(exc)
         logger.warning(
             "triage_rejected",
+            request_id=_request_id_of(request),
             status_code=status_code,
             error_type=type(exc).__name__,
         )
@@ -185,7 +249,9 @@ def create_app(
     @app.post("/chat", response_model=ChatResponse)
     async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
         """对话式安全分析入口。校验交给 Pydantic,业务交给 Agent。"""
-        reply = await _require_agent(request).chat(payload.message)
+        reply = await _require_agent(request).chat(
+            payload.message, request_id=_request_id_of(request)
+        )
         return ChatResponse(response=reply)
 
     @app.post("/triage", response_model=TriageResponse)
@@ -195,7 +261,9 @@ def create_app(
         thread_id 由服务端生成(D3):请求体里没有这个字段,客户端无法指定。
         """
         result = await _require_service(request).triage(
-            payload.indicator, event_type=payload.event_type
+            payload.indicator,
+            event_type=payload.event_type,
+            request_id=_request_id_of(request),
         )
         return _to_response(result)
 
@@ -211,6 +279,7 @@ def create_app(
             status=payload.status,
             operator=payload.operator,
             reason=payload.reason,
+            request_id=_request_id_of(request),
         )
         return _to_response(result)
 

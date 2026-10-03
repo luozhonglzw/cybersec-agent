@@ -532,16 +532,25 @@ def test_checkpoint_lost_is_not_awaiting_subclass():
 # =====================================================================
 
 def test_resume_does_not_accept_interrupt_id():
-    """D7:客户端不能指定 interrupt_id(否则可伪造"审批的是哪一次暂停")。"""
+    """D7:客户端不能指定 interrupt_id(否则可伪造"审批的是哪一次暂停")。
+
+    request_id(9.3-D)是**运维关联**参数,与 interrupt_id 无关 ——
+    它由 API 边界生成,不携带任何恢复句柄语义,故不违反本护栏。
+    """
     params = set(inspect.signature(TriageService.resume).parameters)
     assert "interrupt_id" not in params
-    assert params == {"self", "thread_id", "status", "operator", "reason"}
+    assert params == {"self", "thread_id", "status", "operator", "reason", "request_id"}
 
 
 def test_triage_does_not_accept_thread_id():
-    """D3:thread_id 只能服务端生成,方法签名里没有它。"""
+    """D3:thread_id 只能服务端生成,方法签名里没有它。
+
+    request_id(9.3-D)是运维关联参数,不参与 thread_id 的生成或选择 ——
+    thread_id 仍恒为服务端 uuid4,本护栏不放松。
+    """
     params = set(inspect.signature(TriageService.triage).parameters)
-    assert params == {"self", "indicator", "event_type"}
+    assert "thread_id" not in params
+    assert params == {"self", "indicator", "event_type", "request_id"}
 
 
 def test_triage_module_does_not_import_api_layer():

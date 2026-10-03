@@ -279,7 +279,11 @@ class TriageService:
     # ---------- 发起 ----------
 
     async def triage(
-        self, indicator: str, *, event_type: str | None = None
+        self,
+        indicator: str,
+        *,
+        event_type: str | None = None,
+        request_id: str | None = None,
     ) -> TriageResult:
         """对 indicator 发起一次 HITL 判定。
 
@@ -290,14 +294,18 @@ class TriageService:
 
         thread_id 由服务端生成(D3):见模块 docstring 的 4 个框架行为。
 
+        request_id(Phase 9.3-D):本**HTTP 请求**的运维身份,由 API 边界生成,
+        与 thread_id 语义不同、绝不互相派生。它经 graph 的 `configurable`
+        下发,不放进 AgentState(运维元数据不是 agent 推理状态)。
+
         入口先做惰性超时清理(见 reap_expired)。清理失败在这里**不吞** ——
         它是真实故障,应当响亮失败;唯一放宽的路径是下面那个"已在处理
         主失败"的 except 分支。
         """
-        await self.reap_expired()
+        await self.reap_expired(request_id=request_id)
 
         thread_id = uuid.uuid4().hex
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": thread_id, "request_id": request_id}}
 
         try:
             state = await self._graph.ainvoke(
@@ -314,6 +322,7 @@ class TriageService:
             # 细节在 __cause__ 里,且已由 graph 层写进 plan.failed 审计与 error 日志。
             logger.error(
                 "triage_plan_failed",
+                request_id=request_id,
                 thread_id=thread_id,
                 indicator=indicator,
             )
@@ -330,6 +339,7 @@ class TriageService:
             except Exception as cleanup_exc:
                 logger.warning(
                     "triage_cleanup_failed",
+                    request_id=request_id,
                     thread_id=thread_id,
                     error_type=type(cleanup_exc).__name__,
                 )
@@ -339,13 +349,21 @@ class TriageService:
         request = state.get("approval_request")
         answer = _extract_answer(state.get("messages") or [])
 
-        # 沉淀:无论是否需要审批,只要产出了计划就落一条 incident
-        self._persist_incident(plan, request)
+        # 沉淀:无论是否需要审批,只要产出了计划就落一条 incident。
+        # incident_id 只用于**日志关联** —— 绝不回填进 AgentState / 审计行
+        # (D4:incident 在图跑完之后才创建),沉淀语义完全不变。
+        incident_id = self._persist_incident(plan, request)
 
         if request is not None:
+            # interrupt_id 此刻已可从返回体取到(与 aget_state().tasks[*].interrupts[*].id
+            # 同值),它是恢复句柄、只在本次暂停期有效 —— 只用于日志关联。
+            interrupt_id = _interrupt_id_of(state)
             logger.info(
                 "triage_pending_approval",
+                request_id=request_id,
                 thread_id=thread_id,
+                interrupt_id=interrupt_id,
+                incident_id=incident_id,
                 indicator=indicator,
                 risk_level=plan.risk_level if plan is not None else None,
             )
@@ -357,12 +375,14 @@ class TriageService:
                     plan=plan,
                     approval_request=request,
                 ),
-                interrupt_id=_interrupt_id_of(state),
+                interrupt_id=interrupt_id,
             )
 
         logger.info(
             "triage_completed",
+            request_id=request_id,
             thread_id=thread_id,
+            incident_id=incident_id,
             indicator=indicator,
             has_plan=plan is not None,
         )
@@ -384,17 +404,22 @@ class TriageService:
         status: ApprovalStatus,
         operator: str,
         reason: str | None = None,
+        request_id: str | None = None,
     ) -> TriageResult:
         """对暂停中的判定给出人工决定,并把图跑完。
 
         interrupt_id **由服务端恢复**,不接受客户端传入(D7):
         客户端能指定 interrupt_id 就等于能伪造"审批的是哪一次暂停"。
 
+        request_id(Phase 9.3-D):**本次** /resume HTTP 请求的运维身份。
+        它与发起暂停那次 /triage 的 request_id **必然不同**(两次独立请求),
+        而 thread_id 保持不变 —— 这正是把两者分开的理由(见 §8 冻结决定)。
+
         这里不捕获 PlanFailedError:plan 节点是**已完成节点**,
         resume 不会重放它(实测确认:resume 后 plan.created 仍只有一条),
         因此采集证据的 I/O 不会再次发生。
         """
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": thread_id, "request_id": request_id}}
         interrupt_id = await self._validate_resumable(thread_id, config)
 
         state = await self._graph.ainvoke(
@@ -410,7 +435,9 @@ class TriageService:
         decision = state.get("approval_decision")
         logger.info(
             "triage_resumed",
+            request_id=request_id,
             thread_id=thread_id,
+            interrupt_id=interrupt_id,
             status=status,
             operator=operator,
         )
@@ -454,11 +481,12 @@ class TriageService:
         (它从没完成,是失败了),必须分开说。
         """
         snapshot = await self._graph.aget_state(config)
+        request_id = (config.get("configurable") or {}).get("request_id")
 
         if snapshot.next == (HUMAN_APPROVAL_NODE,):
             # 超时检查必须在取 interrupt_id **之前**:否则已过期的 thread
             # 会先拿到恢复句柄,之后才被判超时。
-            await self._reject_if_expired(thread_id)
+            await self._reject_if_expired(thread_id, request_id)
             tasks = snapshot.tasks
             interrupts = tasks[0].interrupts if tasks else ()
             if not interrupts:
@@ -477,7 +505,7 @@ class TriageService:
         # ---- next == ():图没在跑。区分"跑完了" / "丢了" / "根本不存在" ----
         # 先无条件判超时:已落过 approval.timeout 的 thread 永久作废,
         # 与 checkpoint 是否还在无关(清理可能失败,但结论不能因此松动)。
-        await self._reject_if_expired(thread_id)
+        await self._reject_if_expired(thread_id, request_id)
         if self._store.pending_action_rows(thread_id=thread_id):
             raise CheckpointLostError(
                 "审计显示仍有未决审批,但 checkpoint 已丢失(服务重启);"
@@ -497,7 +525,7 @@ class TriageService:
 
     # ---------- 内部:超时(惰性) ----------
 
-    async def reap_expired(self) -> list[str]:
+    async def reap_expired(self, *, request_id: str | None = None) -> list[str]:
         """把已过期的待审批 thread 收成终态,返回本次收掉的 thread_id。
 
         惰性 = **只在请求到达时执行**,没有后台调度器(9.1-A 约束)。
@@ -539,10 +567,14 @@ class TriageService:
             reaped.append(thread_id)
 
         if reaped:
-            logger.info("triage_expired_reaped", count=len(reaped))
+            logger.info(
+                "triage_expired_reaped", request_id=request_id, count=len(reaped)
+            )
         return reaped
 
-    async def _reject_if_expired(self, thread_id: str) -> None:
+    async def _reject_if_expired(
+        self, thread_id: str, request_id: str | None = None
+    ) -> None:
         """该 thread 已过审批窗口 → 收成 timed_out 终态并拒绝恢复。
 
         未过期(或根本没有 pending 行)时**什么都不做** —— 这个方法是
@@ -561,7 +593,9 @@ class TriageService:
         if anchor is None:
             return
         await self._reap_one(thread_id, utc_now() - anchor)
-        logger.warning("triage_resume_expired", thread_id=thread_id)
+        logger.warning(
+            "triage_resume_expired", request_id=request_id, thread_id=thread_id
+        )
         raise ApprovalExpiredError(_EXPIRED_MESSAGE)
 
     def _expired_anchor(self, thread_id: str) -> datetime | None:
