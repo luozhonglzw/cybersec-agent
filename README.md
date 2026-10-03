@@ -81,7 +81,7 @@ Two compiled graphs exist in one process: a plain ReAct graph for `/chat`, and a
 - **Append-only audit trail** — three SQLite tables, six anti-mutation triggers, a closed six-event vocabulary that includes failure events, and approval state derived from the audit stream rather than stored as a mutable column.
 - **Offline evaluation harness** — three baselines, five separately reported metric classes, an independent evidence oracle, metamorphic relations, and no composite score.
 - **Real-provider evaluation harness** — a budget governor, a network-egress guard built on interpreter audit hooks, per-cell raw-record persistence with fsync, and frozen failure taxonomy.
-- **Fully offline test suite** — 1,323 tests that require no network access and no API key.
+- **Fully offline test suite** — 1,335 tests that require no network access and no API key.
 
 ## Security Design
 
@@ -157,7 +157,7 @@ Run the test suite — it needs no API key and makes no network calls:
 uv run pytest -q
 ```
 
-CI runs this same offline suite on GitHub-hosted Ubuntu: the workflow installs the locked `uv` environment and runs the offline pytest suite, and the latest accepted run passed 1,323 tests.
+CI runs this same offline suite on GitHub-hosted Ubuntu: the workflow installs the locked `uv` environment and runs the offline pytest suite, and the latest accepted run passed 1,335 tests.
 
 ## Project Structure
 
@@ -172,7 +172,7 @@ app/
 data/           generated seed data and the runtime audit database (not committed)
 docs/           architecture design notes
 scripts/        deterministic seed-data generators
-tests/          1,323 offline tests
+tests/          1,335 offline tests
 ```
 
 ## Roadmap
@@ -190,6 +190,6 @@ tests/          1,323 offline tests
 | Real-provider evaluation pilot | Implemented |
 | CI | Implemented |
 | MCP interoperability | Planned |
-| Structured application logging | Planned |
+| Structured application logging | Implemented |
 | Audit read / query API | Planned |
 | Containerized deployment | Planned |
