@@ -129,7 +129,7 @@ LLM 只能产生：
 └─────────────────────────────────────────────┘
 ```
 
-> 注：上图与 §7 目录描述的是**终态蓝图**。截至 2026-09-19 的实际实现：编排层为单文件 `app/core/graph.py`（未创建 `app/graph/` 包）；`app/security/` 已创建（policy / audit / store）；`app/rag/`、`app/knowledge/`、`app/evaluation/`、`mcp_server/`、`docker/` 尚未创建。
+> 注：上图与 §7 目录描述的是**终态蓝图**。截至 2026-09-19 的实际实现：编排层为单文件 `app/core/graph.py`（未创建 `app/graph/` 包）；`app/security/` 已创建（policy / audit / store）；`app/rag/`、`app/knowledge/`、`app/evaluation/`、`docker/` 尚未创建。MCP 接口已于 Phase 9.3-E 落地为 `app/mcp/`（见 §8 Flow C）。
 >
 > **路由命名的实现偏离**：蓝图写 `/chat /approve /audit`，实际实现为 `/chat /triage /resume`。审批不是独立端点——审批决定（`status` + `operator`）是 `/resume` 的请求载荷，与恢复句柄 `thread_id` 一起构成一次完整的恢复请求，拆成两个端点会引入"审批了但没恢复"的中间态。审计目前**没有读接口**（`/audit` 未实现），审计写入走 `app/security/store.py`。
 
@@ -146,7 +146,7 @@ LLM 只能产生：
 
 ## 6. 技术栈
 
-> **Current（2026-09-17）**：已装依赖以 `pyproject.toml` / `uv.lock` 为准。下表"引入 Phase"记录该依赖首次加入的**里程碑**，"当前状态"记录它**此刻是否真的装上了**——两者不是一回事。关键事实：**ChromaDB（Phase 5）与 mcp（Phase 6）都还没引入**，对应能力已顺延（见 §14 偏离说明）；`respx` 从未加入依赖，测试改用显式 Fake（`FakeLLMClient` / `FakeChatModel`）而非 mock HTTP 层。
+> **Current（2026-09-17）**：已装依赖以 `pyproject.toml` / `uv.lock` 为准。下表"引入 Phase"记录该依赖首次加入的**里程碑**，"当前状态"记录它**此刻是否真的装上了**——两者不是一回事。关键事实：**ChromaDB（Phase 5）仍未引入**（RAG 顺延，见 §14 偏离说明）；**mcp 已引入**（`mcp>=2.3.0`，Phase 9.3-E 落地为 `app/mcp/`，见 §8 Flow C）；`respx` 从未加入依赖，测试改用显式 Fake（`FakeLLMClient` / `FakeChatModel`）而非 mock HTTP 层。
 
 ### 代码依赖
 
@@ -165,7 +165,7 @@ LLM 只能产生：
 | respx | Mock LLM 的 HTTP 调用 | 1 | **未引入**（测试用显式 Fake 替身，不需要 mock HTTP 层） |
 | LangGraph | Agent 编排（State/Node/Edge/Checkpoint/Interrupt） | 4 | 已装（1.0.1） |
 | ChromaDB | 向量库（RAG） | 5 | **未引入**（Phase 5 只交付 IOC Exact Match） |
-| mcp（FastMCP） | MCP Server | 6 | **未引入**（Phase 6 顺延） |
+| mcp | MCP Server | 6 | 已装（2.3.0；该版本 `FastMCP` 已更名为 `MCPServer`）。Phase 9.3-E 落地为 `app/mcp/` |
 | OpenTelemetry | Trace | 9 | 未引入 |
 | Langfuse | 可观测平台 | 9 | 未引入 |
 | Docker / PostgreSQL / Redis | 工程化 | 10（可选，按需引入） | 未引入 |
@@ -200,10 +200,10 @@ cybersec-agent/
 │   ├── rag/                     # Phase 5：embedding、retriever、vector store
 │   ├── knowledge/               # Phase 5：知识库加载器（data → SQLite + ChromaDB）
 │   ├── api/                     # Phase 1：FastAPI 路由
+│   ├── mcp/                     # Phase 6 / 9.3-E：只读 MCP 适配器 + 本地 stdio 入口
 │   └── evaluation/              # Phase 9
 │
 ├── data/                        # 模拟日志、知识库 JSON；SQLite/Chroma 持久化文件（gitignore）
-├── mcp_server/                  # Phase 6：MCP Server 入口（复用 app.tools + app.security）
 ├── scripts/                     # seed 数据生成、demo、evaluation 运行
 ├── tests/
 ├── docs/
@@ -221,7 +221,7 @@ cybersec-agent/
 
 - **目录随 Phase 创建**。Phase 0 只创建实际需要的文件（.gitignore / .env.example / README.md / docs/architecture.md），不创建空目录。
 - **data/ 的 Git 策略**：git 只存生成脚本（scripts/seed_*.py），不存生成物；换台机器 `python scripts/seed.py` 一键复原。
-- mcp_server/ 放顶层：MCP Server 是独立进程入口，生命周期与 API 服务不同。
+- MCP 入口放 **`app/mcp/`**，不设顶层 `mcp_server/`：它复用 `app.tools` 的核心只读函数与 `app.schemas` 模型，放进 `app/` 包内才能沿用同一条导入边界与测试约定；进程入口仍由 `python -m app.mcp.server` 提供，独立于 API 服务。
 - schemas/ 独立成包：Pydantic 模型被 tools、graph、api、knowledge 同时引用，单独放置避免循环 import。
 
 ### 7.1 当前实际结构（2026-09-19）
@@ -235,10 +235,11 @@ cybersec-agent/
 │   ├── schemas/    # log_event / threat_intel / risk / response / approval / audit
 │   ├── tools/      # query_logs / query_threat_intel / risk_analyzer / response_planner
 │   ├── security/   # policy / audit / store（Phase 8）
+│   ├── mcp/        # Phase 9.3-E：只读 MCP 适配器（tools.py）+ 本地 stdio 入口（server.py）
 │   └── api/        # main（/chat /triage /resume）+ schemas
 ├── data/           # security_events.jsonl / threat_intel.jsonl（**仅 JSONL**）
 ├── scripts/        # seed_logs.py / seed_threat_intel.py
-├── tests/          # test_api / test_core / test_schemas / test_security / test_tools
+├── tests/          # test_api / test_core / test_schemas / test_security / test_tools / test_mcp
 ├── docs/           # **仅 architecture.md**
 ├── pyproject.toml
 ├── uv.lock
@@ -246,7 +247,7 @@ cybersec-agent/
 └── .gitignore
 ```
 
-**尚未创建**：`app/graph/`（编排层实现为 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`app/evaluation/`、`mcp_server/`、`docker/`、`docs/learning/`、`docs/interview/`。
+**尚未创建**：`app/graph/`（编排层实现为 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`app/evaluation/`、`docker/`、`docs/learning/`、`docs/interview/`。（MCP **不再**属于"尚未创建"：Phase 9.3-E 把它落在 `app/mcp/`，见 §8 Flow C。）
 
 **data/ 的实际内容**：只有两个 seed 生成的 JSONL 文件，**没有** SQLite 或 Chroma 持久化文件。`audit.db` 由 `SqliteAuditStore` 在运行时按需创建（测试全部注入 `tmp_path`，仓库里不产生该文件）；checkpoint 走 `InMemorySaver`，**不落盘**。
 
@@ -280,17 +281,31 @@ data/knowledge/*.json（ATT&CK 子集、CVE 样例、IOC、威胁报告）
   → 分块（chunk）→ embedding → ChromaDB（语义检索，metadata 保留来源）
 ```
 
-### Flow C — MCP 工具调用（Phase 6）
+### Flow C — MCP 只读接口（Phase 9.3-E 落地）
 
 ```
 外部 MCP Client（Claude Desktop / MCP Inspector / 我们自己的 Agent）
-  → 我们写的 MCP Server（FastMCP）
-  → 复用 app/tools 的工具实现
-  → 复用 app/security 的同一套策略与审计   ← 关键：安全层只有一个入口
-  → 返回结果
+  → 本地 stdio MCP Server（python -m app.mcp.server，app/mcp/server.py）
+  → 只读适配器（app/mcp/tools.py：公开签名里没有任何路径形参）
+  → 复用 app/tools 的核心只读函数（不经 LLM、不经 provider）
+      ├─ query_security_logs   安全日志查询
+      ├─ query_threat_intel    威胁情报 Exact Match 查询
+      └─ analyze_risk          确定性风险分析
+  → 返回结构化结果
 ```
 
-Flow C 的存在意义：Function Calling 是**进程内、厂商私有**的工具调用协议；MCP 是**跨进程、跨客户端**的标准协议。使用 MCP 的真实需求是"让第三方客户端也能安全地复用我们的安全工具"，而不是为简历硬加。
+没有 `plan_response` 分支、没有 provider/model 分支、没有写入/动作分支。
+
+Flow C 的存在意义：Function Calling 是**进程内、厂商私有**的工具调用协议；MCP 是**跨进程、跨客户端**的标准协议。MCP 在本项目里的定位是**既有能力的另一种只读接口**：它不替代 LangGraph agent 路径，不替代 policy/HITL，不暴露响应规划，也不引入新的权威策略层或审计层——策略与审计仍然只有 `app/security/` 一个入口。
+
+**MCP 信任边界**：
+
+- **不可信**：MCP client 传入的调用参数（`tools/call` 的 `arguments`）。协议层守卫把 SDK 对未声明参数的"静默忽略"升级为**显式拒绝**。
+- **服务端控制**：本地数据位置。客户端可见的 schema 里**没有** `data_path` / `logs_path` / `intel_path`；服务端在委派给既有只读函数之前绑定仓库受控的数据位置。
+- **既有领域逻辑**：只读查询与风险分析函数（纯函数，不写盘）。
+- **不在 MCP 暴露面内**：响应规划、审批变更、策略变更、checkpoint 变更、审计变更、provider/model 调用。
+
+传输面只有**本地 stdio**：不实现 HTTP / SSE / Streamable HTTP 端点，也不做 MCP 鉴权服务器——身份由拉起该进程的宿主承担。
 
 ## 9. LangGraph Workflow 设计
 
@@ -474,7 +489,7 @@ AuditEvent = Literal[
 |---|---|---|
 | 0-4 | 骨架 / API / 日志 / 工具+ReAct / LangGraph | **已完成** |
 | 5 | 威胁情报 + RAG | **部分完成**：IOC 库与 Exact Match 查询已交付；RAG（CVE / ATT&CK 向量检索）**未实现**，顺延 |
-| 6 | MCP Server | **未按蓝图执行**：该 Phase 实际交付的是 Rule-based Risk Analyzer（提前实现，见 §14）；**MCP Server 整体顺延** |
+| 6 | MCP Server | **未按蓝图在 Phase 6 执行**：该 Phase 实际交付的是 Rule-based Risk Analyzer（提前实现，见 §14），MCP Server 顺延；**已于 Phase 9.3-E 落地为 `app/mcp/`**（只读暴露，见 §8 Flow C） |
 | 7 | 风险分析 + 响应规划 | **已完成**（规则引擎侧）：`RiskAssessment` + `ResponsePlan` 纯函数规则引擎 |
 | 8 | 安全层 + HITL | **已完成（8.1-8.5）**：策略引擎 / 审批流 / append-only 审计 / SQLite 持久化 / triage 服务与 API |
 | 9 | 可观测 + 评估 | **部分启动**：9.1-A 交付可靠性侧（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 依赖护栏对齐），**不属于**蓝图的可观测/评估内容 —— 蓝图的 Trace / 指标 / LLM-as-Judge 仍未启动 |
@@ -677,7 +692,7 @@ OpenAI-compatible LLM
 - LangGraph 实际形态比 §9.1 蓝图更小：蓝图是 7 节点（含 `analyze_request` / `tool_router` / `tool_execute` / `risk_analyze` / `response_plan` / `execute_or_reject`），实际是 5 节点（`agent ⇄ tools` + `plan → policy_gate → human_approval`）。工具路由用 `tool_map` 泛型路由替代 `tool_router` 节点，风险分析与计划生成合并在 `plan` 节点内（规则引擎是纯函数，不需要单独节点）。`AgentState` 为 8 字段而非 §10.1 蓝图的 7 字段（差异原因见 §10.2）。蓝图描述终态，实现按最小必要演进。
 - **Response Planner 采用 Tool 而非 Node（Phase 7）→ 节点化在 Phase 8 落地**：§9.1 蓝图把它画成 `response_plan` 节点，Phase 7 先实现为第 4 个工具（Node 需要从 messages 反解 `RiskAssessment` 或在 tools 节点特判风险工具，两者都会侵蚀 graph 的通用性）。Phase 8.3 按计划把 `plan_response()` 提升为 `plan` 节点 —— **直接复用同一个纯函数，零返工**，验证了当初"等 HITL 一起做"的判断。
 - **incident 持久化延后（Phase 7 → Phase 8）**：见 §11.5。Phase 7 不引入数据库，`ResponsePlan` 仅作为结构化输出契约存在，随 ToolMessage 流转；落库与 HITL / checkpoint / audit lifecycle 一起在 Phase 8 实现（已完成）。
-- **MCP Server 与 RAG 顺延（Phase 5 / 6）**：§12 把 Phase 5 定为"威胁情报 + RAG"、Phase 6 定为"MCP Server"，实际 Phase 5 只交付 IOC Exact Match（理由见上一条），Phase 6 则交付了提前实现的 Rule-based Risk Analyzer。结果是 **RAG 与 MCP Server 两项能力整体顺延**，`ChromaDB` 与 `mcp` 依赖至今未引入。这不是"砍掉"，是排序调整：先做能用规则确定性验证的部分（风险分级 / 响应规划 / HITL 安全层），把依赖外部组件的能力留到后面。
+- **MCP Server 与 RAG 顺延（Phase 5 / 6）**：§12 把 Phase 5 定为"威胁情报 + RAG"、Phase 6 定为"MCP Server"，实际 Phase 5 只交付 IOC Exact Match（理由见上一条），Phase 6 则交付了提前实现的 Rule-based Risk Analyzer。结果是 **RAG 与 MCP Server 两项能力整体顺延**，`ChromaDB` 至今未引入。这不是"砍掉"，是排序调整：先做能用规则确定性验证的部分（风险分级 / 响应规划 / HITL 安全层），把依赖外部组件的能力留到后面。（后续进展：**MCP Server 已于 Phase 9.3-E 以只读形态落地为 `app/mcp/`**，`mcp` 依赖引入 2.3.0；RAG 仍顺延。）
 - **`/approve` 未实现，审批并入 `/resume`**：见 §5 注。审计也**没有读接口** —— `/audit` 未实现，审计写入走 store，读取目前只在测试里通过 `list_audit()` 进行。
 
 ## 当前架构快照（2026-09-19）
@@ -733,7 +748,6 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 ## 尚未实现（按 §12 Roadmap）
 
 - RAG / 知识库（CVE、ATT&CK）——Phase 5 剩余部分，检索对象是自然语言文档，与 IOC Exact Match 不冲突（ChromaDB 未引入）
-- MCP Server——原 Phase 6，整体顺延（`mcp` 未引入）
 - LLM 风险复核层——Phase 8 只做了规则侧；LLM 复核未实现
 - 超时的**主动**触发——9.1-A 只做惰性判定（挂在请求入口），没有后台调度器；长时间无请求时过期 pending 不会被及时收掉
 - 超时的**观测面**——`TriageOutcome.status` 不新增 `timed_out`，也没有"查询 thread 状态"的端点，所以超时在 API 响应里只以 409 的形式出现，终态事实只能从 `audit_logs` 读

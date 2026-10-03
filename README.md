@@ -68,6 +68,28 @@ This is a research and engineering prototype. It is not production-ready and not
 
 Two compiled graphs exist in one process: a plain ReAct graph for `/chat`, and a graph with the human-in-the-loop safety layer for `/triage` and `/resume`. They share one model client and one audit store.
 
+## MCP Interface (read-only)
+
+The same tool functions are also published over MCP (Model Context Protocol) as an **alternate read-only interface** for external clients. It does not replace the LangGraph agent path, the policy gate, or HITL.
+
+```bash
+python -m app.mcp.server        # local stdio server
+```
+
+Transport is **local stdio only**. No HTTP, SSE, or Streamable HTTP endpoint is implemented, and there is no MCP authentication server — the host process that spawns the server owns the identity boundary.
+
+Three read-only tools are published:
+
+| MCP tool | Behavior |
+| --- | --- |
+| `query_security_logs` | structured event query over the seed log file |
+| `query_threat_intel` | exact-match IOC lookup (IP / domain / SHA256) |
+| `analyze_risk` | rule-based risk scoring over already-collected evidence |
+
+`plan_response` is **not** exposed through MCP: response planning remains behind the existing policy/HITL path and is not published as an MCP capability. MCP does not create a second authorization system.
+
+Client-visible MCP schemas do not expose `data_path`, `logs_path`, or `intel_path`; the server binds repository-controlled data locations before delegating to the existing read-only domain functions. This is a property of the published interface as tested, not a general claim about filesystem access.
+
 ## Key Features
 
 - **LangGraph orchestration** — a five-node state graph (`agent`, `tools`, `plan`, `policy_gate`, `human_approval`) with a conditional ReAct loop and a business-level iteration cap separate from the framework's recursion limit.
@@ -81,7 +103,8 @@ Two compiled graphs exist in one process: a plain ReAct graph for `/chat`, and a
 - **Append-only audit trail** — three SQLite tables, six anti-mutation triggers, a closed six-event vocabulary that includes failure events, and approval state derived from the audit stream rather than stored as a mutable column.
 - **Offline evaluation harness** — three baselines, five separately reported metric classes, an independent evidence oracle, metamorphic relations, and no composite score.
 - **Real-provider evaluation harness** — a budget governor, a network-egress guard built on interpreter audit hooks, per-cell raw-record persistence with fsync, and frozen failure taxonomy.
-- **Fully offline test suite** — 1,335 tests that require no network access and no API key.
+- **Read-only MCP interface** — three read-only tools (security-log query, threat-intel lookup, deterministic risk analysis) published over a local stdio MCP server, reusing the existing tool functions as an alternate read-only surface. Response planning is not published, and no remote transport or authentication server is implemented.
+- **Fully offline test suite** — 1,397 tests that require no network access and no API key.
 
 ## Security Design
 
@@ -157,7 +180,7 @@ Run the test suite — it needs no API key and makes no network calls:
 uv run pytest -q
 ```
 
-CI runs this same offline suite on GitHub-hosted Ubuntu: the workflow installs the locked `uv` environment and runs the offline pytest suite, and the latest accepted run passed 1,335 tests.
+CI runs this same offline suite on GitHub-hosted Ubuntu: the workflow installs the locked `uv` environment and runs the offline pytest suite, and the latest accepted run passed 1,397 tests.
 
 ## Project Structure
 
@@ -169,10 +192,11 @@ app/
   security/     policy engine, audit-record construction, append-only SQLite store
   tools/        security tools (pure core functions + LangChain wrappers)
   evaluation/   offline architecture harness and real-provider evaluation harness
+  mcp/          read-only MCP adapters and the local stdio server
 data/           generated seed data and the runtime audit database (not committed)
 docs/           architecture design notes
 scripts/        deterministic seed-data generators
-tests/          1,335 offline tests
+tests/          1,397 offline tests
 ```
 
 ## Roadmap
@@ -189,7 +213,7 @@ tests/          1,335 offline tests
 | Offline agent evaluation harness | Implemented |
 | Real-provider evaluation pilot | Implemented |
 | CI | Implemented |
-| MCP interoperability | Planned |
+| MCP interoperability | Implemented |
 | Structured application logging | Implemented |
 | Audit read / query API | Planned |
 | Containerized deployment | Planned |
