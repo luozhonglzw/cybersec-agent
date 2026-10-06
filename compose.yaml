@@ -1,0 +1,25 @@
+# CyberSec Agent - minimal local Compose topology (Phase 9.3-G)
+#
+# Exactly one service and one named volume:
+#   - api          : the HTTP/FastAPI container
+#   - audit-data   : mutable SQLite audit state, mounted at /data
+#
+# The baked synthetic demo data lives at /app/data (inside the image) and is
+# deliberately NOT on the volume, so it is never shadowed by the mount.
+# MCP stays local stdio (`python -m app.mcp.server`) and is not a service here.
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AUDIT_DB_PATH: /data/audit.db
+    volumes:
+      - audit-data:/data
+
+volumes:
+  audit-data:

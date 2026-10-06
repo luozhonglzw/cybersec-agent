@@ -1,0 +1,38 @@
+# VCS / CI
+.git
+.gitignore
+.github
+
+# Local environments and caches
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Tests and docs are not needed at runtime
+tests
+docs
+
+# Process/agent artifacts - must never enter the image
+.tmp-d2b-run*
+.workbuddy-ai
+
+# Local secrets and state
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+logs
+*.log
+
+# Host-generated demo data - the Dockerfile regenerates deterministic copies
+data
+
+# Editor / OS metadata
+.DS_Store
+.idea
+.vscode
