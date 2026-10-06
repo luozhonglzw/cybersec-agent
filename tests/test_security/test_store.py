@@ -485,6 +485,138 @@ def test_list_audit_filters(store: SqliteAuditStore):
     assert store.list_audit(event="approval.timeout") == []
 
 
+# ---------- list_audit 的 limit / descending 扩展(Phase 9.3-F)----------
+#
+# 向后兼容是硬约束:不传新参数时行为必须与历史版本**逐字一致**
+# (ORDER BY ts, rowid,无 LIMIT)。下面的用例把"默认不变"与"新能力"
+# 分开锁定;SQL 层 LIMIT / 固定方向由白盒用例证明。
+
+_TS_SEQ = tuple(
+    datetime(2026, 9, 17, 10, 0, i, tzinfo=timezone.utc) for i in range(6)
+)
+
+
+def _seed_audit(store: SqliteAuditStore, count: int) -> None:
+    """按 ts 递增写入 count 条 plan.created;reason 携带序号,便于断言顺序。"""
+    for i in range(count):
+        store.append_audit(build_audit_record(
+            "plan.created", ts=_TS_SEQ[i], reason=f"r{i:03d}",
+        ))
+
+
+class _RecordingConnection:
+    """把真实连接包一层,记录执行过的 SQL —— 用于证明 LIMIT 进了 SQL 本身。
+
+    每次 `_connect()` 返回一个**新的**包装(真实连接每次新开、用完即关,
+    与 store 的连接策略一致),但共享同一个 statements 列表。
+    """
+
+    def __init__(self, conn: sqlite3.Connection, statements: list[str]) -> None:
+        self._conn = conn
+        self._statements = statements
+
+    def execute(self, sql: str, params=()):
+        self._statements.append(sql)
+        return self._conn.execute(sql, params)
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def _recording_connect(store: SqliteAuditStore):
+    """返回 (statements, fake_connect);fake_connect 记录所有执行过的 SQL。
+
+    `real_connect` 在 monkeypatch **之前**取好 —— 否则 fake 会递归调用自己。
+    """
+    real_connect = store._connect
+    statements: list[str] = []
+
+    def fake_connect() -> _RecordingConnection:
+        return _RecordingConnection(real_connect(), statements)
+
+    return statements, fake_connect
+
+
+def test_list_audit_default_behavior_unchanged(store: SqliteAuditStore):
+    """不传新参数时,顺序与结果集与历史版本完全一致(升序、无 LIMIT)。"""
+    _seed_audit(store, 5)
+    assert [r.reason for r in store.list_audit()] == [
+        "r000", "r001", "r002", "r003", "r004",
+    ]
+    # 显式 descending=False / limit=None 必须与默认完全等价。
+    assert store.list_audit(descending=False, limit=None) == store.list_audit()
+
+
+def test_list_audit_limit_bounds_result(store: SqliteAuditStore):
+    _seed_audit(store, 5)
+    assert [r.reason for r in store.list_audit(limit=2)] == ["r000", "r001"]
+    assert len(store.list_audit(limit=None)) == 5
+
+
+def test_list_audit_descending_reverses_order(store: SqliteAuditStore):
+    _seed_audit(store, 5)
+    assert [r.reason for r in store.list_audit(descending=True)] == [
+        "r004", "r003", "r002", "r001", "r000",
+    ]
+
+
+def test_list_audit_descending_deterministic_on_tied_ts(store: SqliteAuditStore):
+    """同一 ts 的并列行由 rowid 决定次序:升序取先写入者,降序取后写入者。"""
+    for i in range(3):
+        store.append_audit(build_audit_record("plan.created", ts=TS, reason=f"t{i}"))
+    assert [r.reason for r in store.list_audit()] == ["t0", "t1", "t2"]
+    assert [r.reason for r in store.list_audit(descending=True)] == [
+        "t2", "t1", "t0",
+    ]
+
+
+def test_list_audit_descending_with_limit(store: SqliteAuditStore):
+    _seed_audit(store, 5)
+    assert [r.reason for r in store.list_audit(descending=True, limit=2)] == [
+        "r004", "r003",
+    ]
+
+
+def test_list_audit_filters_combine_with_limit_and_descending(
+    store: SqliteAuditStore,
+):
+    _seed_audit(store, 4)
+    store.append_audit(build_audit_record(
+        "approval.decided", ts=_TS_SEQ[4], reason="other",
+    ))
+    result = store.list_audit(event="plan.created", descending=True, limit=2)
+    assert [r.reason for r in result] == ["r003", "r002"]
+
+
+def test_list_audit_limit_is_applied_at_sql_level(
+    store: SqliteAuditStore, monkeypatch,
+):
+    """LIMIT 必须进 SQL,而不是拉全表后在 Python 里切片。"""
+    _seed_audit(store, 5)
+    statements, fake_connect = _recording_connect(store)
+    monkeypatch.setattr(store, "_connect", fake_connect)
+
+    store.list_audit(limit=2)
+
+    assert any("LIMIT" in sql for sql in statements), statements
+
+
+def test_list_audit_order_direction_is_fixed_sql(
+    store: SqliteAuditStore, monkeypatch,
+):
+    """两个方向的 ORDER BY 都是固定字面量(不接受调用方传入的排序片段)。"""
+    _seed_audit(store, 3)
+    statements, fake_connect = _recording_connect(store)
+    monkeypatch.setattr(store, "_connect", fake_connect)
+
+    store.list_audit()
+    store.list_audit(descending=True)
+
+    joined = " | ".join(statements)
+    assert "ORDER BY ts, rowid" in joined
+    assert "ORDER BY ts DESC, rowid DESC" in joined
+
+
 # ---------- append-only 保障 1:PRIMARY KEY 响亮失败 ----------
 
 def test_duplicate_incident_pk_rejected(store: SqliteAuditStore):

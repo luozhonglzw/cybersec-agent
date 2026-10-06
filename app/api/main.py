@@ -17,11 +17,13 @@ core 层只声明依赖(构造函数参数),不自己去找依赖。
 """
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import sqlite3
 import time
+from typing import Literal
 import uuid
 
 import structlog
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -44,9 +46,21 @@ from app.core.triage import (
     TriageService,
     UnknownThreadError,
 )
+from app.schemas.audit import AuditEvent, AuditRecord
 from app.security.store import SqliteAuditStore
 
 logger = structlog.get_logger(__name__)
+
+
+class AuditStoreUnavailableError(Exception):
+    """审计读边界的数据源失败(Phase 9.3-F)。
+
+    刻意是**本模块私有**的窄类型:只有 GET /audit/events 的读路径会抛出它,
+    因此对应的异常处理器不会改变 /chat、/triage、/resume 的既有语义。
+    这样做而不是注册一个全局 `sqlite3.Error` 处理器,是为了把异常处理
+    严格限定在审计读边界内 —— 全局处理器会把**写路径**上的 sqlite 故障
+    也一并改写成 503,那是本次未获授权的行为变更。
+    """
 
 
 @asynccontextmanager
@@ -66,6 +80,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # audit_db_path 来自 Settings(D5);logs_path / intel_path 不注入,
     # 由工具层默认值提供(HitlConfig 的 None 语义)。
     store = SqliteAuditStore(settings.audit_db_path)
+    # 同一实例既供写入路径(HITL 图 + TriageService),也供只读审计端点
+    # (GET /audit/events)。端点只调用 list_audit,不会产生新的写入点。
+    app.state.audit_store = store
 
     # 一个 LLMClient 给两条链路共用:bind_tools 每次返回新的 runnable,
     # 不存在互相污染;少建一个 ChatOpenAI 实例。
@@ -142,6 +159,22 @@ def _request_id_of(request: Request) -> str | None:
     return getattr(request.state, "request_id", None)
 
 
+def _require_store(request: Request) -> SqliteAuditStore:
+    """取出进程级 SqliteAuditStore(与 _require_agent / _require_service 同构)。
+
+    缺失时给明确的 503,而不是让 AttributeError 变成带 traceback 的 500:
+    后者既难排查,又会把内部结构泄露给客户端。这个分支只在"注入了 agent /
+    triage_service 但没注入 audit_store"时出现(测试场景)。
+
+    detail 与读失败共用同一固定文案:审计库不可用是一个部署事实,
+    不应因"没装配"与"读不动"而给客户端两套不同的内部信号。
+    """
+    store = getattr(request.app.state, "audit_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="audit store unavailable")
+    return store
+
+
 def _to_response(result: TriageResult) -> TriageResponse:
     """TriageResult → HTTP 响应模型(纯协议转换,无业务判断)。"""
     return TriageResponse(
@@ -153,19 +186,21 @@ def _to_response(result: TriageResult) -> TriageResponse:
 def create_app(
     agent: SecurityAgent | None = None,
     triage_service: TriageService | None = None,
+    audit_store: SqliteAuditStore | None = None,
 ) -> FastAPI:
     """构建 FastAPI 应用。
 
     参数:
         agent: 已组装好的 SecurityAgent(测试注入 Fake 用);
-        triage_service: 已组装好的 TriageService(测试注入 Fake graph 用)。
+        triage_service: 已组装好的 TriageService(测试注入 Fake graph 用);
+        audit_store: 已组装好的 SqliteAuditStore(测试注入只读审计端点用)。
 
     注入**任意一个**即视为"调用方接管了装配",lifespan 不再运行 ——
     否则它会去构造真实 LLMClient(需要 .env),测试根本跑不起来。
-    代价是只注入 agent 时 /triage 不可用(503),反之 /chat 不可用;
-    生产路径 create_app() 不带参数,两者都会装配好。
+    代价是只注入 agent 时 /triage 与 /audit/events 不可用(503),以此类推;
+    生产路径 create_app() 不带参数,三者都会装配好。
     """
-    use_lifespan = agent is None and triage_service is None
+    use_lifespan = agent is None and triage_service is None and audit_store is None
     app = FastAPI(
         title="CyberSec Agent",
         version="0.1.0",
@@ -175,6 +210,8 @@ def create_app(
         app.state.agent = agent
     if triage_service is not None:
         app.state.triage_service = triage_service
+    if audit_store is not None:
+        app.state.audit_store = audit_store
 
     @app.middleware("http")
     async def correlation_middleware(request: Request, call_next):
@@ -246,6 +283,27 @@ def create_app(
         )
         return JSONResponse(status_code=status_code, content={"detail": str(exc)})
 
+    @app.exception_handler(AuditStoreUnavailableError)
+    async def audit_store_error_handler(
+        request: Request, exc: AuditStoreUnavailableError
+    ) -> JSONResponse:
+        """审计读失败 → 503;detail 是固定文案。
+
+        窄范围:只在 GET /audit/events 的读路径上被抛出,因此不会波及
+        写路径或其它端点的既有错误语义。
+
+        绝不回传:绝对路径、原始 SQLite 异常文本、repr(exc)、traceback、
+        环境变量或凭据。只记录**异常类型名**(不是消息)用于排障关联。
+        """
+        logger.error(
+            "audit_read_failed",
+            request_id=_request_id_of(request),
+            error_type=type(exc.__cause__).__name__,
+        )
+        return JSONResponse(
+            status_code=503, content={"detail": "audit store unavailable"}
+        )
+
     @app.post("/chat", response_model=ChatResponse)
     async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
         """对话式安全分析入口。校验交给 Pydantic,业务交给 Agent。"""
@@ -282,6 +340,56 @@ def create_app(
             request_id=_request_id_of(request),
         )
         return _to_response(result)
+
+    @app.get("/audit/events", response_model=list[AuditRecord])
+    async def list_audit_events(
+        request: Request,
+        thread_id: str | None = None,
+        event: AuditEvent | None = None,
+        limit: int = Query(default=50, ge=1, le=200),
+        order: Literal["desc", "asc"] = Query(default="desc"),
+    ) -> list[AuditRecord]:
+        """只读查询审计流(Phase 9.3-F)。
+
+        这是**只读**端点:它只调用 SqliteAuditStore.list_audit,不追加任何
+        审计(读审计不会再写一条审计)、不触发策略/审批/resume/checkpoint、
+        不调用工具 / MCP / provider / 模型,也不发起外部网络请求。
+
+        **本端点没有任何认证** —— 它是只读的,但**不是** "authorized
+        endpoint"。措辞上不得暗示调用方已通过身份校验、或只有审计员可见;
+        认证留到后续阶段。
+
+        响应是**裸列表** `list[AuditRecord]`,无信封;空结果(含未知
+        thread_id / 无匹配过滤)一律 200 + `[]`,不区分"不存在"与"无数据"
+        (避免用响应差异探测库里有什么)。
+
+        参数刻意只有四个,且都是**声明式**的:
+            thread_id / event  —— 等值过滤(全部参数绑定,无字符串拼接);
+            limit              —— 1..200(边界由本层校验),SQL 层 LIMIT;
+            order              —— desc(默认) / asc,方向由固定程序逻辑选择。
+
+        刻意**不暴露**的输入:incident_id / approval_id / request_id /
+        interrupt_id / actor / outcome / plan_digest / offset / cursor,
+        以及任何 db_path / database_path / sqlite_path / file_path /
+        raw SQL —— 查询契约里没有路径参数,因此未声明的 path-like 参数
+        无法把读取重定向到别的库。
+
+        校验失败一律 422(FastAPI 默认);审计库读失败 → 503 固定文案。
+        """
+        store = _require_store(request)
+        try:
+            return store.list_audit(
+                thread_id=thread_id,
+                event=event,
+                limit=limit,
+                descending=order == "desc",
+            )
+        except (sqlite3.Error, ValueError) as exc:
+            # sqlite3.Error: 库损坏 / 表缺失 / 锁 / 无法打开等持久化层失败。
+            # ValueError: 覆盖 json.JSONDecodeError 与 pydantic ValidationError
+            #   (二者都是 ValueError 子类)—— 即"持久化行解码/校验失败"。
+            # 两类都在**读边界**收敛成同一个窄类型,由上面的处理器映射成 503。
+            raise AuditStoreUnavailableError() from exc
 
     return app
 

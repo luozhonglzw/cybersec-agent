@@ -374,8 +374,24 @@ class SqliteAuditStore:
         thread_id: str | None = None,
         incident_id: str | None = None,
         event: str | None = None,
+        limit: int | None = None,
+        descending: bool = False,
     ) -> list[AuditRecord]:
-        """按条件读审计流,按 (ts, rowid) 升序 —— 顺序确定,不依赖存储顺序。"""
+        """按条件读审计流,按 (ts, rowid) 升序 —— 顺序确定,不依赖存储顺序。
+
+        Phase 9.3-F 扩展(**向后兼容**):新增两个 keyword-only 参数,
+        不传时行为与历史版本逐字一致 —— SQL 仍是
+        `SELECT * FROM audit_logs [WHERE ...] ORDER BY ts, rowid`,无 LIMIT。
+
+            descending=True → `ORDER BY ts DESC, rowid DESC`。
+                方向由**固定程序逻辑**二选一(不拼接调用方传入的 ORDER BY
+                片段、列名或原始 SQL);
+            limit 非 None → 在 **SQL 层** 施加 `LIMIT ?`(不拉全表再切片),
+                值与过滤条件一律走参数绑定。
+                limit 的取值边界(1..200)由调用方/HTTP 层负责,本方法只负责
+                把非 None 的 limit 施加到 SQL —— store 是 persistence 原语,
+                不承担请求校验。
+        """
         clauses: list[str] = []
         params: list[object] = []
         if thread_id is not None:
@@ -391,7 +407,15 @@ class SqliteAuditStore:
         sql = "SELECT * FROM audit_logs"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY ts, rowid"
+        # 默认分支保持历史字面量(升序等价于 `ts ASC, rowid ASC`);
+        # 降序分支同样只由这里的固定常量决定,不接受任何调用方输入。
+        if descending:
+            sql += " ORDER BY ts DESC, rowid DESC"
+        else:
+            sql += " ORDER BY ts, rowid"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
 
         with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
