@@ -94,7 +94,7 @@ LLM 只能产生：
 - 不做多租户
 - 不做微服务
 - 不做 Kubernetes
-- Phase 10 之前不引入 Docker / PostgreSQL / Redis
+- PostgreSQL / Redis 未引入，且**不是**既定下一步（由需求驱动，而非按 Phase 排期）
 
 **实验环境边界**：所有扫描、命令执行、网络操作默认限制在本地实验环境、Docker Lab 或明确授权的测试环境。项目数据全部为模拟生成（scripts/seed_*.py），不针对任何真实第三方系统。
 
@@ -129,7 +129,7 @@ LLM 只能产生：
 └─────────────────────────────────────────────┘
 ```
 
-> 注：上图与 §7 目录描述的是**终态蓝图**。截至 2026-09-19 的实际实现：编排层为单文件 `app/core/graph.py`（未创建 `app/graph/` 包）；`app/security/` 已创建（policy / audit / store）；`app/rag/`、`app/knowledge/`、`app/evaluation/`、`docker/` 尚未创建。MCP 接口已于 Phase 9.3-E 落地为 `app/mcp/`（见 §8 Flow C）。
+> 注：上图与 §7 目录描述的是**终态蓝图**。截至 2026-09-19 的实际实现：编排层为单文件 `app/core/graph.py`（未创建 `app/graph/` 包）；`app/security/` 已创建（policy / audit / store）；`app/rag/`、`app/knowledge/`、`app/evaluation/` 尚未创建。MCP 接口已于 Phase 9.3-E 落地为 `app/mcp/`（见 §8 Flow C）。**容器化已于 Phase 9.3-G 落地，但不落在蓝图里的 `docker/` 目录** —— 实现是仓库根的 `Dockerfile` / `.dockerignore` / `compose.yaml` 三个文件，不存在也不需要 `docker/` 目录（见 §8 Flow E）。
 >
 > **路由命名的实现偏离**：蓝图写 `/chat /approve /audit`，实际实现为 `/chat /triage /resume`。审批不是独立端点——审批决定（`status` + `operator`）是 `/resume` 的请求载荷，与恢复句柄 `thread_id` 一起构成一次完整的恢复请求，拆成两个端点会引入"审批了但没恢复"的中间态。审计写入走 `app/security/store.py`；审计**读接口**已于 Phase 9.3-F 落地为只读的 `GET /audit/events`（蓝图里的 `/audit` 这个具体路径名未采用，见 §8 Flow D）。
 
@@ -168,7 +168,8 @@ LLM 只能产生：
 | mcp | MCP Server | 6 | 已装（2.3.0；该版本 `FastMCP` 已更名为 `MCPServer`）。Phase 9.3-E 落地为 `app/mcp/` |
 | OpenTelemetry | Trace | 9 | 未引入 |
 | Langfuse | 可观测平台 | 9 | 未引入 |
-| Docker / PostgreSQL / Redis | 工程化 | 10（可选，按需引入） | 未引入 |
+| Docker / Compose | 容器化运行边界 | 9.3-G | **已引入**（最小部署：仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E） |
+| PostgreSQL / Redis | 外部持久化 / 缓存 | — | **未引入**（当前架构不依赖；是否引入由需求驱动，不是既定下一步） |
 
 ### 安全领域知识（知识库内容，非代码依赖）
 
@@ -210,7 +211,7 @@ cybersec-agent/
 │   ├── architecture.md          # 本文档
 │   ├── learning/                # 每 phase 学习笔记（学到了什么/为什么这么设计/坑/面试怎么答）
 │   └── interview/               # 面试问答（agent/langgraph/mcp/rag/security...）
-├── docker/                      # Phase 10
+├── docker/                      # Phase 10 蓝图位置；实际未建立该目录，容器化落地为仓库根 Dockerfile / .dockerignore / compose.yaml（Phase 9.3-G）
 ├── pyproject.toml
 ├── .env.example
 ├── .gitignore
@@ -223,6 +224,7 @@ cybersec-agent/
 - **data/ 的 Git 策略**：git 只存生成脚本（scripts/seed_*.py），不存生成物；换台机器 `python scripts/seed.py` 一键复原。
 - MCP 入口放 **`app/mcp/`**，不设顶层 `mcp_server/`：它复用 `app.tools` 的核心只读函数与 `app.schemas` 模型，放进 `app/` 包内才能沿用同一条导入边界与测试约定；进程入口仍由 `python -m app.mcp.server` 提供，独立于 API 服务。
 - schemas/ 独立成包：Pydantic 模型被 tools、graph、api、knowledge 同时引用，单独放置避免循环 import。
+- **容器化不建 `docker/` 目录**：蓝图把容器化画成 `docker/`，实际实现是仓库根三个文件（`Dockerfile` / `.dockerignore` / `compose.yaml`，Phase 9.3-G）。放根目录是因为它们描述的是**整个仓库**的构建与运行方式，而不是 `app/` 包内的一个模块 —— 与 `pyproject.toml` 同级更贴近语义（见 §8 Flow E）。
 
 ### 7.1 当前实际结构（2026-09-19）
 
@@ -241,13 +243,16 @@ cybersec-agent/
 ├── scripts/        # seed_logs.py / seed_threat_intel.py
 ├── tests/          # test_api / test_core / test_schemas / test_security / test_tools / test_mcp
 ├── docs/           # **仅 architecture.md**
+├── Dockerfile      # Phase 9.3-G：最小容器镜像（单阶段，运行时依赖 only）
+├── .dockerignore   # 构建上下文排除（.env / 宿主 data / agent 产物 / .git）
+├── compose.yaml    # 单服务 api + 单命名卷 audit-data
 ├── pyproject.toml
 ├── uv.lock
 ├── .env.example
 └── .gitignore
 ```
 
-**尚未创建**：`app/graph/`（编排层实现为 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`app/evaluation/`、`docker/`、`docs/learning/`、`docs/interview/`。（MCP **不再**属于"尚未创建"：Phase 9.3-E 把它落在 `app/mcp/`，见 §8 Flow C。）
+**尚未创建**：`app/graph/`（编排层实现为 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`app/evaluation/`、`docs/learning/`、`docs/interview/`。（MCP **不再**属于"尚未创建"：Phase 9.3-E 把它落在 `app/mcp/`，见 §8 Flow C。`docker/` **也不再**属于"尚未创建"，但它不是"已创建"——Phase 9.3-G 的容器化刻意**不**建立 `docker/` 目录，实现是仓库根三个文件，见 §8 Flow E。）
 
 **data/ 的实际内容**：只有两个 seed 生成的 JSONL 文件，**没有** SQLite 或 Chroma 持久化文件。`audit.db` 由 `SqliteAuditStore` 在运行时按需创建（测试全部注入 `tmp_path`，仓库里不产生该文件）；checkpoint 走 `InMemorySaver`，**不落盘**。
 
@@ -342,6 +347,32 @@ HTTP Client
 **认证边界**：本端点是**只读**的，**不等于**已认证 / 已授权 —— 本原型仍**没有**生产级认证 / 授权层，端点不是 "authorized endpoint"，也不应被描述为"仅审计员可见"。`actor` 字段仍只是调用方自称的字符串（见 §11.4 已知局限）。
 
 append-only 语义不受本端点影响：它**不能** UPDATE / DELETE / 清空审计，**不能**批准 / 拒绝 / resume，**不能**执行工具或调用 provider/model（见 §11.3）。
+
+### Flow E — 容器化运行边界（Phase 9.3-G 落地）
+
+```
+开发者 / 运维
+  → docker compose up --build（compose.yaml：1 个服务 + 1 个命名卷）
+  → API 容器（Dockerfile：单阶段镜像，CMD = uvicorn app.api.main:app --host 0.0.0.0 --port 8000）
+      ├─ /app/data/security_events.jsonl   144 条合成事件（构建期生成，确定性）
+      ├─ /app/data/threat_intel.jsonl       29 条 IOC 记录（构建期生成，确定性）
+      └─ /data/audit.db  ← 命名卷 audit-data:/data（可变审计状态，唯一跨容器存活的状态）
+
+MCP：在 Compose 之外
+  → python -m app.mcp.server（本地 stdio，见 Flow C）—— 不是 Compose 服务，不发布网络端口
+```
+
+**容器里装什么**：`Dockerfile` 是单阶段镜像，只装**锁定的运行时依赖**（`uv sync --locked --no-dev`）—— 不装 dev 组、不装系统包、不联网升级；随后复制 `app/`、两个 seed 脚本与 `README.md`（hatchling 构建本地项目时需要它），并在构建期运行两个 seed 脚本，把确定性演示数据烘焙到 `/app/data`。宿主 `data/`、`.env` 与 agent 产物都被 `.dockerignore` 排除，**不会**进入镜像。
+
+**什么会持久化**：Compose 里只有一个服务 `api` 和一个命名卷 `audit-data`，端口映射 `8000:8000`。镜像内的 `/app/data` 是只读语义的演示输入；卷挂在 `/data`，因此**不遮蔽** `/app/data`。可变审计状态落在 `/data/audit.db`（组合根通过环境变量把 `Settings.audit_db_path` 指向它），这是唯一跨容器存活的状态 —— 重建容器保留审计轨迹，删除卷则不保留。
+
+**运行时配置仍在镜像之外**：`LLM_MODEL` / `LLM_BASE_URL` / `LLM_API_KEY` 由运行期 `.env`（或宿主环境）提供，与本地 `uv` 路径同源；镜像里**没有**凭据，缺配置时应用照旧拒绝启动（`Settings` 启动期校验）。
+
+**MCP 与 Compose 的关系**：MCP **不是** Compose 服务，也**不是**网络服务 —— 它仍是 Flow C 的本地 stdio 入口，由拉起它的宿主进程承担身份边界。本部署不实现远程 MCP 传输，也不实现 MCP 鉴权服务器。
+
+**部署 / 伸缩边界**：当前是**单服务 + SQLite** 的本地 / 演示 / 单实例边界，**不是**水平扩展设计，也**不**引入外部数据库或缓存。若将来需要跨实例共享审计状态，需要替换持久化层 —— 这属于需求驱动的未来工作，不是既定下一步。
+
+**Compose 兼容性**：`compose.yaml` 使用了可选的 `env_file` 长语法（`path:` + `required: false`），因此需要支持该语法的较新 Compose 版本（Compose ≥ 2.24）。
 
 ## 9. LangGraph Workflow 设计
 
@@ -529,7 +560,9 @@ AuditEvent = Literal[
 | 7 | 风险分析 + 响应规划 | **已完成**（规则引擎侧）：`RiskAssessment` + `ResponsePlan` 纯函数规则引擎 |
 | 8 | 安全层 + HITL | **已完成（8.1-8.5）**：策略引擎 / 审批流 / append-only 审计 / SQLite 持久化 / triage 服务与 API |
 | 9 | 可观测 + 评估 | **部分启动**：9.1-A 交付可靠性侧（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 依赖护栏对齐），**不属于**蓝图的可观测/评估内容 —— 蓝图的 Trace / 指标 / LLM-as-Judge 仍未启动 |
-| 10 | 工程化 | 未启动 |
+| 10 | 工程化 | **部分启动**：Phase 9.3-G 已交付最小 Docker / Compose 容器化（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E）；蓝图同格里的 PostgreSQL / Redis 等**未引入**，且**不是**既定必做项 —— 由需求驱动，而非"下一步就必须做" |
+
+> 说明：§12 蓝图表把"工程化"写成 `Docker/PG/Retry/CI/文档` 一组交付物，那是**蓝图的分组**，不是"这几项都要做"的承诺。实际状态见上表：CI 与容器化已交付；PostgreSQL / Redis 从未引入，当前架构（单进程 + SQLite）也不依赖它们。是否引入由真实需求决定。
 
 
 ## 13. 待定决策
@@ -719,6 +752,20 @@ OpenAI-compatible LLM
 - **7 条变异测试全部验证变红后完整还原**：pending 谓词去掉 timeout / 失败路径不清理 / 过期判定 `>=` 反成 `<` / reap 去掉过期过滤 / 去掉幂等闸门 / 去掉 `/chat` 护栏 / 超时检查移位。其中"M4 reap 去掉过期过滤"打的是本阶段最重要的不变量 —— **未过期的 pending 绝不能被删**。
 - 522 tests（Phase 9.1-A 终态基线，8.5 的 486 → +36）。验证方式：仓库根全绿；**从无 `data/` 目录的 CWD 运行同样 522 passed**（hermetic 证明）。
 
+> 2026-10-06 · Phase 9.3-G 完成（最小 Docker / Compose 容器化）
+
+本阶段只加部署面，**不改任何运行时逻辑**：新增仓库根三个文件 `Dockerfile` / `.dockerignore` / `compose.yaml`，应用代码、测试、依赖清单、CI 工作流**零改动**（测试套件不新增，因此全量计数不变）。
+
+- **单阶段镜像，只装运行时依赖**：base 为官方 Astral uv 镜像（自带 Python 3.12，slim）；先只复制依赖元数据（`pyproject.toml` / `uv.lock` / `.python-version`）并 `uv sync --locked --no-dev --no-install-project` 让依赖层独立缓存，再复制 `app/`、两个 seed 脚本与 `README.md`，最后 `uv sync --locked --no-dev` 安装本地项目。`--locked` 禁止重解析，`--no-dev` 排除 dev 组；不装系统包、不联网升级。
+- **`README.md` 是构建期输入，不是运行时文件**：`pyproject.toml` 声明 `readme = "README.md"`，hatchling 构建本地项目 wheel 时会校验该文件，因此镜像必须复制它 —— 这是构建元数据依赖，运行时并不读它。
+- **演示数据在构建期生成**：构建阶段运行既有的两个 seed 脚本，把确定性合成数据烘焙到 `/app/data`（`security_events.jsonl` 144 条、`threat_intel.jsonl` 29 条）。数据是**生成物**而非提交物；宿主 `data/` 由 `.dockerignore` 排除，永不进入镜像。
+- **可变状态与镜像分离**：`compose.yaml` 只声明一个服务 `api` 和一个命名卷 `audit-data`，卷挂 `/data`，审计库落在 `/data/audit.db`（组合根把 `Settings.audit_db_path` 指向它）。卷**不遮蔽**镜像内的 `/app/data`；容器重建保留审计轨迹，删除卷则不保留。
+- **配置与凭据不烘焙**：`.env` 被 `.dockerignore` 排除，`LLM_MODEL` / `LLM_BASE_URL` / `LLM_API_KEY` 一律运行期提供；镜像里没有凭据，缺配置时应用照旧拒绝启动。
+- **MCP 留在 Compose 之外**：MCP 不是 Compose 服务、不发布网络端口，仍是本地 stdio 入口（见 §8 Flow C）。本阶段**没有**引入远程 MCP 传输或 MCP 鉴权服务器。
+- **部署 / 伸缩边界（明确写下）**：单服务 + SQLite 的本地 / 演示 / 单实例边界，**不是**水平扩展设计，也**不**引入外部数据库或缓存。跨实例共享审计状态需要替换持久化层，属需求驱动的未来工作。
+- **边界纪律**：本阶段**未**引入 Kubernetes / PostgreSQL / Redis / nginx / 多副本 / 健康检查，**未**声称 production-ready 或可水平扩展；容器以最小可用为准。
+- 全量测试计数不变（Phase 9.3-F 基线 1,463）：本阶段只新增非测试文件、不新增测试，因此套件规模不变。测试仍保持既有的 hermetic 约束（不读仓库 `data/`，数据由 `tmp_path` 现场生成）。
+
 ### Implementation Deviation Note（与 §12 Roadmap 的实现偏离说明）
 
 > §12 Roadmap 的原始设计保持不变；本节只记录实际实现与蓝图之间的有意偏离及原因。
@@ -733,7 +780,7 @@ OpenAI-compatible LLM
 
 ## 当前架构快照（2026-09-19）
 
-> 完成状态：**Phase 0-8.5 已完成；Phase 9.1-A 已完成**（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 护栏对齐）。
+> 完成状态：**Phase 0-8.5 已完成；Phase 9.1-A 已完成**（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 护栏对齐）；**Phase 9.3-G 已完成**（最小 Docker / Compose 容器化，见 §8 Flow E）。
 
 ```
 HTTP Client
@@ -774,11 +821,20 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
  ↓
 持久化：SQLite（业务表 + 审计，append-only）
         checkpoint = InMemorySaver（进程内内存，**不落盘**）
+ ↓
+容器化运行边界（Phase 9.3-G，可选部署路径，见 §8 Flow E）
+   Dockerfile       单阶段镜像：uv 官方 base + 锁定运行时依赖 + app/ + 构建期生成演示数据
+   compose.yaml     1 个服务 api（端口 8000:8000）+ 1 个命名卷 audit-data
+   /app/data        镜像烘焙的确定性演示输入（security_events.jsonl / threat_intel.jsonl）
+   /data/audit.db   命名卷承载的可变审计状态（卷只挂 /data，不遮蔽 /app/data）
+   运行时配置       由 .env / 宿主环境提供；镜像内无凭据
+   MCP              不在 Compose 内，仍是本地 stdio（见 §8 Flow C）
 ```
 
 - 默认注册工具：`app.tools.DEFAULT_TOOLS` = `[query_security_logs_tool, query_threat_intel_tool, analyze_risk_tool, plan_response_tool]`（单一真相源，agent 与 graph 共用），graph 对工具数量零假设（加工具 = 加 map 条目，控制流不变）
 - **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
 - 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided` / `approval.timeout` —— 6 个全部有生产写入路径（`approval.timeout` 由 Phase 9.1-A 的惰性超时补齐）
+- **部署面（Phase 9.3-G）**：容器化只增加部署文件（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`），**不改变**上面任何一条运行时语义 —— 图结构、工具集、审计写入路径、HITL 行为全部不变。当前是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）。
 - 测试基线：**601 passed**，全部离线（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`，无真实 API 调用）；**从无 `data/` 目录的 CWD 运行同样 601 passed**（hermetic）
 
 ## 尚未实现（按 §12 Roadmap）
@@ -792,6 +848,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - 身份认证 / 不可否认性——`actor` 只是自称字符串（Phase 10）
 - 审计读接口的**导出 / 聚合 / 游标分页**——只读查询端点 `GET /audit/events` 已于 Phase 9.3-F 落地（见 §8 Flow D）
 - Observability / Evaluation——Phase 9
+- 生产 / 分布式部署面——当前容器化**刻意最小**：**未**引入 Kubernetes、外部数据库（PostgreSQL）、缓存（Redis）、反向代理（nginx）、多副本、健康检查。这些是否引入由需求驱动，**不是**既定下一步；现有部署是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）
 
 
 ## Testing Framework

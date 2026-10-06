@@ -205,6 +205,44 @@ uv run pytest -q
 
 CI runs this same offline suite on GitHub-hosted Ubuntu: the workflow installs the locked `uv` environment and runs the offline pytest suite. The exact Phase 9.3-F implementation commit (`dd295c8`) passed 1,463 tests in the observed GitHub-hosted Ubuntu 24.04 CI environment — an observation of that run, not a claim of universal Linux compatibility.
 
+### Running with Docker Compose
+
+The repository also ships a minimal container deployment — a single `Dockerfile` and a `compose.yaml` at the repository root. It is an additional supported execution path, not a replacement for the local `uv` workflow above, and it reuses the same `.env` configuration.
+
+```bash
+cp .env.example .env          # same runtime configuration as the local workflow
+docker compose up --build
+```
+
+The API is then served at <http://localhost:8000>, with interactive documentation at <http://localhost:8000/docs>.
+
+**What is baked into the image.** The image installs the locked runtime dependencies, copies the application, and generates the deterministic demo inputs at build time, so the container starts with its own data:
+
+```
+/app/data/security_events.jsonl   144 synthetic events  (image-baked, deterministic)
+/app/data/threat_intel.jsonl       29 IOC records       (image-baked, deterministic)
+```
+
+**What persists.** Compose declares exactly one service and one named volume:
+
+| Item | Value |
+| --- | --- |
+| Service | `api` — the only service |
+| Named volume | `audit-data` |
+| Audit database path inside the container | `/data/audit.db` |
+| Volume mount | `audit-data:/data` |
+| Published port | `8000:8000` |
+
+Mutable audit state is the only state that outlives a container. Because the volume mounts at `/data` and the demo inputs live under `/app/data`, the mount does **not** shadow the image-baked demo data. Recreating the container keeps the audit trail; removing the volume does not.
+
+**Runtime configuration stays outside the image.** `LLM_MODEL` / `LLM_BASE_URL` / `LLM_API_KEY` are supplied at runtime from `.env` (or from the surrounding environment), exactly as in the local workflow. `.env` is excluded from the build context, so real credentials are never baked into the image — and, as with the local workflow, the application refuses to start without them.
+
+**MCP is not a Compose service.** This deployment does not publish MCP over the network. It remains the local stdio server described under [MCP Interface (read-only)](#mcp-interface-read-only), started by whichever host process wants it; there is no remote MCP transport and no MCP authentication server.
+
+**Scaling boundary.** The Compose deployment is intentionally a single API service with SQLite persistence — a local / demo / single-instance boundary. It is not a horizontally scaled or multi-replica design, and it introduces no external database or cache.
+
+**Compose version.** `compose.yaml` uses the optional `env_file` long syntax with `required: false`, which needs a Docker Compose release supporting that syntax (Compose ≥ 2.24).
+
 ## Project Structure
 
 ```
@@ -220,6 +258,9 @@ data/           generated seed data and the runtime audit database (not committe
 docs/           architecture design notes
 scripts/        deterministic seed-data generators
 tests/          1,463 offline tests
+Dockerfile      minimal container image (Phase 9.3-G)
+.dockerignore   build-context exclusions (secrets, host data, agent artifacts)
+compose.yaml    single-service Compose topology with the audit-data volume
 ```
 
 ## Roadmap
@@ -239,4 +280,4 @@ tests/          1,463 offline tests
 | MCP interoperability | Implemented |
 | Structured application logging | Implemented |
 | Audit read / query API | Implemented |
-| Containerized deployment | Planned |
+| Containerized deployment | Implemented |
