@@ -27,3 +27,7 @@ logs/
 .DS_Store
 .idea/
 .vscode/
+
+# Local agent state & protected experiment evidence (never commit)
+/.workbuddy-ai/
+/.tmp-d2b-run*/

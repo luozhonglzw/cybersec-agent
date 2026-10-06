@@ -352,3 +352,7 @@ compose.yaml    single-service Compose topology with the audit-data volume
 | Structured application logging | Implemented |
 | Audit read / query API | Implemented |
 | Containerized deployment | Implemented |
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for the full text.
