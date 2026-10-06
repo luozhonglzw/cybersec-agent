@@ -102,7 +102,7 @@ LLM 只能产生：
 
 ```
 ┌──────────────────────────────────────────────┐
-│ 客户端：curl / Swagger UI / scripts/demo.py │
+│ 客户端：curl / Swagger UI                  │
 └───────────────────┬──────────────────────────┘
 ┌───────────────────▼──────────────────────────┐
 │ API 层（app/api）  FastAPI                   │
@@ -129,7 +129,11 @@ LLM 只能产生：
 └─────────────────────────────────────────────┘
 ```
 
-> 注：上图与 §7 目录描述的是**终态蓝图**。截至 2026-09-19 的实际实现：编排层为单文件 `app/core/graph.py`（未创建 `app/graph/` 包）；`app/security/` 已创建（policy / audit / store）；`app/rag/`、`app/knowledge/`、`app/evaluation/` 尚未创建。MCP 接口已于 Phase 9.3-E 落地为 `app/mcp/`（见 §8 Flow C）。**容器化已于 Phase 9.3-G 落地，但不落在蓝图里的 `docker/` 目录** —— 实现是仓库根的 `Dockerfile` / `.dockerignore` / `compose.yaml` 三个文件，不存在也不需要 `docker/` 目录（见 §8 Flow E）。
+> 注：上图与 §7 目录描述的是**终态蓝图**（历史设计快照，不随实现更新）。**蓝图与实现之间的差异，以 §7.1「当前实际结构」为准** —— 该小节维护的是**当前**事实。
+>
+> 蓝图里画出但**至今未创建**的：`app/graph/`（编排层实现为单文件 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`docker/`（容器化刻意**不**建该目录，实现是仓库根的 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E）。
+>
+> 蓝图里画出且**已落地**的：`app/api/`、`app/schemas/`、`app/tools/`、`app/security/`（policy / audit / store）、`app/evaluation/`（离线架构 harness + 真实 provider 评估 harness，见 §6 / §14）、`app/mcp/`（Phase 9.3-E，见 §8 Flow C）。
 >
 > **路由命名的实现偏离**：蓝图写 `/chat /approve /audit`，实际实现为 `/chat /triage /resume`。审批不是独立端点——审批决定（`status` + `operator`）是 `/resume` 的请求载荷，与恢复句柄 `thread_id` 一起构成一次完整的恢复请求，拆成两个端点会引入"审批了但没恢复"的中间态。审计写入走 `app/security/store.py`；审计**读接口**已于 Phase 9.3-F 落地为只读的 `GET /audit/events`（蓝图里的 `/audit` 这个具体路径名未采用，见 §8 Flow D）。
 
@@ -226,22 +230,25 @@ cybersec-agent/
 - schemas/ 独立成包：Pydantic 模型被 tools、graph、api、knowledge 同时引用，单独放置避免循环 import。
 - **容器化不建 `docker/` 目录**：蓝图把容器化画成 `docker/`，实际实现是仓库根三个文件（`Dockerfile` / `.dockerignore` / `compose.yaml`，Phase 9.3-G）。放根目录是因为它们描述的是**整个仓库**的构建与运行方式，而不是 `app/` 包内的一个模块 —— 与 `pyproject.toml` 同级更贴近语义（见 §8 Flow E）。
 
-### 7.1 当前实际结构（2026-09-19）
+### 7.1 当前实际结构（**当前维护**；小节初版 2026-09-19，之后随 Phase 持续更新）
+
+> 与 §5 / §7 的**历史蓝图**不同，本小节描述的是**当前**仓库事实；两者冲突时以本节为准。
 
 蓝图中的目录并非全部已创建。实际存在的是：
 
 ```
 cybersec-agent/
 ├── app/
-│   ├── core/       # config / logging / llm / agent / graph（编排层单文件）
-│   ├── schemas/    # log_event / threat_intel / risk / response / approval / audit
+│   ├── core/       # config / llm / agent / graph（编排层单文件）/ triage（无独立 logging.py：结构化日志用 structlog 内联在既有模块中）
+│   ├── schemas/    # log_event / threat_intel / risk / response / approval / incident / audit
 │   ├── tools/      # query_logs / query_threat_intel / risk_analyzer / response_planner
 │   ├── security/   # policy / audit / store（Phase 8）
+│   ├── evaluation/ # 离线架构 harness（runner / metrics / oracles / cases / golden）+ llm/（真实 provider 评估：budget / runner / confinement / offline_guard / pilot ...）
 │   ├── mcp/        # Phase 9.3-E：只读 MCP 适配器（tools.py）+ 本地 stdio 入口（server.py）
 │   └── api/        # main（/chat /triage /resume + 只读 /audit/events）+ schemas
 ├── data/           # security_events.jsonl / threat_intel.jsonl（**仅 JSONL**）
 ├── scripts/        # seed_logs.py / seed_threat_intel.py
-├── tests/          # test_api / test_core / test_schemas / test_security / test_tools / test_mcp
+├── tests/          # test_api / test_core / test_schemas / test_security / test_tools / test_mcp / test_evaluation / test_evaluation_llm
 ├── docs/           # **仅 architecture.md**
 ├── Dockerfile      # Phase 9.3-G：最小容器镜像（单阶段，运行时依赖 only）
 ├── .dockerignore   # 构建上下文排除（.env / 宿主 data / agent 产物 / .git）
@@ -252,7 +259,7 @@ cybersec-agent/
 └── .gitignore
 ```
 
-**尚未创建**：`app/graph/`（编排层实现为 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`app/evaluation/`、`docs/learning/`、`docs/interview/`。（MCP **不再**属于"尚未创建"：Phase 9.3-E 把它落在 `app/mcp/`，见 §8 Flow C。`docker/` **也不再**属于"尚未创建"，但它不是"已创建"——Phase 9.3-G 的容器化刻意**不**建立 `docker/` 目录，实现是仓库根三个文件，见 §8 Flow E。）
+**尚未创建**：`app/graph/`（编排层实现为 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`docs/learning/`、`docs/interview/`。（`app/evaluation/` **不属于**"尚未创建"——它已存在并有两层评估实现，见上表与 §6。MCP **也不再**属于"尚未创建"：Phase 9.3-E 把它落在 `app/mcp/`，见 §8 Flow C。`docker/` **同样不再**属于"尚未创建"，但它不是"已创建"——Phase 9.3-G 的容器化刻意**不**建立 `docker/` 目录，实现是仓库根三个文件，见 §8 Flow E。）
 
 **data/ 的实际内容**：只有两个 seed 生成的 JSONL 文件，**没有** SQLite 或 Chroma 持久化文件。`audit.db` 由 `SqliteAuditStore` 在运行时按需创建（测试全部注入 `tmp_path`，仓库里不产生该文件）；checkpoint 走 `InMemorySaver`，**不落盘**。
 
@@ -548,7 +555,7 @@ AuditEvent = Literal[
 
 依赖关系：Phase 3 → 4 → 8 是硬依赖（顺序不能乱）；Phase 5 与 6 可互换；评估集（golden set）从 Phase 2 起开始积累。
 
-### 12.1 实际进度 vs 上表（2026-09-19）
+### 12.1 实际进度 vs 上表（**当前维护**；小节初版 2026-09-19，之后随 Phase 持续更新）
 
 上表是**设计蓝图**，保持不变。实际推进有两处顺序偏离（详见 §14 偏离说明）：
 
@@ -559,7 +566,7 @@ AuditEvent = Literal[
 | 6 | MCP Server | **未按蓝图在 Phase 6 执行**：该 Phase 实际交付的是 Rule-based Risk Analyzer（提前实现，见 §14），MCP Server 顺延；**已于 Phase 9.3-E 落地为 `app/mcp/`**（只读暴露，见 §8 Flow C） |
 | 7 | 风险分析 + 响应规划 | **已完成**（规则引擎侧）：`RiskAssessment` + `ResponsePlan` 纯函数规则引擎 |
 | 8 | 安全层 + HITL | **已完成（8.1-8.5）**：策略引擎 / 审批流 / append-only 审计 / SQLite 持久化 / triage 服务与 API |
-| 9 | 可观测 + 评估 | **部分启动**：9.1-A 交付可靠性侧（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 依赖护栏对齐），**不属于**蓝图的可观测/评估内容 —— 蓝图的 Trace / 指标 / LLM-as-Judge 仍未启动 |
+| 9 | 可观测 + 评估 | **部分完成**：蓝图的 **Trace / LLM-as-Judge 未实现**；但"评估"侧已交付**离线评估 harness**（`app/evaluation/`：runner / metrics / oracles / cases / golden）与**真实 provider 评估 harness**（`app/evaluation/llm/`：budget / runner / confinement / offline_guard / pilot），另有 9.1-A 的可靠性侧（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 依赖护栏对齐）。只读审计查询（9.3-F）与只读 MCP（9.3-E）也在 9.3 段落地，见 §8 Flow C / Flow D |
 | 10 | 工程化 | **部分启动**：Phase 9.3-G 已交付最小 Docker / Compose 容器化（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E）；蓝图同格里的 PostgreSQL / Redis 等**未引入**，且**不是**既定必做项 —— 由需求驱动，而非"下一步就必须做" |
 
 > 说明：§12 蓝图表把"工程化"写成 `Docker/PG/Retry/CI/文档` 一组交付物，那是**蓝图的分组**，不是"这几项都要做"的承诺。实际状态见上表：CI 与容器化已交付；PostgreSQL / Redis 从未引入，当前架构（单进程 + SQLite）也不依赖它们。是否引入由真实需求决定。
@@ -575,8 +582,10 @@ AuditEvent = Literal[
 
 ## 14. 实现进度（随开发更新）
 
-> 2026-09-19 · **Phase 0-7 全部完成；Phase 8 已完成（8.1-8.5）；Phase 9 已启动（9.1-A）**。最新状态见文末"当前架构快照"。
-> 下方按 Phase 顺序记录各阶段的交付物与设计决策。
+> 本节按 Phase 顺序记录各阶段的交付物与设计决策。下方每条 `> <日期> · <阶段> 完成` 条目（含本节开篇那条 2026-09-19 的状态快照）都是**该阶段当时的历史记录**，不随后续 Phase 更新 —— 因此较早条目里出现的测试计数与结构描述反映的是**当时**的事实，不是当前状态。
+> **当前**状态请见 §7.1 与文末「当前架构快照」。
+>
+> 2026-09-19 · **Phase 0-7 全部完成；Phase 8 已完成（8.1-8.5）；Phase 9 已启动（9.1-A）**。（**当时**的状态快照；此后 Phase 9.3-E / 9.3-F / 9.3-G 已继续推进。）
 
 历史快照（Phase 1-3 时期的调用链，已被 LangGraph 版取代，见文末）：
 
@@ -778,7 +787,7 @@ OpenAI-compatible LLM
 - **MCP Server 与 RAG 顺延（Phase 5 / 6）**：§12 把 Phase 5 定为"威胁情报 + RAG"、Phase 6 定为"MCP Server"，实际 Phase 5 只交付 IOC Exact Match（理由见上一条），Phase 6 则交付了提前实现的 Rule-based Risk Analyzer。结果是 **RAG 与 MCP Server 两项能力整体顺延**，`ChromaDB` 至今未引入。这不是"砍掉"，是排序调整：先做能用规则确定性验证的部分（风险分级 / 响应规划 / HITL 安全层），把依赖外部组件的能力留到后面。（后续进展：**MCP Server 已于 Phase 9.3-E 以只读形态落地为 `app/mcp/`**，`mcp` 依赖引入 2.3.0；RAG 仍顺延。）
 - **`/approve` 未实现，审批并入 `/resume`**：见 §5 注。审计写入走 store；审计**读接口**于 Phase 9.3-F 落地为只读的 `GET /audit/events`（复用既有 `list_audit()`，蓝图里的 `/audit` 路径名未采用，见 §8 Flow D）。
 
-## 当前架构快照（2026-09-19）
+## 当前架构快照（**当前维护**；小节初版 2026-09-19，之后随 Phase 持续更新）
 
 > 完成状态：**Phase 0-8.5 已完成；Phase 9.1-A 已完成**（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 护栏对齐）；**Phase 9.3-G 已完成**（最小 Docker / Compose 容器化，见 §8 Flow E）。
 
@@ -835,7 +844,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
 - 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided` / `approval.timeout` —— 6 个全部有生产写入路径（`approval.timeout` 由 Phase 9.1-A 的惰性超时补齐）
 - **部署面（Phase 9.3-G）**：容器化只增加部署文件（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`），**不改变**上面任何一条运行时语义 —— 图结构、工具集、审计写入路径、HITL 行为全部不变。当前是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）。
-- 测试基线：**601 passed**，全部离线（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`，无真实 API 调用）；**从无 `data/` 目录的 CWD 运行同样 601 passed**（hermetic）
+- 测试基线：**1,463 passed**，全部离线（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`，无真实 API 调用）；**从无 `data/` 目录的 CWD 运行同样 1,463 passed**（hermetic）。计数来源：Phase 9.3-G 文档提交 `b4f9d4e4` 的 exact-head CI 观测（GitHub-hosted Ubuntu 24.04，见 §14）。
 
 ## 尚未实现（按 §12 Roadmap）
 
@@ -886,16 +895,19 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 | `tests/test_schemas/` | LogEvent / ThreatIntelRecord / RiskAssessment / ResponsePlan / ApprovalRequest / AuditRecord 的校验边界、seed 可复现、API DTO 策略 |
 | `tests/test_security/` | 策略引擎 / 审计记录构造 / append-only store（含"源码里无 UPDATE/DELETE"的结构护栏） |
 | `tests/test_tools/` | 四个工具核心函数的过滤、排序、规则分支与错误契约 |
+| `tests/test_mcp/` | 只读 MCP 适配器与本地 stdio server（工具发布面、schema 不暴露路径参数） |
+| `tests/test_evaluation/` | 离线架构 harness：runner / metrics / oracles / cases / golden digest |
+| `tests/test_evaluation_llm/` | 真实 provider 评估 harness：budget / confinement / offline_guard / runner / pilot 等（全部离线，不触网） |
 
-当前基线：**601 passed**（`pytest -q`，2026-09-19）。
+当前基线：**1,463 passed**（`pytest -q`；来源为 Phase 9.3-G 文档提交 `b4f9d4e4` 的 exact-head CI 观测，见 §14）。
 
 ### 6. hermetic 约束（Phase 8.5 收口）
 
-**全部 35 个测试文件都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
+**全部 67 个测试模块（`tests/` 下所有 `test_*.py`）都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
 
 ```bash
 cd <任意不含 data/ 的目录>
-<python> -m pytest <repo>/tests -q      # 期望:601 passed
+<python> -m pytest <repo>/tests -q      # 期望:1,463 passed
 ```
 
 根因说明：生产默认值 `DEFAULT_DATA_PATH` 是**相对路径**（`data/security_events.jsonl`），相对 CWD 解析 —— 这是**生产行为的正确设计**（部署时以启动目录为基准），但会让测试在换 CWD 时红。所以修的是**测试**（注入 `tmp_path` 现场生成的 seed 数据），不是生产默认值。

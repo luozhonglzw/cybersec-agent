@@ -69,6 +69,17 @@ This is a research and engineering prototype. It is not production-ready and not
 
 Two compiled graphs exist in one process: a plain ReAct graph for `/chat`, and a graph with the human-in-the-loop safety layer for `/triage` and `/resume`. They share one model client and one audit store.
 
+### Why LangGraph
+
+The orchestration layer is a `StateGraph` rather than a hand-written loop because the properties this prototype cares about are *control-flow* properties, and a graph makes them explicit and testable:
+
+- **The safety path is structural.** `plan → policy_gate → human_approval` is wired into the graph, so the model cannot skip, reorder, or conditionally bypass it.
+- **Tool execution is a named boundary.** The `agent` node's output is routed by tool name into a single `tools` node; model-produced code is never evaluated.
+- **Pausing is a state, not a blocking call.** `interrupt()` suspends the graph at `human_approval`; a later request resumes it with a decision.
+- **Control flow is testable offline.** The graph is compiled from plain functions, so nodes and edges are asserted with a scripted fake model and no network.
+
+LangGraph supplies the state machine and the interrupt/resume mechanism — **not** the security properties above, which come from the graph's shape and from the policy gate being a node rather than a tool.
+
 ## Audit Query API (read-only)
 
 The append-only audit trail is also readable over HTTP through a **read-only audit query endpoint**. It is an additional read interface over the existing authoritative SQLite audit store — not a second audit system, not a second audit writer, and not an authorization mechanism.
@@ -145,11 +156,11 @@ Known limitation: this prototype has no authentication. The audit `actor` field 
 
 ## Evaluation
 
-Evaluation has two independent parts.
+Evaluation has two independent parts, and they answer different questions. Part A is deterministic, offline, and reproducible from the repository alone: it checks whether the architecture behaves as designed. Part B is a bounded, one-off observation with a real provider: it records what the system did under one specific configuration. Neither part is a security proof.
 
-**Offline architecture harness.** Three baselines — a rule-only pipeline, a ReAct graph with no policy gate, and the full agent with policy enforcement and HITL — are run over a fixed, hand-authored case set. Metrics are reported in five separate classes and are deliberately never combined into a single "agent score", because a weighted total would fold implementation self-consistency into correctness. The oracle recomputes evidence from raw records without importing the rule modules it is checking; case expectations carry provenance; and golden-set and dataset digests are emitted with every result so that it can be re-verified independently. Metamorphic relations are asserted without referencing any weight constant, and capabilities with no independent oracle are recorded as not-evaluable rather than scored zero.
+**(A) Offline architecture harness — deterministic, no network.** Three baselines — a rule-only pipeline, a ReAct graph with no policy gate, and the full agent with policy enforcement and HITL — are run over a fixed, hand-authored case set. Metrics are reported in five separate classes and are deliberately never combined into a single "agent score", because a weighted total would fold implementation self-consistency into correctness. The oracle recomputes evidence from raw records without importing the rule modules it is checking; case expectations carry provenance; and golden-set and dataset digests are emitted with every result so that it can be re-verified independently. Metamorphic relations are asserted without referencing any weight constant, and capabilities with no independent oracle are recorded as not-evaluable rather than scored zero.
 
-**Real-provider pilot.** Evaluated the agent architecture with a controlled 108-run real-provider pilot and audited tool-use, injection-exposure, invocation, and architecture-invariant behavior.
+**(B) Real-provider pilot — bounded, one configuration.** Evaluated the agent architecture with a controlled 108-run real-provider pilot and audited tool-use, injection-exposure, invocation, and architecture-invariant behavior.
 
 Scope: 108 runs, 8 tasks, 4 parallel baseline configurations, n = 3 repetitions per cell, 197 logical LLM invocations; a single provider and endpoint configuration, requested model `deepseek-flash`, single execution window. The baselines are parallel experimental conditions, not a ranking. Token accounting is descriptive only; monetary cost is not evaluated; provider-side HTTP attempt counts are unobservable and recorded as unknown rather than zero.
 
@@ -160,6 +171,24 @@ Architecture invariants — plan digest, policy outcome, and audit event sequenc
 Pilot artifacts are anchored by artifact-level SHA256 digests; 34/34 data-quality checks passed; a secret scan over the final artifacts returned zero hits.
 
 Nothing in this evaluation establishes that the system is secure, and no configuration is claimed to be the best.
+
+## Known Limitations
+
+This is a research and engineering prototype. The limitations below are properties of the current implementation, not a backlog of things that were overlooked.
+
+**Not production-ready.** There is no production hardening: no authentication or authorization layer on the HTTP API, no non-repudiation for the audit `actor` field, and no operational guarantees. `GET /audit/events` being *read-only* is not the same as *protected*.
+
+**Single-service, single-instance persistence.** The application is one API process backed by a local SQLite file. There is no external database, no cache, and no coordination between replicas. Nothing here is claimed to scale horizontally, and the Compose topology is deliberately one service with one named volume.
+
+**The MCP interface is local only.** It is a local stdio server with no remote transport and no authentication server; the identity boundary is the host process that spawns it.
+
+**The agent path requires a provider.** `/chat`, `/triage`, and `/resume` run through the model, and there is no offline mode for that path. The deterministic and read-only parts of the system — tools, policy, audit, MCP — can be exercised without a provider; the agent cannot.
+
+**Evaluation scope is narrow.** The real-provider pilot is 108 runs over 8 tasks, one provider and endpoint configuration, one requested model, one execution window, and a single matched injection task with a denominator of 6. It is a bounded observation, not a general result.
+
+**Invariant checks are regression guards, not a security score.** Plan digest, policy outcome, and audit event sequence were invariant across the pilot; they hold by construction in the current design and are reported as architecture regression invariants, not as a measure of safety.
+
+**Nothing here establishes that the system is secure.** No configuration is claimed to be best, and no claim is made about prompt-injection resistance in general or about any provider or model family.
 
 ## Quick Start
 
@@ -204,6 +233,48 @@ uv run pytest -q
 ```
 
 CI runs this same offline suite on GitHub-hosted Ubuntu: the workflow installs the locked `uv` environment and runs the offline pytest suite. The exact Phase 9.3-F implementation commit (`dd295c8`) passed 1,463 tests in the observed GitHub-hosted Ubuntu 24.04 CI environment — an observation of that run, not a claim of universal Linux compatibility.
+
+### Demo Walkthrough
+
+There are two independent ways to see the system work, and they have different prerequisites.
+
+**(A) Provider-backed agent walkthrough.** `/chat`, `/triage`, and `/resume` all run through the LangGraph agent, so all three require a configured provider (`LLM_MODEL` / `LLM_BASE_URL` / `LLM_API_KEY` in `.env`); the application refuses to start without them. With valid credentials, a representative end-to-end run is:
+
+```bash
+uv run python scripts/seed_logs.py             # 1. generate the demo telemetry
+uv run python scripts/seed_threat_intel.py     #    and the IOC records
+uv run uvicorn app.api.main:app --reload       # 2. start the API
+
+# 3. ask the agent a question — the model selects tools, the answer is prose
+curl -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "帮我分析一下最近服务器有没有受到攻击"}'
+
+# 4. start a triage run — a high-impact plan pauses for approval
+curl -X POST http://127.0.0.1:8000/triage \
+  -H "Content-Type: application/json" \
+  -d '{"indicator": "203.0.113.66", "event_type": "login_failed"}'
+
+# 5. resume the paused run with a decision (thread_id comes from /triage)
+curl -X POST http://127.0.0.1:8000/resume \
+  -H "Content-Type: application/json" \
+  -d '{"thread_id": "<from /triage>", "status": "approved", "operator": "analyst-1"}'
+
+# 6. read the audit trail the run produced
+curl "http://127.0.0.1:8000/audit/events?thread_id=<from /triage>&limit=50&order=desc"
+```
+
+What is **stable** in this walkthrough: the four routes and their contracts, that `/triage` either ends in a policy decision or pauses for approval, that resuming requires a decision plus the server-issued handle, and that each step appends audit events. What is **not** stable: the model's exact wording, and whether a given indicator trips the approval gate — the risk level and the approval requirement are produced by the rule engine, not by the model.
+
+**(B) Offline, provider-free capability demo.** The MCP interface is a separate, deterministic read-only surface over the same tool functions. It needs no provider credentials, because it never calls a model:
+
+```bash
+uv run python -m app.mcp.server     # local stdio MCP server
+```
+
+It publishes three read-only tools — `query_security_logs`, `query_threat_intel`, `analyze_risk` — over local stdio. This demonstrates the deterministic tool layer (structured event query, exact-match IOC lookup, rule-based risk scoring), and nothing else.
+
+This is **not** an offline substitute for the agent path. It does not exercise the model, the ReAct loop, the plan stage, the policy gate, the human-approval interrupt, or the audit lifecycle — none of those are reachable without a provider.
 
 ### Running with Docker Compose
 
