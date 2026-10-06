@@ -131,7 +131,7 @@ LLM 只能产生：
 
 > 注：上图与 §7 目录描述的是**终态蓝图**。截至 2026-09-19 的实际实现：编排层为单文件 `app/core/graph.py`（未创建 `app/graph/` 包）；`app/security/` 已创建（policy / audit / store）；`app/rag/`、`app/knowledge/`、`app/evaluation/`、`docker/` 尚未创建。MCP 接口已于 Phase 9.3-E 落地为 `app/mcp/`（见 §8 Flow C）。
 >
-> **路由命名的实现偏离**：蓝图写 `/chat /approve /audit`，实际实现为 `/chat /triage /resume`。审批不是独立端点——审批决定（`status` + `operator`）是 `/resume` 的请求载荷，与恢复句柄 `thread_id` 一起构成一次完整的恢复请求，拆成两个端点会引入"审批了但没恢复"的中间态。审计目前**没有读接口**（`/audit` 未实现），审计写入走 `app/security/store.py`。
+> **路由命名的实现偏离**：蓝图写 `/chat /approve /audit`，实际实现为 `/chat /triage /resume`。审批不是独立端点——审批决定（`status` + `operator`）是 `/resume` 的请求载荷，与恢复句柄 `thread_id` 一起构成一次完整的恢复请求，拆成两个端点会引入"审批了但没恢复"的中间态。审计写入走 `app/security/store.py`；审计**读接口**已于 Phase 9.3-F 落地为只读的 `GET /audit/events`（蓝图里的 `/audit` 这个具体路径名未采用，见 §8 Flow D）。
 
 ### 为什么是单进程 + FastAPI + SQLite + ChromaDB？
 
@@ -236,7 +236,7 @@ cybersec-agent/
 │   ├── tools/      # query_logs / query_threat_intel / risk_analyzer / response_planner
 │   ├── security/   # policy / audit / store（Phase 8）
 │   ├── mcp/        # Phase 9.3-E：只读 MCP 适配器（tools.py）+ 本地 stdio 入口（server.py）
-│   └── api/        # main（/chat /triage /resume）+ schemas
+│   └── api/        # main（/chat /triage /resume + 只读 /audit/events）+ schemas
 ├── data/           # security_events.jsonl / threat_intel.jsonl（**仅 JSONL**）
 ├── scripts/        # seed_logs.py / seed_threat_intel.py
 ├── tests/          # test_api / test_core / test_schemas / test_security / test_tools / test_mcp
@@ -306,6 +306,42 @@ Flow C 的存在意义：Function Calling 是**进程内、厂商私有**的工�
 - **不在 MCP 暴露面内**：响应规划、审批变更、策略变更、checkpoint 变更、审计变更、provider/model 调用。
 
 传输面只有**本地 stdio**：不实现 HTTP / SSE / Streamable HTTP 端点，也不做 MCP 鉴权服务器——身份由拉起该进程的宿主承担。
+
+### Flow D — 审计只读查询（Phase 9.3-F 落地）
+
+```
+HTTP Client
+  → GET /audit/events?thread_id=...&event=...&limit=...&order=...
+  → FastAPI 组合根（app/api/main.py：_require_store → app.state.audit_store）
+  → 既有 SqliteAuditStore.list_audit（参数绑定 SELECT，无写入）
+  → 既有 audit_logs 记录（原样读回并重新过 Pydantic 校验）
+```
+
+**审计写路径 vs 审计读路径（两条路径必须分开看）**：
+
+| | 写路径（权威，Phase 8.2 起，**不变**） | 读路径（Phase 9.3-F 新增） |
+|---|---|---|
+| 入口 | `plan` / `policy_gate` / `human_approval` 节点 + `TriageService` 超时清理 | `GET /audit/events` |
+| 方法 | `append_audit` / `record_incident` / `record_action_request` | `list_audit` |
+| SQL | 纯 `INSERT` | 参数绑定 `SELECT` |
+| 性质 | 产生权威事实 | **只观测**，不产生任何事实 |
+
+写路径仍是唯一的事实来源，本阶段**没有**新增写入点；读路径不写审计（读审计不会再写一条审计），也不触碰 policy / approval / HITL / checkpoint。
+
+支持的 HTTP 查询维度（**仅此四维**）：
+
+- `thread_id`：等值过滤（图执行线程）；
+- `event`：等值过滤，取值限于 6 个封闭审计事件之一（非法值 → 422）；
+- `limit`：有界页大小，1–200（默认 50），LIMIT 在 **SQL 层**施加（不拉全表再切片）；
+- `order`：`desc`（默认）/ `asc`，方向由固定程序逻辑选择，顺序确定（`(ts, rowid)`）。
+
+**刻意不暴露**的查询维度：`incident_id`（图写入行的该列恒为 `NULL`，做成过滤器会得到"看似可用、实则恒空"的接口）、`request_id` / `approval_id`（**未持久化**，库里没有对应列）、`offset` / `cursor`（无游标分页）。**没有任何**原始 SQL 入口，也不存在由客户端控制的列名或 ORDER BY 片段。
+
+**路径边界**：请求契约里没有路径参数 —— 客户端**不能**选择审计库路径；服务端继续使用受信任的配置存储（`Settings.audit_db_path`，由组合根在 lifespan 注入）。未声明的 path-like 查询参数会被 FastAPI **忽略**（不是拒绝），因此无法把读取重定向到别的库。
+
+**认证边界**：本端点是**只读**的，**不等于**已认证 / 已授权 —— 本原型仍**没有**生产级认证 / 授权层，端点不是 "authorized endpoint"，也不应被描述为"仅审计员可见"。`actor` 字段仍只是调用方自称的字符串（见 §11.4 已知局限）。
+
+append-only 语义不受本端点影响：它**不能** UPDATE / DELETE / 清空审计，**不能**批准 / 拒绝 / resume，**不能**执行工具或调用 provider/model（见 §11.3）。
 
 ## 9. LangGraph Workflow 设计
 
@@ -693,7 +729,7 @@ OpenAI-compatible LLM
 - **Response Planner 采用 Tool 而非 Node（Phase 7）→ 节点化在 Phase 8 落地**：§9.1 蓝图把它画成 `response_plan` 节点，Phase 7 先实现为第 4 个工具（Node 需要从 messages 反解 `RiskAssessment` 或在 tools 节点特判风险工具，两者都会侵蚀 graph 的通用性）。Phase 8.3 按计划把 `plan_response()` 提升为 `plan` 节点 —— **直接复用同一个纯函数，零返工**，验证了当初"等 HITL 一起做"的判断。
 - **incident 持久化延后（Phase 7 → Phase 8）**：见 §11.5。Phase 7 不引入数据库，`ResponsePlan` 仅作为结构化输出契约存在，随 ToolMessage 流转；落库与 HITL / checkpoint / audit lifecycle 一起在 Phase 8 实现（已完成）。
 - **MCP Server 与 RAG 顺延（Phase 5 / 6）**：§12 把 Phase 5 定为"威胁情报 + RAG"、Phase 6 定为"MCP Server"，实际 Phase 5 只交付 IOC Exact Match（理由见上一条），Phase 6 则交付了提前实现的 Rule-based Risk Analyzer。结果是 **RAG 与 MCP Server 两项能力整体顺延**，`ChromaDB` 至今未引入。这不是"砍掉"，是排序调整：先做能用规则确定性验证的部分（风险分级 / 响应规划 / HITL 安全层），把依赖外部组件的能力留到后面。（后续进展：**MCP Server 已于 Phase 9.3-E 以只读形态落地为 `app/mcp/`**，`mcp` 依赖引入 2.3.0；RAG 仍顺延。）
-- **`/approve` 未实现，审批并入 `/resume`**：见 §5 注。审计也**没有读接口** —— `/audit` 未实现，审计写入走 store，读取目前只在测试里通过 `list_audit()` 进行。
+- **`/approve` 未实现，审批并入 `/resume`**：见 §5 注。审计写入走 store；审计**读接口**于 Phase 9.3-F 落地为只读的 `GET /audit/events`（复用既有 `list_audit()`，蓝图里的 `/audit` 路径名未采用，见 §8 Flow D）。
 
 ## 当前架构快照（2026-09-19）
 
@@ -754,7 +790,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - 跨进程 checkpoint 恢复——当前 `InMemorySaver` 只在进程存活期内有效（`langgraph-checkpoint-sqlite` 未安装）
 - `completed` / `allowed` 的 checkpoint 清理——9.1-A 的清理范围只有 `failed` 与 `timed_out`，这两个终态仍留在内存里
 - 身份认证 / 不可否认性——`actor` 只是自称字符串（Phase 10）
-- 审计读接口（`/audit`）——未实现
+- 审计读接口的**导出 / 聚合 / 游标分页**——只读查询端点 `GET /audit/events` 已于 Phase 9.3-F 落地（见 §8 Flow D）
 - Observability / Evaluation——Phase 9
 
 

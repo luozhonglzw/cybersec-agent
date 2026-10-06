@@ -16,7 +16,7 @@ This is a research and engineering prototype. It is not production-ready and not
                     HTTP client (curl / Swagger UI)
                                  │
                      FastAPI — app/api/main.py
-          POST /chat     POST /triage     POST /resume
+          POST /chat     POST /triage     POST /resume     GET /audit/events
                                  │
             ┌────────────────────┴────────────────────┐
             │                                         │
@@ -59,6 +59,7 @@ This is a research and engineering prototype. It is not production-ready and not
     audit.py    plan digest + audit-record construction     (pure)
     store.py    SQLite: incidents / action_requests / audit_logs
                 append-only, enforced by six database triggers
+                read path: list_audit() — bounded, ordered SELECT only
 
   Data
     data/security_events.jsonl    144 synthetic events   (generated)
@@ -67,6 +68,27 @@ This is a research and engineering prototype. It is not production-ready and not
 ```
 
 Two compiled graphs exist in one process: a plain ReAct graph for `/chat`, and a graph with the human-in-the-loop safety layer for `/triage` and `/resume`. They share one model client and one audit store.
+
+## Audit Query API (read-only)
+
+The append-only audit trail is also readable over HTTP through a **read-only audit query endpoint**. It is an additional read interface over the existing authoritative SQLite audit store — not a second audit system, not a second audit writer, and not an authorization mechanism.
+
+```bash
+curl "http://127.0.0.1:8000/audit/events?thread_id=<from /triage>&limit=50&order=desc"
+```
+
+| Query parameter | Meaning |
+| --- | --- |
+| `thread_id` | exact-match filter on the graph execution thread |
+| `event` | exact-match filter on one of the six closed audit event types |
+| `limit` | bounded page size, 1–200 (default 50) |
+| `order` | `desc` (default) or `asc` — deterministic `(ts, rowid)` ordering |
+
+The response is a bare JSON array of `AuditRecord` records — there is no envelope. Empty results and unknown `thread_id` values both return `200 []`.
+
+Boundary: the endpoint reads the **existing authoritative SQLite audit trail** through `SqliteAuditStore.list_audit` (parameterized `SELECT` only). It does not mutate audit state and does not alter policy, approval, HITL, or checkpoint state. The client cannot choose the audit database path — the server keeps using the configured trusted store (`Settings.audit_db_path`) — and no raw SQL is exposed.
+
+This endpoint is **read-only**, which is not the same as **authenticated**: as with the rest of this prototype, no production authentication or authorization layer is implemented, and this is not an "authorized" or "protected" API.
 
 ## MCP Interface (read-only)
 
@@ -104,7 +126,8 @@ Client-visible MCP schemas do not expose `data_path`, `logs_path`, or `intel_pat
 - **Offline evaluation harness** — three baselines, five separately reported metric classes, an independent evidence oracle, metamorphic relations, and no composite score.
 - **Real-provider evaluation harness** — a budget governor, a network-egress guard built on interpreter audit hooks, per-cell raw-record persistence with fsync, and frozen failure taxonomy.
 - **Read-only MCP interface** — three read-only tools (security-log query, threat-intel lookup, deterministic risk analysis) published over a local stdio MCP server, reusing the existing tool functions as an alternate read-only surface. Response planning is not published, and no remote transport or authentication server is implemented.
-- **Fully offline test suite** — 1,397 tests that require no network access and no API key.
+- **Read-only audit query API** — `GET /audit/events` exposes the existing append-only audit trail as a bounded, deterministically ordered read surface (`thread_id` / `event` / `limit` / `order`). It is a read path only: no audit writes, no policy / approval / HITL / checkpoint mutation, and no client control over the audit database path.
+- **Fully offline test suite** — 1,463 tests that require no network access and no API key.
 
 ## Security Design
 
@@ -180,7 +203,7 @@ Run the test suite — it needs no API key and makes no network calls:
 uv run pytest -q
 ```
 
-CI runs this same offline suite on GitHub-hosted Ubuntu: the workflow installs the locked `uv` environment and runs the offline pytest suite, and the latest accepted run passed 1,397 tests.
+CI runs this same offline suite on GitHub-hosted Ubuntu: the workflow installs the locked `uv` environment and runs the offline pytest suite. The exact Phase 9.3-F implementation commit (`dd295c8`) passed 1,463 tests in the observed GitHub-hosted Ubuntu 24.04 CI environment — an observation of that run, not a claim of universal Linux compatibility.
 
 ## Project Structure
 
@@ -196,7 +219,7 @@ app/
 data/           generated seed data and the runtime audit database (not committed)
 docs/           architecture design notes
 scripts/        deterministic seed-data generators
-tests/          1,397 offline tests
+tests/          1,463 offline tests
 ```
 
 ## Roadmap
@@ -215,5 +238,5 @@ tests/          1,397 offline tests
 | CI | Implemented |
 | MCP interoperability | Implemented |
 | Structured application logging | Implemented |
-| Audit read / query API | Planned |
+| Audit read / query API | Implemented |
 | Containerized deployment | Planned |
