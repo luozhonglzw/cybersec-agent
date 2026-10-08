@@ -897,7 +897,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
 - 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided` / `approval.timeout` —— 6 个全部有生产写入路径（`approval.timeout` 由 Phase 9.1-A 的惰性超时补齐）
 - **部署面（Phase 9.3-G）**：容器化只增加部署文件（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`），**不改变**上面任何一条运行时语义 —— 图结构、工具集、审计写入路径、HITL 行为全部不变。当前是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）。
-- 测试基线：默认离线运行 **1,517 passed / 311 deselected**（`pytest -q`）。被取消收集的 311 例是 `postgres` 标记的集成用例，需要真实 PostgreSQL，由独立的 CI job 显式运行（`pytest -m postgres`）。离线计数与 hermetic 性质来自**本地实测**；**上一次远端 CI 观测**是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`（GitHub-hosted Ubuntu 24.04，见 §14）—— v0.2.0 变更集的**远端 CI 尚未运行**，不得据本地结果声称远端通过。
+- 测试基线：默认离线运行 **1,517 passed / 311 deselected**（`pytest -q`）。被取消收集的 311 例是 `postgres` 标记的集成用例，需要真实 PostgreSQL，由独立的 CI job 显式运行（`pytest -m postgres`）。离线计数与 hermetic 性质来自**本地实测**。**远端 CI 已执行**：最新一次经验证的观测是 run `37737872748`（提交 `4334b14d`），其中 `test` = **1,517 passed / 311 deselected / 2 warnings**、`test-postgres` = **311 passed / 1,517 deselected / 7 warnings**，两个 job 均成功；更早的历史观测是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`（GitHub-hosted Ubuntu 24.04，见 §14）。以上均为**某一次特定 run 的记录**，不是对当前 HEAD 的长期保证 —— 最新结果以 Actions 页为准。
 
 ## 尚未实现（按 §12 Roadmap）
 
@@ -954,7 +954,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 | `tests/test_evaluation_llm/` | 真实 provider 评估 harness：budget / confinement / offline_guard / runner / pilot 等（全部离线，不触网） |
 | `tests/test_postgres/` | 真实 PostgreSQL 集成：连接 / schema / 迁移 / 角色与触发器 / 排序 / 存储契约（双后端参数化）/ 并发 / 应用集成（**默认不收集**，需要真实实例） |
 
-当前基线：默认运行 **1,517 passed / 311 deselected**（`pytest -q`，本地实测）；311 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行。上一次远端 CI 观测是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`，见 §14。
+当前基线：默认运行 **1,517 passed / 311 deselected**（`pytest -q`，本地实测）；311 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行。最新远端 CI 观测是 run `37737872748`（提交 `4334b14d`）：`test` = 1,517 passed / 311 deselected、`test-postgres` = 311 passed / 1,517 deselected，两个 job 均成功；更早的历史观测（Phase 9.3-G 文档提交 `b4f9d4e4` 的 1,463 passed）见 §14。
 
 ### 6. hermetic 约束（Phase 8.5 收口）
 
