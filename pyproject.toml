@@ -15,13 +15,28 @@ dependencies = [
     "pytest-asyncio>=1.4.0",
     "langgraph>=1.0.1",
     "mcp>=2.3.0",
+    # PostgreSQL 审计后端(v0.2.0-M1b)。`app/security/store_postgres.py` 属于
+    # `app` 包(见下方 hatch 配置),在**应用运行时** import psycopg 与
+    # psycopg_pool —— 因此它们必须是**运行时**依赖,不能只挂在 dev 组:
+    # 否则 `uv sync --locked --no-dev` 装出来的镜像一 import 该模块就 ImportError。
+    # 注意本阶段**未**接线:应用后端仍走 SQLite,组合根不构造 PostgresAuditStore。
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
 ]
 
 [dependency-groups]
 dev = [
+    { include-group = "migration" },
     "httpx>=0.27,<1",
     "pytest>=8.2,<9",
     "pytest-asyncio>=0.24,<2",
+]
+# 迁移专用依赖:只有 Alembic 迁移与迁移测试需要。
+# 应用运行时(app/**)刻意**不** import 它们;生产镜像走
+# `uv sync --locked --no-dev`,因此本组不会进入镜像。
+migration = [
+    "alembic>=1.13,<2",
+    "sqlalchemy>=2.0,<3",
 ]
 
 [build-system]
@@ -31,6 +46,14 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# 默认套件保持**离线**:`postgres` 标记的用例需要一个真实 PostgreSQL 实例
+# (由 opt-in 的 compose.postgres.yaml 提供),因此默认**取消收集**,而不是
+# 跳过 —— 取消收集不产生 skip 记录,CI 的无 Docker runner 也因此保持全绿。
+# 显式运行:uv run --no-sync pytest -m postgres -q
+addopts = "-m 'not postgres'"
+markers = [
+    "postgres: 需要真实 PostgreSQL 实例的集成用例(默认不收集)",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

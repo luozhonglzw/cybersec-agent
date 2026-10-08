@@ -42,3 +42,162 @@ jobs:
 
       - name: Run test suite
         run: uv run --no-sync pytest -q --basetemp="${{ runner.temp }}/pytest-${{ github.run_id }}-${{ github.run_attempt }}"
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL integration job (Phase v0.2.0-M1d).
+  #
+  # This job is ADDITIVE. The `test` job above is unchanged and still runs the
+  # offline suite on a runner with no database; `pyproject.toml` keeps
+  # `addopts = -m 'not postgres'` so the `postgres`-marked cases are not even
+  # collected there.
+  #
+  # The database is a throwaway service container: a fresh PostgreSQL 16 server
+  # on an ephemeral runner, reachable only from that runner's loopback. Nothing
+  # is persisted, and the container is destroyed with the job.
+  #
+  # Image provenance: `postgres:16-alpine` is the same image the opt-in local
+  # test service uses (`compose.postgres.yaml`), which is what the PostgreSQL
+  # integration suite was actually exercised against. It is referenced by tag,
+  # NOT by digest: this phase had no registry access, so no digest could be
+  # re-verified, and inventing one would be worse than naming the tag. See the
+  # M1d report, TASK 3, for that limitation stated in full.
+  # ---------------------------------------------------------------------------
+  test-postgres:
+    name: test-postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+
+      # Disposable CI-only credentials. These are NOT secrets and must never be
+      # reused: the server exists for the lifetime of this job, on an ephemeral
+      # runner, reachable only from loopback. They are deliberately DIFFERENT
+      # from the local development credentials in `compose.postgres.yaml`, and
+      # they come from no repository secret or environment.
+      PGPASSWORD: ci_bootstrap_local_only
+      PG_BOOTSTRAP_USER: ci_bootstrap
+      PG_DB: cybersec_ci
+      PG_MIGRATOR_PASSWORD: ci_migrator_local_only
+      PG_APP_PASSWORD: ci_app_local_only
+
+      # The integration suite reads these three DSNs (see
+      # `tests/test_postgres/conftest.py`). Their defaults point at the local
+      # opt-in service on port 55432; here they are overridden to point at the
+      # service container on port 5432. The migration DSN
+      # (`CYBERSEC_PG_MIGRATION_DSN`) is derived from the migrator DSN by the
+      # suite's own autouse fixture, so it is not set here.
+      CYBERSEC_TEST_PG_DSN: postgresql://ci_bootstrap:ci_bootstrap_local_only@127.0.0.1:5432/cybersec_ci
+      CYBERSEC_TEST_PG_APP_DSN: postgresql://cybersec_app:ci_app_local_only@127.0.0.1:5432/cybersec_ci
+      CYBERSEC_TEST_PG_MIGRATOR_DSN: postgresql://cybersec_migrator:ci_migrator_local_only@127.0.0.1:5432/cybersec_ci
+
+      # Floor for the "tests must not silently be deselected" guard below. It is
+      # a floor, not the exact count: adding or removing a handful of cases must
+      # not break CI, while mass deselection must.
+      PG_TEST_MIN_COLLECTED: "250"
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci_bootstrap
+          POSTGRES_PASSWORD: ci_bootstrap_local_only
+          POSTGRES_DB: cybersec_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci_bootstrap -d cybersec_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Provision Python (from .python-version)
+        run: uv python install
+
+      - name: Install dependencies (locked)
+        run: uv sync --locked
+
+      # `psql` is the canonical tool for applying `scripts/pg/bootstrap_roles.sql`
+      # (the file is written for psql). It is installed explicitly rather than
+      # assumed to be preinstalled on the runner image, so this job does not
+      # depend on unverified image contents.
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      # A missing or unreachable database must fail the job. It must never be
+      # skipped, and it must never be reported as a pass. The suite itself takes
+      # the same line: `tests/test_postgres/conftest.py` raises on any
+      # connectivity, role, or migration failure and contains no `skip`.
+      - name: Wait for PostgreSQL and assert reachability
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if psql -h 127.0.0.1 -p 5432 -U "$PG_BOOTSTRAP_USER" -d "$PG_DB" \
+                 -v ON_ERROR_STOP=1 -tAc 'select version();'; then
+              exit 0
+            fi
+            echo "attempt ${attempt}: PostgreSQL is not reachable yet"
+            sleep 2
+          done
+          echo "PostgreSQL did not become reachable within 60s" >&2
+          exit 1
+
+      # Creates the two separated roles used by the suite:
+      #   cybersec_migrator — migration-owner (owns the schema objects)
+      #   cybersec_app      — application-runtime (SELECT / INSERT only)
+      # The bootstrap script is idempotent. The two role passwords are supplied
+      # through `PGOPTIONS` GUCs, which is the script's documented mechanism for
+      # overriding its built-in local-development defaults.
+      - name: Bootstrap database roles
+        run: |
+          PGOPTIONS="-c cybersec.migrator_password=$PG_MIGRATOR_PASSWORD -c cybersec.app_password=$PG_APP_PASSWORD" \
+            psql -h 127.0.0.1 -p 5432 -U "$PG_BOOTSTRAP_USER" -d "$PG_DB" \
+              -v ON_ERROR_STOP=1 -f scripts/pg/bootstrap_roles.sql
+
+      # A green PostgreSQL job must mean the PostgreSQL cases actually ran.
+      # If `-m postgres` were ever neutralised (for example by the ini
+      # `addopts`), collection would collapse and this step fails first, with a
+      # clearer message than the later "no tests ran" exit code 5.
+      - name: Guard — the postgres marker must select tests
+        run: |
+          set -euo pipefail
+          uv run --no-sync pytest -m postgres --collect-only -q > "$RUNNER_TEMP/pg-collected.txt"
+          tail -n 5 "$RUNNER_TEMP/pg-collected.txt"
+          collected="$(sed -n 's#^\([0-9][0-9]*\)\(/[0-9][0-9]*\)\? tests collected.*#\1#p' "$RUNNER_TEMP/pg-collected.txt" | tail -n 1)"
+          if [ -z "$collected" ]; then
+            echo "Could not parse the pytest collection summary." >&2
+            exit 1
+          fi
+          echo "collected ${collected} postgres test(s); floor is ${PG_TEST_MIN_COLLECTED}"
+          if [ "$collected" -lt "$PG_TEST_MIN_COLLECTED" ]; then
+            echo "Only ${collected} postgres test(s) were collected." >&2
+            exit 1
+          fi
+
+      # `-m postgres` on the command line overrides the ini
+      # `addopts = -m 'not postgres'` (measured: for pytest's `-m`, the last
+      # occurrence wins). If that override ever stopped working, collection
+      # would be zero and pytest would exit 5 — a failure, not a pass.
+      #
+      # The `skipped` check encodes the Gate-F rule: a skipped integration test
+      # is not a passing integration test, so any skip in this job is a failure.
+      - name: Run PostgreSQL integration tests
+        run: |
+          set -euo pipefail
+          uv run --no-sync pytest -m postgres -q \
+            --basetemp="${{ runner.temp }}/pytest-pg-${{ github.run_id }}-${{ github.run_attempt }}" \
+            | tee "$RUNNER_TEMP/pg-pytest.txt"
+          if grep -Eq '[0-9]+ skipped' "$RUNNER_TEMP/pg-pytest.txt"; then
+            echo "The PostgreSQL suite reported skipped tests; a skip is not a pass." >&2
+            exit 1
+          fi

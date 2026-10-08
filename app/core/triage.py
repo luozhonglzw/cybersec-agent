@@ -110,7 +110,7 @@ from app.core.graph import PlanFailedError
 from app.schemas.approval import ApprovalStatus, TriageOutcome, utc_now
 from app.schemas.incident import Incident
 from app.security.audit import build_audit_record
-from app.security.store import SqliteAuditStore
+from app.security.store_protocol import AuditStore
 
 logger = structlog.get_logger(__name__)
 
@@ -249,7 +249,7 @@ class TriageService:
         graph: create_agent_graph(..., hitl=...) 编译出的图。刻意不写死
                CompiledStateGraph 的内部导入路径(langgraph 版本间会变),
                本模块只用到它的两个公开入口 ainvoke / aget_state。
-        store: SqliteAuditStore,用于沉淀 incident / action_requests
+        store: AuditStore(契约),用于沉淀 incident / action_requests
                以及 resume 前的校验门查询。
         approval_timeout: 审批窗口(keyword-only,默认 APPROVAL_TIMEOUT)。
                只有测试需要覆盖它(用 timedelta(0) 让 pending 立即过期);
@@ -268,7 +268,7 @@ class TriageService:
     def __init__(
         self,
         graph,
-        store: SqliteAuditStore,
+        store: AuditStore,
         *,
         approval_timeout: timedelta = APPROVAL_TIMEOUT,
     ) -> None:

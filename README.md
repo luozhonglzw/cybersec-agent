@@ -55,16 +55,21 @@ This is a research and engineering prototype. It is not production-ready and not
     plan_response          rule-based response planning     (pure function)
 
   Security layer — app/security/  (cross-cutting)
-    policy.py   evaluate_policy(ResponsePlan) → allow | require_approval
-    audit.py    plan digest + audit-record construction     (pure)
-    store.py    SQLite: incidents / action_requests / audit_logs
-                append-only, enforced by six database triggers
-                read path: list_audit() — bounded, ordered SELECT only
+    policy.py           evaluate_policy(ResponsePlan) → allow | require_approval
+    audit.py            plan digest + audit-record construction     (pure)
+    store_protocol.py   AuditStore — the eight-method contract that the graph,
+                        the triage service and the API depend on
+    store.py            SQLite backend (default): incidents / action_requests /
+                        audit_logs — append-only, enforced by six database triggers
+    store_postgres.py   PostgreSQL backend (explicit opt-in): same contract, same
+                        append-only controls, nine database triggers
+                        read path: list_audit() — bounded, ordered SELECT only
 
   Data
     data/security_events.jsonl    144 synthetic events   (generated)
     data/threat_intel.jsonl        29 IOC records        (generated)
-    data/audit.db                 created at runtime
+    data/audit.db                 created at runtime     (default SQLite backend)
+    PostgreSQL                    opt-in; see "PostgreSQL audit backend" below
 ```
 
 Two compiled graphs exist in one process: a plain ReAct graph for `/chat`, and a graph with the human-in-the-loop safety layer for `/triage` and `/resume`. They share one model client and one audit store.
@@ -82,7 +87,7 @@ LangGraph supplies the state machine and the interrupt/resume mechanism — **no
 
 ## Audit Query API (read-only)
 
-The append-only audit trail is also readable over HTTP through a **read-only audit query endpoint**. It is an additional read interface over the existing authoritative SQLite audit store — not a second audit system, not a second audit writer, and not an authorization mechanism.
+The append-only audit trail is also readable over HTTP through a **read-only audit query endpoint**. It is an additional read interface over the existing authoritative audit store — not a second audit system, not a second audit writer, and not an authorization mechanism.
 
 ```bash
 curl "http://127.0.0.1:8000/audit/events?thread_id=<from /triage>&limit=50&order=desc"
@@ -93,13 +98,85 @@ curl "http://127.0.0.1:8000/audit/events?thread_id=<from /triage>&limit=50&order
 | `thread_id` | exact-match filter on the graph execution thread |
 | `event` | exact-match filter on one of the six closed audit event types |
 | `limit` | bounded page size, 1–200 (default 50) |
-| `order` | `desc` (default) or `asc` — deterministic `(ts, rowid)` ordering |
+| `order` | `desc` (default) or `asc` — deterministic ordering by `ts`, with a backend-provided tiebreaker (`rowid` on SQLite, `seq` on PostgreSQL) |
 
 The response is a bare JSON array of `AuditRecord` records — there is no envelope. Empty results and unknown `thread_id` values both return `200 []`.
 
-Boundary: the endpoint reads the **existing authoritative SQLite audit trail** through `SqliteAuditStore.list_audit` (parameterized `SELECT` only). It does not mutate audit state and does not alter policy, approval, HITL, or checkpoint state. The client cannot choose the audit database path — the server keeps using the configured trusted store (`Settings.audit_db_path`) — and no raw SQL is exposed.
+Boundary: the endpoint reads the **existing authoritative audit trail** through the configured `AuditStore`'s `list_audit` (parameterized `SELECT` only) — the same contract whether the backend is the default SQLite file or the opt-in PostgreSQL one. It does not mutate audit state and does not alter policy, approval, HITL, or checkpoint state. The client cannot choose the audit database path or connection string — the server keeps using the configured trusted store from settings — and no raw SQL is exposed.
 
 This endpoint is **read-only**, which is not the same as **authenticated**: as with the rest of this prototype, no production authentication or authorization layer is implemented, and this is not an "authorized" or "protected" API.
+
+## PostgreSQL audit backend (opt-in)
+
+SQLite remains the **default** audit backend. Setting no `AUDIT_*` variable gives the v0.1.0 behaviour exactly: a local SQLite file at `data/audit.db`.
+
+PostgreSQL is an **explicit opt-in**. It is selected in one place — the application composition root — and nowhere else. No graph node, tool, or route branches on the backend; they all depend on the same `AuditStore` contract.
+
+| Variable | Meaning |
+| --- | --- |
+| `AUDIT_BACKEND` | `sqlite` (default) or `postgres`. A closed set: an empty value fails startup validation. |
+| `AUDIT_POSTGRES_DSN` | libpq connection string. Required when `AUDIT_BACKEND=postgres`. Read as a secret (`SecretStr`), so it never appears in a `repr`, a log line, or an error message. |
+| `AUDIT_DB_PATH` | Optional; SQLite backend only. Defaults to `data/audit.db`. |
+
+**No automatic fallback, and no dual-write.** If `AUDIT_BACKEND=postgres` and the DSN is missing or blank, the application refuses to start — it never quietly writes to SQLite instead. There is exactly one audit store per process, and nothing is written to two places.
+
+**If PostgreSQL is unavailable.** The store connects lazily (constructing it performs no I/O), so an unreachable server surfaces at the first audit operation rather than at process start. From there the two paths behave differently — this is the current behaviour, not a design goal:
+
+| Path | Current behaviour |
+| --- | --- |
+| Audit **write** (graph nodes, triage service) | The persistence failure propagates unhandled → HTTP **500**. |
+| Audit **read** (`GET /audit/events`) | Mapped to a narrow internal type → HTTP **503**, body `{"detail": "audit store unavailable"}`. |
+
+That asymmetry is a known limitation, not a guarantee; it is recorded under [Known Limitations](#known-limitations).
+
+### Running the PostgreSQL integration tests
+
+The repository ships an opt-in, isolated test service (`compose.postgres.yaml`) that shares no namespace, no volume, and no port with the default `compose.yaml` topology. `compose.yaml` itself is not modified.
+
+```bash
+# 1. start the disposable test server (loopback only, restart policy "no")
+docker compose -f compose.postgres.yaml up -d --wait
+
+# 2. provision the two separated roles
+#    (a FRESH data directory runs this automatically; an existing volume does not)
+docker exec -i cybersec-pg-test-postgres-1 psql -v ON_ERROR_STOP=1 \
+  -U cybersec_test -d cybersec_test -f - < scripts/pg/bootstrap_roles.sql
+
+# 3. apply the schema as the migration owner
+CYBERSEC_PG_MIGRATION_DSN="postgresql://cybersec_migrator:cybersec_migrator_local_only@127.0.0.1:55432/cybersec_test" \
+  uv run --no-sync alembic upgrade head
+
+# 4. run the integration suite (explicitly — the default run deselects it)
+uv run --no-sync pytest -m postgres -q
+
+# 5. stop the service WITHOUT deleting the data volume
+docker compose -f compose.postgres.yaml down
+```
+
+Two roles, deliberately separated:
+
+| Role | Purpose | Privileges |
+| --- | --- | --- |
+| `cybersec_migrator` | migration owner; owns every schema object and runs Alembic | `CREATE` / `USAGE` on `public` |
+| `cybersec_app` | application runtime; the only role the running app may use | `SELECT` / `INSERT` only — no `UPDATE`, `DELETE`, `TRUNCATE`, no DDL |
+
+The credentials in `compose.postgres.yaml`, `scripts/pg/bootstrap_roles.sql`, and the CI workflow are **disposable local/CI test credentials**. They are not secrets, must never be reused, and must never front real data.
+
+`docker compose -f compose.postgres.yaml down` stops the service and keeps the `pg-test-data` volume; only `down -v` deletes it. That is also the only supported way to reach a genuinely empty database, because the tables are append-only at the database level.
+
+The offline suite does not collect these tests (`addopts = -m 'not postgres'` in `pyproject.toml`), so a machine without Docker still runs the whole default suite green. CI runs them in a separate job against a throwaway PostgreSQL service container.
+
+### Scope and limits
+
+- **Audit, incident, and action-request data only.** The PostgreSQL backend stores the same three tables as the SQLite backend. It does **not** store LangGraph checkpoints — checkpointing still uses `InMemorySaver`, which is in-process memory.
+- **HITL state does not survive a process restart.** Because checkpoints are in-process, a run paused at `human_approval` cannot be resumed by another process, and a restart loses the paused run. Moving audit data to PostgreSQL does not change this.
+- **Append-only is a database control, not tamper-proofing.** The triggers stop `UPDATE`, `DELETE`, and `TRUNCATE` issued through the application and through the runtime role. They do not stop a privileged administrator, a superuser, a table owner, or a forged `INSERT` of a plausible-looking record. The trail is append-only by construction, not notarised.
+- **Not production-ready.** No authentication or authorization layer, no high-availability or backup story, no operational guarantees. This is an opt-in persistence backend for a prototype.
+- **No performance or capacity claim.** The backend was exercised on one machine against one throwaway server. No throughput, latency, or scaling claim is made, and none should be inferred from it.
+- **No exactly-once claim.** Audit writes are not deduplicated across processes; a retry can append a second record.
+- **`/chat` is not the gated workflow.** `/chat` runs the ReAct graph only. The plan → policy gate → human-approval path exists on `/triage` and `/resume`. Switching the audit backend changes neither.
+
+The design rationale and the exact boundary of these controls are in [docs/architecture.md](docs/architecture.md) §11.6.
 
 ## MCP Interface (read-only)
 
@@ -133,12 +210,13 @@ Client-visible MCP schemas do not expose `data_path`, `logs_path`, or `intel_pat
 - **Risk-aware response planning** — a pure rule engine that maps a risk assessment to a closed vocabulary of actions, each carrying its own approval requirement and reversibility flag. It consumes the assessment rather than re-deriving it.
 - **Policy enforcement** — a rule-based policy gate implemented as a mandatory graph node rather than a tool, so the decision cannot be skipped.
 - **Human-in-the-loop approval** — a genuine graph interrupt with a server-issued thread handle, a resume validation gate that rejects unknown, completed, expired, or lost threads, and a lazy approval-timeout lifecycle.
-- **Append-only audit trail** — three SQLite tables, six anti-mutation triggers, a closed six-event vocabulary that includes failure events, and approval state derived from the audit stream rather than stored as a mutable column.
+- **Append-only audit trail** — three tables, six anti-mutation triggers on SQLite (nine on PostgreSQL, which adds `TRUNCATE` coverage), a closed six-event vocabulary that includes failure events, and approval state derived from the audit stream rather than stored as a mutable column.
 - **Offline evaluation harness** — three baselines, five separately reported metric classes, an independent evidence oracle, metamorphic relations, and no composite score.
 - **Real-provider evaluation harness** — a budget governor, a network-egress guard built on interpreter audit hooks, per-cell raw-record persistence with fsync, and frozen failure taxonomy.
 - **Read-only MCP interface** — three read-only tools (security-log query, threat-intel lookup, deterministic risk analysis) published over a local stdio MCP server, reusing the existing tool functions as an alternate read-only surface. Response planning is not published, and no remote transport or authentication server is implemented.
 - **Read-only audit query API** — `GET /audit/events` exposes the existing append-only audit trail as a bounded, deterministically ordered read surface (`thread_id` / `event` / `limit` / `order`). It is a read path only: no audit writes, no policy / approval / HITL / checkpoint mutation, and no client control over the audit database path.
-- **Fully offline test suite** — 1,463 tests that require no network access and no API key.
+- **Optional PostgreSQL audit backend** — an explicit opt-in persistence backend behind the same `AuditStore` contract, with a separated migration-owner role and a runtime role limited to `SELECT` / `INSERT`. SQLite stays the default, there is no automatic fallback and no dual-write, and the PostgreSQL backend stores audit / incident / action-request data only — not LangGraph checkpoints.
+- **Fully offline test suite** — 1,517 tests that require no network access and no API key, plus a PostgreSQL integration suite (311 cases) that the default run deselects and a separate CI job runs against a throwaway server.
 
 ## Security Design
 
@@ -178,7 +256,15 @@ This is a research and engineering prototype. The limitations below are properti
 
 **Not production-ready.** There is no production hardening: no authentication or authorization layer on the HTTP API, no non-repudiation for the audit `actor` field, and no operational guarantees. `GET /audit/events` being *read-only* is not the same as *protected*.
 
-**Single-service, single-instance persistence.** The application is one API process backed by a local SQLite file. There is no external database, no cache, and no coordination between replicas. Nothing here is claimed to scale horizontally, and the Compose topology is deliberately one service with one named volume.
+**Single-service, single-instance persistence.** The application is one API process. By default it is backed by a local SQLite file; a PostgreSQL audit backend can be enabled explicitly, but it is optional and the deployment remains a single instance with no cache and no coordination between replicas. Nothing here is claimed to scale horizontally, and the Compose topology is deliberately one service with one named volume.
+
+**Audit persistence is pluggable; checkpointing is not.** Choosing the PostgreSQL backend moves audit, incident, and action-request rows to PostgreSQL. It does **not** move LangGraph checkpoints: those still live in `InMemorySaver`, in process memory. A run paused at `human_approval` therefore cannot be resumed by another process, and a restart loses the paused run. This is unchanged by the backend choice.
+
+**Append-only is enforced by the database, but it is not tamper-proofing.** The anti-mutation triggers stop `UPDATE`, `DELETE`, and `TRUNCATE` through the application and through the runtime role. They do not stop a privileged administrator, a superuser, a table owner, or a forged `INSERT` that looks plausible. Pending-approval state is derived rather than stored, which removes one class of silent rewrite, but the trail is append-only by construction — not notarised.
+
+**Audit write and audit read fail differently when the database is unavailable.** With the PostgreSQL backend, a failed audit **write** surfaces as HTTP 500, while a failed audit **read** (`GET /audit/events`) is mapped to HTTP 503. That asymmetry is the current behaviour, documented rather than promised.
+
+**No exactly-once audit write.** Writes are not deduplicated across processes; a retry can append a second record. A repeated primary key fails loudly, but a retry that mints a new identifier does not.
 
 **The MCP interface is local only.** It is a local stdio server with no remote transport and no authentication server; the identity boundary is the host process that spawns it.
 
@@ -205,7 +291,7 @@ uv run python scripts/seed_threat_intel.py # → data/threat_intel.jsonl    (29 
 uv run uvicorn app.api.main:app --reload
 ```
 
-The seed files are generated rather than committed, and the application validates its configuration at startup — it will refuse to boot without a model name and API key. `data/audit.db` is created on first run.
+The seed files are generated rather than committed, and the application validates its configuration at startup — it will refuse to boot without a model name and API key. `data/audit.db` is created on first run. No `AUDIT_*` variable is needed for this default path; to opt into PostgreSQL instead, see [PostgreSQL audit backend (opt-in)](#postgresql-audit-backend-opt-in).
 
 Interactive API documentation is served at <http://127.0.0.1:8000/docs>.
 
@@ -232,7 +318,7 @@ Run the test suite — it needs no API key and makes no network calls:
 uv run pytest -q
 ```
 
-CI runs this same offline suite on GitHub-hosted Ubuntu: the workflow installs the locked `uv` environment and runs the offline pytest suite. The exact Phase 9.3-F implementation commit (`dd295c8`) passed 1,463 tests in the observed GitHub-hosted Ubuntu 24.04 CI environment — an observation of that run, not a claim of universal Linux compatibility.
+CI runs on GitHub-hosted Ubuntu in two independent jobs. The `test` job installs the locked `uv` environment and runs the offline pytest suite. The `test-postgres` job starts a throwaway PostgreSQL 16 service container, provisions the two separated roles, and runs `pytest -m postgres` explicitly — a missing or unreachable database fails that job rather than skipping it. The exact Phase 9.3-F implementation commit (`dd295c8`) passed 1,463 tests in the observed GitHub-hosted Ubuntu 24.04 CI environment — an observation of that run, not a claim of universal Linux compatibility. The PostgreSQL job has **not** yet been executed on a remote runner; its configuration has been validated locally only.
 
 ### Demo Walkthrough
 
@@ -310,7 +396,7 @@ Mutable audit state is the only state that outlives a container. Because the vol
 
 **MCP is not a Compose service.** This deployment does not publish MCP over the network. It remains the local stdio server described under [MCP Interface (read-only)](#mcp-interface-read-only), started by whichever host process wants it; there is no remote MCP transport and no MCP authentication server.
 
-**Scaling boundary.** The Compose deployment is intentionally a single API service with SQLite persistence — a local / demo / single-instance boundary. It is not a horizontally scaled or multi-replica design, and it introduces no external database or cache.
+**Scaling boundary.** The Compose deployment is intentionally a single API service with SQLite persistence — a local / demo / single-instance boundary. It is not a horizontally scaled or multi-replica design, and this topology deploys no external database or cache. The opt-in PostgreSQL backend is not part of it: the test service lives in a separate Compose project (`compose.postgres.yaml`), and enabling PostgreSQL for the application would require supplying a server that this topology does not provide.
 
 **Compose version.** `compose.yaml` uses the optional `env_file` long syntax with `required: false`, which needs a Docker Compose release supporting that syntax (Compose ≥ 2.24).
 
@@ -321,17 +407,20 @@ app/
   api/          FastAPI application, routes, request/response contracts
   core/         configuration, model client, LangGraph state graph, agent, triage service
   schemas/      Pydantic models: events, threat intel, risk, response, approval, audit
-  security/     policy engine, audit-record construction, append-only SQLite store
+  security/     policy engine, audit-record construction, append-only audit store (SQLite default, PostgreSQL opt-in)
   tools/        security tools (pure core functions + LangChain wrappers)
   evaluation/   offline architecture harness and real-provider evaluation harness
   mcp/          read-only MCP adapters and the local stdio server
 data/           generated seed data and the runtime audit database (not committed)
 docs/           architecture design notes
-scripts/        deterministic seed-data generators
-tests/          1,463 offline tests
+scripts/        deterministic seed-data generators; scripts/pg/ holds the role bootstrap SQL
+tests/          1,517 offline tests, plus a PostgreSQL integration suite (deselected by default)
+migrations/     Alembic environment and the hand-written baseline schema
+alembic.ini     Alembic configuration — the connection URL comes from the environment, never from this file
 Dockerfile      minimal container image (Phase 9.3-G)
 .dockerignore   build-context exclusions (secrets, host data, agent artifacts)
 compose.yaml    single-service Compose topology with the audit-data volume
+compose.postgres.yaml  opt-in, isolated PostgreSQL test service (outside the default topology)
 ```
 
 ## Roadmap
@@ -351,6 +440,7 @@ compose.yaml    single-service Compose topology with the audit-data volume
 | MCP interoperability | Implemented |
 | Structured application logging | Implemented |
 | Audit read / query API | Implemented |
+| PostgreSQL audit backend (opt-in) | Implemented |
 | Containerized deployment | Implemented |
 
 ## License

@@ -1,0 +1,62 @@
+# CyberSec Agent - OPT-IN PostgreSQL integration-test service (Phase v0.2.0-M0R)
+#
+# This file is deliberately NOT part of the default local topology. `compose.yaml`
+# remains the single-service, production-shaped topology and is not modified by
+# this file in any way. Start this one only when PostgreSQL integration tests are
+# wanted:
+#
+#   docker compose -f compose.postgres.yaml up -d --wait
+#   docker compose -f compose.postgres.yaml ps
+#   docker compose -f compose.postgres.yaml down
+#
+# Isolation properties:
+#   - dedicated Compose project name (`cybersec-pg-test`), so it never shares a
+#     namespace with the default `chatgpt-wangan` project that compose.yaml uses.
+#     `docker compose down` on one cannot affect the other.
+#   - dedicated named volume (`pg-test-data`); no host bind mounts.
+#   - published on 127.0.0.1 only, so it is not reachable from the network.
+#   - restart policy is "no": nothing starts automatically, nothing survives a
+#     Docker restart, and there is no background scheduler.
+#   - the credentials below are DISPOSABLE LOCAL TEST CREDENTIALS. They are not
+#     secrets, must never be reused, and must never front real data. This
+#     instance is a throwaway test fixture, not a deployable database.
+#
+# Two database roles are used (Phase v0.2.0-M1a), created by
+# `scripts/pg/bootstrap_roles.sql`:
+#   - cybersec_migrator : migration-owner; owns every schema object; runs Alembic
+#   - cybersec_app      : application-runtime; SELECT / INSERT only
+# The runtime role is deliberately NOT the owner of any table, and holds no
+# UPDATE / DELETE / TRUNCATE privilege. The `postgres` superuser below
+# (POSTGRES_USER) is used only for environment bootstrap, never by the app.
+#
+# This service intentionally defines no schema, no migrations and no application
+# tables. It exists only to make PostgreSQL testable; the schema is created by
+# the Alembic baseline migration, run as the migration-owner role.
+
+name: cybersec-pg-test
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_USER: cybersec_test
+      POSTGRES_PASSWORD: cybersec_test_local_only
+      POSTGRES_DB: cybersec_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pg-test-data:/var/lib/postgresql/data
+      # Role bootstrap runs only on a FRESH data directory (official image
+      # entrypoint semantics). An already-initialised volume will not re-run
+      # it; use the documented psql command in that case.
+      - ./scripts/pg/bootstrap_roles.sql:/docker-entrypoint-initdb.d/01-bootstrap-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cybersec_test -d cybersec_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  pg-test-data:

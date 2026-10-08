@@ -94,7 +94,7 @@ LLM 只能产生：
 - 不做多租户
 - 不做微服务
 - 不做 Kubernetes
-- PostgreSQL / Redis 未引入，且**不是**既定下一步（由需求驱动，而非按 Phase 排期）
+- Redis 未引入；PostgreSQL 仅作为**可选**的审计后端引入（Phase v0.2.0，显式 opt-in，默认仍是 SQLite，见 §11.6）。两者都不是按 Phase 排期的既定下一步。
 
 **实验环境边界**：所有扫描、命令执行、网络操作默认限制在本地实验环境、Docker Lab 或明确授权的测试环境。项目数据全部为模拟生成（scripts/seed_*.py），不针对任何真实第三方系统。
 
@@ -173,7 +173,7 @@ LLM 只能产生：
 | OpenTelemetry | Trace | 9 | 未引入 |
 | Langfuse | 可观测平台 | 9 | 未引入 |
 | Docker / Compose | 容器化运行边界 | 9.3-G | **已引入**（最小部署：仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E） |
-| PostgreSQL / Redis | 外部持久化 / 缓存 | — | **未引入**（当前架构不依赖；是否引入由需求驱动，不是既定下一步） |
+| PostgreSQL / Redis | 外部持久化 / 缓存 | v0.2.0（PG，可选）/ — | PostgreSQL：**可选**审计后端，显式 opt-in，默认仍是 SQLite（见 §11.6）；Redis：**未引入**（当前架构不依赖；是否引入由需求驱动，不是既定下一步） |
 
 ### 安全领域知识（知识库内容，非代码依赖）
 
@@ -242,17 +242,20 @@ cybersec-agent/
 │   ├── core/       # config / llm / agent / graph（编排层单文件）/ triage（无独立 logging.py：结构化日志用 structlog 内联在既有模块中）
 │   ├── schemas/    # log_event / threat_intel / risk / response / approval / incident / audit
 │   ├── tools/      # query_logs / query_threat_intel / risk_analyzer / response_planner
-│   ├── security/   # policy / audit / store（Phase 8）
+│   ├── security/   # policy / audit / store（Phase 8）+ store_protocol（AuditStore 契约）/ store_postgres（可选后端，Phase v0.2.0）
 │   ├── evaluation/ # 离线架构 harness（runner / metrics / oracles / cases / golden）+ llm/（真实 provider 评估：budget / runner / confinement / offline_guard / pilot ...）
 │   ├── mcp/        # Phase 9.3-E：只读 MCP 适配器（tools.py）+ 本地 stdio 入口（server.py）
 │   └── api/        # main（/chat /triage /resume + 只读 /audit/events）+ schemas
 ├── data/           # security_events.jsonl / threat_intel.jsonl（**仅 JSONL**）
-├── scripts/        # seed_logs.py / seed_threat_intel.py
-├── tests/          # test_api / test_core / test_schemas / test_security / test_tools / test_mcp / test_evaluation / test_evaluation_llm
+├── scripts/        # seed_logs.py / seed_threat_intel.py；pg/ 下是角色引导 SQL
+├── tests/          # test_api / test_core / test_schemas / test_security / test_tools / test_mcp / test_evaluation / test_evaluation_llm / test_postgres（真实 PG，默认不收集）
+├── migrations/     # Alembic 环境 + 手写 raw SQL 基线（Phase v0.2.0-M1a）
 ├── docs/           # **仅 architecture.md**
 ├── Dockerfile      # Phase 9.3-G：最小容器镜像（单阶段，运行时依赖 only）
 ├── .dockerignore   # 构建上下文排除（.env / 宿主 data / agent 产物 / .git）
 ├── compose.yaml    # 单服务 api + 单命名卷 audit-data
+├── compose.postgres.yaml  # 可选、隔离的 PostgreSQL 测试服务（独立 Compose project，不在默认拓扑内）
+├── alembic.ini     # Alembic 配置（sqlalchemy.url 为空；迁移 DSN 只来自环境变量）
 ├── pyproject.toml
 ├── uv.lock
 ├── .env.example
@@ -345,7 +348,7 @@ HTTP Client
 - `thread_id`：等值过滤（图执行线程）；
 - `event`：等值过滤，取值限于 6 个封闭审计事件之一（非法值 → 422）；
 - `limit`：有界页大小，1–200（默认 50），LIMIT 在 **SQL 层**施加（不拉全表再切片）；
-- `order`：`desc`（默认）/ `asc`，方向由固定程序逻辑选择，顺序确定（`(ts, rowid)`）。
+- `order`：`desc`（默认）/ `asc`，方向由固定程序逻辑选择，顺序确定（主序 `ts`，tiebreaker 由后端提供：SQLite 用 `rowid`，PostgreSQL 用 `seq`）。
 
 **刻意不暴露**的查询维度：`incident_id`（图写入行的该列恒为 `NULL`，做成过滤器会得到"看似可用、实则恒空"的接口）、`request_id` / `approval_id`（**未持久化**，库里没有对应列）、`offset` / `cursor`（无游标分页）。**没有任何**原始 SQL 入口，也不存在由客户端控制的列名或 ORDER BY 片段。
 
@@ -487,6 +490,8 @@ class AgentState(TypedDict, total=False):
 
 > **`action_requests` 没有 `status` 列** —— 这不是遗漏，见 §11.3。
 
+> PostgreSQL 后端（Phase v0.2.0-M1a）落地的是**同一组三张表**，字段与约束以 `migrations/versions/0001_baseline_audit_schema.py` 的 DDL 为准（`seq` 是 identity 主键列，替代 SQLite 的隐式 `rowid`），库层禁改触发器从 6 条扩到 9 条（每表多一条 `BEFORE TRUNCATE`）。**checkpoint 不在此列** —— 见 §11.2 与 §11.6。
+
 ### 11.2 蓝图 vs 实现（未被实现为 SQLite 表的部分）
 
 | 蓝图项 | 蓝图字段 | 实际情况 |
@@ -494,7 +499,7 @@ class AgentState(TypedDict, total=False):
 | security_events | ts, src_ip, dst_ip, username, action, status, user_agent, raw | **不是 SQLite 表**：实现为 JSONL 文件 `data/security_events.jsonl`（144 条），按需全量读入内存过滤 |
 | threat_intel | ioc_type, ioc_value, source, confidence, tags | **不是 SQLite 表**：实现为 JSONL 文件 `data/threat_intel.jsonl`（29 条 IOC） |
 | knowledge_docs | kind, key, title, text, metadata | **未实现**（RAG 顺延，见 §14 偏离说明） |
-| checkpoints | 框架自动管理 | 已实现，但用 `InMemorySaver` —— **进程内内存，不落盘**。`langgraph-checkpoint-sqlite` 未安装，所以"崩溃恢复"目前只在进程存活期内成立（跨进程恢复是 Phase 9/10 的事） |
+| checkpoints | 框架自动管理 | 已实现，但用 `InMemorySaver` —— **进程内内存，不落盘**。`langgraph-checkpoint-sqlite` 未安装，所以"崩溃恢复"目前只在进程存活期内成立（跨进程恢复是 Phase 9/10 的事）。Phase v0.2.0 引入的 PostgreSQL 审计后端**不**承载 checkpoint，见 §11.6 |
 
 ChromaDB collections（`mitre_techniques` / `cve_entries` / `threat_reports`）：**未创建**（ChromaDB 未引入）。
 
@@ -537,6 +542,50 @@ AuditEvent = Literal[
 
 
 
+### 11.6 PostgreSQL 审计后端（opt-in；Phase v0.2.0-M1a / M1b / M1c）
+
+**默认仍是 SQLite。** 不设任何 `AUDIT_*` 变量时行为与 v0.1.0 一致。PostgreSQL 是**显式 opt-in**：只有 `AUDIT_BACKEND=postgres` 才会启用。操作步骤（起停隔离的测试服务、引导角色、跑迁移、跑集成测试、如何停止而不删卷）见 `README.md` 的 "PostgreSQL audit backend (opt-in)" 一节；本节只记录**设计**与**边界**，不重复命令。
+
+#### 契约，而非实现
+
+`app/security/store_protocol.py` 的 `AuditStore` 是**唯一**的持久化契约（`@runtime_checkable`，恰好 8 个方法）。HITL 图节点（`app/core/graph.py` 的 `HitlConfig.audit_store`）、`TriageService`、以及只读端点 `GET /audit/events` 都只依赖这个契约。
+
+- **后端选择只发生一次**：`app/api/main.py` 的 `build_audit_store(settings)`。全项目只有 `app/api/main.py` 与 `app/core/config.py` 读 `audit_backend` / `audit_postgres_dsn`；图节点、triage、端点里没有任何"是 sqlite 还是 postgres"的分支（由 AST 结构护栏钉住）。
+- **`close()` 刻意不进契约**：只有持有连接池的后端才有可释放的长期资源；SQLite 版每次操作新开连接、用完即关。为一个后端的具体需要给所有实现强加一个方法，会让契约描述**实现细节**而不是**行为**。释放由组合根按具体类型判断（`close_audit_store`），连接池**归 lifespan 所有**、每进程一个，绝不按请求建池；`finally` 同时覆盖"正常退出"与"部分启动失败"。
+- **同步调用是刻意的**：`plan` / `policy_gate` / `human_approval` 是 `async def`，但它们**同步**调用 store —— 这是 Phase 8.3 起的既有形状，本阶段不改，也没有为此重构图执行。实测（同机、同表规模、并发 20）显示请求实际被串行化，事件循环最大滞后 PostgreSQL ≈ 143 ms、SQLite ≈ 2090 ms。**该结论仅限相对比较**，不构成吞吐 / 延迟 / 容量声明，也没有据此推断"PostgreSQL 普遍更快"。
+
+#### 不做的事（硬边界）
+
+- **不自动回退**：`AUDIT_BACKEND=postgres` 而 DSN 缺失或为空 → 启动期 `ValidationError`，**绝不**悄悄退回 SQLite。`AuditBackend` 是封闭取值集，刻意不含 `auto` / `fallback` 之类的取值。
+- **不双写、不做数据迁移转换**：一个进程只有一个审计 store，不存在"两边都写"，也没有 SQLite ↔ PostgreSQL 的搬迁或自动转换。
+- **不做运行时 DDL**：运行期角色 `cybersec_app` 只有 `SELECT` / `INSERT`，没有 `UPDATE` / `DELETE` / `TRUNCATE`，也没有 `public` 上的 `CREATE`。建表与迁移只走 Alembic，且必须以 migration-owner 角色 `cybersec_migrator` 身份运行（基线迁移里有一条显式守卫拒绝以 `cybersec_app` 运行）。
+- **不是 checkpoint 存储**：PostgreSQL 只承载 `incidents` / `action_requests` / `audit_logs` 三张表。LangGraph checkpoint 仍是 `InMemorySaver`（进程内内存，**不落盘**），因此**跨进程恢复仍不可用**，停在 `human_approval` 的 run 在进程重启后无法恢复 —— 换审计后端**不改变**这一点。
+- **不引入** PostgreSQL checkpointer、认证 / RBAC、Redis、RAG、多 Agent、后台调度器；默认拓扑 `compose.yaml` 不改动。
+
+#### append-only 的边界（必须一起说清楚）
+
+PostgreSQL 侧与 SQLite 侧同样是**库层强制**的 append-only，且覆盖更全：每张表 3 条禁改触发器（`BEFORE UPDATE` / `BEFORE DELETE` / `BEFORE TRUNCATE`，共 9 条）。
+
+为什么 PostgreSQL 需要多一条 `TRUNCATE`：行级 `FOR EACH ROW` 触发器在**命中 0 行**时不会触发，而 `TRUNCATE` 是语句级操作、不逐行走触发器 —— 不单独拦它，就等于留下一条"整表清空"的路。
+
+但 **"append-only"不等于"防篡改"**，这一点不得被含糊掉：
+
+- 触发器拦的是**应用与运行期角色**发出的 `UPDATE` / `DELETE` / `TRUNCATE`；
+- 它**拦不住**超级用户、表 owner、有足够权限的管理员，也**拦不住**一条伪造的 `INSERT`（写进一条看起来完全合理的记录）；
+- 没有签名、没有外部锚定、没有不可否认性 —— `actor` 仍只是调用方自称的字符串（见 §11.4）。
+
+另外两处必须写明的语义：
+
+- **`seq` 是分配顺序，不是提交顺序，也不是因果顺序。** `GENERATED ALWAYS AS IDENTITY` 的序列推进**不随事务回滚**。可主张的顺序性质只有"对已提交且可见的行是确定的"，它与 SQLite 侧的 `(ts, rowid)` 排序**不是**同一个东西。
+- **审计读 / 写路径的失败语义不对称**：读失败（`GET /audit/events`）收敛成窄类型 → **503** 固定文案；写路径失败仍是未处理的持久化异常 → **500**。这是**当前行为**，不是承诺，已记录在 `README.md` 的 Known Limitations。
+
+#### 凭据
+
+- 运行期连接串来自 `Settings.audit_postgres_dsn`，类型是 `SecretStr`：`repr` / `str` 都是 `**********`。
+- store 侧不打印 DSN、不把它写进异常消息；`__repr__` 走 `redact_dsn` 把口令换成 `***`，解析失败也**不回显原文**。
+- 组合根在语法校验失败时 `raise ... from None` —— 实测 psycopg 的解析错误文本会**内嵌连接串片段**，把 `__cause__` 挂上去等于把口令写进 traceback。
+- 仓库里**没有**真实凭据。`compose.postgres.yaml` / `scripts/pg/bootstrap_roles.sql` / CI 工作流里的是**一次性本地与 CI 测试凭据**：不是机密、不得复用、不得承载真实数据。`alembic.ini` 的 `sqlalchemy.url` 是**空**的，迁移连接串只来自环境变量 `CYBERSEC_PG_MIGRATION_DSN`。
+
 ## 12. Phase Roadmap
 
 | Phase | 交付物 | 核心概念（面试可讲） | 退出标准（能回答） | 最终 Commit |
@@ -567,9 +616,9 @@ AuditEvent = Literal[
 | 7 | 风险分析 + 响应规划 | **已完成**（规则引擎侧）：`RiskAssessment` + `ResponsePlan` 纯函数规则引擎 |
 | 8 | 安全层 + HITL | **已完成（8.1-8.5）**：策略引擎 / 审批流 / append-only 审计 / SQLite 持久化 / triage 服务与 API |
 | 9 | 可观测 + 评估 | **部分完成**：蓝图的 **Trace / LLM-as-Judge 未实现**；但"评估"侧已交付**离线评估 harness**（`app/evaluation/`：runner / metrics / oracles / cases / golden）与**真实 provider 评估 harness**（`app/evaluation/llm/`：budget / runner / confinement / offline_guard / pilot），另有 9.1-A 的可靠性侧（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 依赖护栏对齐）。只读审计查询（9.3-F）与只读 MCP（9.3-E）也在 9.3 段落地，见 §8 Flow C / Flow D |
-| 10 | 工程化 | **部分启动**：Phase 9.3-G 已交付最小 Docker / Compose 容器化（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E）；蓝图同格里的 PostgreSQL / Redis 等**未引入**，且**不是**既定必做项 —— 由需求驱动，而非"下一步就必须做" |
+| 10 | 工程化 | **部分推进**：Phase 9.3-G 已交付最小 Docker / Compose 容器化（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E）；Phase v0.2.0 交付了**可选**的 PostgreSQL 审计后端（Alembic 迁移 + 迁移/运行期角色分离 + 组合根装配 + 集成测试 + 独立 CI job + 文档，见 §11.6），SQLite 仍是默认。蓝图同格里的 Redis 等**未引入**，且**不是**既定必做项 —— 由需求驱动，而非"下一步就必须做" |
 
-> 说明：§12 蓝图表把"工程化"写成 `Docker/PG/Retry/CI/文档` 一组交付物，那是**蓝图的分组**，不是"这几项都要做"的承诺。实际状态见上表：CI 与容器化已交付；PostgreSQL / Redis 从未引入，当前架构（单进程 + SQLite）也不依赖它们。是否引入由真实需求决定。
+> 说明：§12 蓝图表把"工程化"写成 `Docker/PG/Retry/CI/文档` 一组交付物，那是**蓝图的分组**，不是"这几项都要做"的承诺。实际状态见上表：CI 与容器化已交付；PostgreSQL 已作为**可选**审计后端引入（默认仍是 SQLite，见 §11.6），Redis 仍未引入，当前默认架构（单进程 + SQLite）也不依赖它们。是否引入由真实需求决定。
 
 
 ## 13. 待定决策
@@ -789,7 +838,7 @@ OpenAI-compatible LLM
 
 ## 当前架构快照（**当前维护**；小节初版 2026-09-19，之后随 Phase 持续更新）
 
-> 完成状态：**Phase 0-8.5 已完成；Phase 9.1-A 已完成**（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 护栏对齐）；**Phase 9.3-G 已完成**（最小 Docker / Compose 容器化，见 §8 Flow E）。
+> 完成状态：**Phase 0-8.5 已完成；Phase 9.1-A 已完成**（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 护栏对齐）；**Phase 9.3-G 已完成**（最小 Docker / Compose 容器化，见 §8 Flow E）；**Phase v0.2.0 已交付可选 PostgreSQL 审计后端**（M0R–M1c：Alembic 迁移 / 迁移与运行期角色分离 / 组合根装配 / 集成测试；M1d：独立 CI job 与文档 —— 见 §11.6）。SQLite 仍是默认后端。
 
 ```
 HTTP Client
@@ -823,13 +872,17 @@ Structured evidence（messages 按 reducer 顺序累积：LogToolMsg → IntelTo
 LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终回答）
  ↓
 安全层（app/security/，横切）
-   policy.py  evaluate_policy(plan) → allow / require_approval（永不解析 messages）
-   audit.py   compute_plan_digest / build_audit_record
-   store.py   SqliteAuditStore：incidents / action_requests / audit_logs
-              append-only（纯 INSERT + PRIMARY KEY + 6 条禁改触发器 + 无状态列 + 状态派生）
+   policy.py           evaluate_policy(plan) → allow / require_approval（永不解析 messages）
+   audit.py            compute_plan_digest / build_audit_record
+   store_protocol.py   AuditStore 契约（8 个方法，@runtime_checkable）—— 图 / triage / API 只依赖它
+   store.py            SqliteAuditStore（**默认**）：incidents / action_requests / audit_logs
+                       append-only（纯 INSERT + PRIMARY KEY + 6 条禁改触发器 + 无状态列 + 状态派生）
+   store_postgres.py   PostgresAuditStore（**可选**，Phase v0.2.0）：同一契约、同一 append-only
+                       约束、9 条禁改触发器；只由组合根按 Settings.audit_backend 装配（见 §11.6）
  ↓
-持久化：SQLite（业务表 + 审计，append-only）
-        checkpoint = InMemorySaver（进程内内存，**不落盘**）
+持久化：SQLite（**默认**：业务表 + 审计，append-only，6 条禁改触发器）
+        或 PostgreSQL（**可选**审计后端，见 §11.6：同样 append-only，9 条禁改触发器）
+        checkpoint = InMemorySaver（进程内内存，**不落盘**）—— 换审计后端不影响它
  ↓
 容器化运行边界（Phase 9.3-G，可选部署路径，见 §8 Flow E）
    Dockerfile       单阶段镜像：uv 官方 base + 锁定运行时依赖 + app/ + 构建期生成演示数据
@@ -844,7 +897,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
 - 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided` / `approval.timeout` —— 6 个全部有生产写入路径（`approval.timeout` 由 Phase 9.1-A 的惰性超时补齐）
 - **部署面（Phase 9.3-G）**：容器化只增加部署文件（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`），**不改变**上面任何一条运行时语义 —— 图结构、工具集、审计写入路径、HITL 行为全部不变。当前是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）。
-- 测试基线：**1,463 passed**，全部离线（`FakeLLMClient` / `FakeChatModel` / `ScriptedTraceModel`，无真实 API 调用）；**从无 `data/` 目录的 CWD 运行同样 1,463 passed**（hermetic）。计数来源：Phase 9.3-G 文档提交 `b4f9d4e4` 的 exact-head CI 观测（GitHub-hosted Ubuntu 24.04，见 §14）。
+- 测试基线：默认离线运行 **1,517 passed / 311 deselected**（`pytest -q`）。被取消收集的 311 例是 `postgres` 标记的集成用例，需要真实 PostgreSQL，由独立的 CI job 显式运行（`pytest -m postgres`）。离线计数与 hermetic 性质来自**本地实测**；**上一次远端 CI 观测**是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`（GitHub-hosted Ubuntu 24.04，见 §14）—— v0.2.0 变更集的**远端 CI 尚未运行**，不得据本地结果声称远端通过。
 
 ## 尚未实现（按 §12 Roadmap）
 
@@ -857,7 +910,8 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - 身份认证 / 不可否认性——`actor` 只是自称字符串（Phase 10）
 - 审计读接口的**导出 / 聚合 / 游标分页**——只读查询端点 `GET /audit/events` 已于 Phase 9.3-F 落地（见 §8 Flow D）
 - Observability / Evaluation——Phase 9
-- 生产 / 分布式部署面——当前容器化**刻意最小**：**未**引入 Kubernetes、外部数据库（PostgreSQL）、缓存（Redis）、反向代理（nginx）、多副本、健康检查。这些是否引入由需求驱动，**不是**既定下一步；现有部署是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）
+- PostgreSQL 后端的运维面——**没有**备份 / 恢复、连接池调优、只读副本、审计导出、跨进程 checkpoint。append-only 由库层触发器强制，但**不是**防篡改：超级用户、表 owner、以及一条伪造的 `INSERT` 都不受它拦（见 §11.6）
+- 生产 / 分布式部署面——当前容器化**刻意最小**：**未**引入 Kubernetes、缓存（Redis）、反向代理（nginx）、多副本、健康检查，默认拓扑也不部署任何外部数据库。PostgreSQL 已作为**可选**审计后端引入（见 §11.6），但它不是默认、不是生产就绪形态，也不承载 checkpoint。这些是否进一步引入由需求驱动，**不是**既定下一步；现有部署仍是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）
 
 
 ## Testing Framework
@@ -898,16 +952,18 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 | `tests/test_mcp/` | 只读 MCP 适配器与本地 stdio server（工具发布面、schema 不暴露路径参数） |
 | `tests/test_evaluation/` | 离线架构 harness：runner / metrics / oracles / cases / golden digest |
 | `tests/test_evaluation_llm/` | 真实 provider 评估 harness：budget / confinement / offline_guard / runner / pilot 等（全部离线，不触网） |
+| `tests/test_postgres/` | 真实 PostgreSQL 集成：连接 / schema / 迁移 / 角色与触发器 / 排序 / 存储契约（双后端参数化）/ 并发 / 应用集成（**默认不收集**，需要真实实例） |
 
-当前基线：**1,463 passed**（`pytest -q`；来源为 Phase 9.3-G 文档提交 `b4f9d4e4` 的 exact-head CI 观测，见 §14）。
+当前基线：默认运行 **1,517 passed / 311 deselected**（`pytest -q`，本地实测）；311 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行。上一次远端 CI 观测是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`，见 §14。
 
 ### 6. hermetic 约束（Phase 8.5 收口）
 
-**全部 67 个测试模块（`tests/` 下所有 `test_*.py`）都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
+**全部 78 个测试模块（`tests/` 下所有 `test_*.py`，其中 9 个是需要真实 PostgreSQL 的集成模块）都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
 
 ```bash
 cd <任意不含 data/ 的目录>
-<python> -m pytest <repo>/tests -q      # 期望:1,463 passed
+<python> -m pytest <repo>/tests -q              # 期望:1,517 passed, 311 deselected
+<python> -m pytest <repo>/tests -m postgres -q  # 需真实 PostgreSQL;同样不读仓库 data/
 ```
 
 根因说明：生产默认值 `DEFAULT_DATA_PATH` 是**相对路径**（`data/security_events.jsonl`），相对 CWD 解析 —— 这是**生产行为的正确设计**（部署时以启动目录为基准），但会让测试在换 CWD 时红。所以修的是**测试**（注入 `tmp_path` 现场生成的 seed 数据），不是生产默认值。

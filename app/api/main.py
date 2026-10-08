@@ -5,15 +5,19 @@
         ↓ 依赖注入
     SecurityAgent(app/core/agent.py) / TriageService(app/core/triage.py)
         ↓
-    LLMClient / SqliteAuditStore / HITL graph
+    LLMClient / AuditStore(SQLite 或 PostgreSQL) / HITL graph
         ↓
-    ChatOpenAI / SQLite
+    ChatOpenAI / SQLite / PostgreSQL
 
 测试时通过 create_app(agent=..., triage_service=...) 注入 Fake,
 整个 API 测试不需要真实 LLM,也不需要 .env。
 
 本模块是**组合根**:只有这里知道"生产环境怎么把这些零件装起来"。
 core 层只声明依赖(构造函数参数),不自己去找依赖。
+
+审计后端选择(Phase v0.2.0-M1c)也**只在这里**发生一次 —— 见
+`build_audit_store`。图节点、TriageService 与端点里没有任何
+"是 sqlite 还是 postgres" 的分支;它们只依赖 `AuditStore` 契约。
 """
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -26,6 +30,7 @@ import structlog
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from langgraph.checkpoint.memory import InMemorySaver
+from psycopg.conninfo import conninfo_to_dict
 
 from app.api.schemas import (
     ChatRequest,
@@ -35,7 +40,7 @@ from app.api.schemas import (
     TriageResponse,
 )
 from app.core.agent import SecurityAgent
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.graph import HitlConfig, create_agent_graph
 from app.core.llm import LLMClient, LLMClientError
 from app.core.triage import (
@@ -48,8 +53,26 @@ from app.core.triage import (
 )
 from app.schemas.audit import AuditEvent, AuditRecord
 from app.security.store import SqliteAuditStore
+from app.security.store_postgres import POSTGRES_STORE_ERRORS, PostgresAuditStore
+from app.security.store_protocol import AuditStore
 
 logger = structlog.get_logger(__name__)
+
+#: 审计**读**边界要收敛成 503 的持久化层异常。
+#:
+#: - `sqlite3.Error` —— 文件库损坏 / 表缺失 / 锁 / 无法打开;
+#: - `ValueError`     —— 覆盖 json.JSONDecodeError 与 pydantic.ValidationError
+#:   (二者都是 ValueError 子类),即"持久化行解码/校验失败";
+#: - `POSTGRES_STORE_ERRORS` —— PostgreSQL 侧的连接/协议/权限失败与连接池
+#:   借出超时(见 store_postgres 的说明)。
+#:
+#: 刻意**不**在这里塞 `Exception`:读路径的 bug 必须继续表现为 500,
+#: 不能被伪装成"数据源不可用"。
+_STORE_READ_FAILURES: tuple[type[BaseException], ...] = (
+    sqlite3.Error,
+    ValueError,
+    *POSTGRES_STORE_ERRORS,
+)
 
 
 class AuditStoreUnavailableError(Exception):
@@ -63,9 +86,67 @@ class AuditStoreUnavailableError(Exception):
     """
 
 
+def build_audit_store(settings: Settings) -> AuditStore:
+    """按 `settings.audit_backend` 装配审计后端 —— **唯一的后端选择点**。
+
+    这个函数是组合根的一部分,也是全项目**唯一**读 `audit_backend` 的地方。
+    图节点 / TriageService / 端点只依赖 `AuditStore` 契约,因此后端切换
+    不会渗透到业务层(不会出现"某个节点里偷偷判断后端"的分支)。
+
+    两条硬约束:
+    - **不自动回退**。显式选了 postgres 而 DSN 缺失时,`Settings` 的校验
+      已经在启动期拒绝;这里不做 try/except 退回 SQLite —— 那会让审计
+      悄悄落到另一个库。
+    - **不做 DDL**。`PostgresAuditStore` 只发 SELECT / INSERT,且运行期
+      角色(`cybersec_app`)没有任何 DDL 权限;建表与迁移只走 Alembic。
+
+    `PostgresAuditStore` 的构造器**不做任何 I/O**(不连接、不建池),
+    连接池在首次操作时惰性开启 —— 因此本函数不会把数据库不可用的失败
+    提前到进程启动,失败仍发生在真正需要读/写审计的那一刻,由既有的
+    "必需写入 vs best-effort" 契约处理。
+    """
+    if settings.audit_backend == "postgres":
+        dsn = settings.audit_postgres_dsn
+        # Settings 的 model_validator 已保证非空;这里是**第二道**闸门,
+        # 防止有人绕过 Settings 直接构造一个假的配置对象。
+        if dsn is None or not dsn.get_secret_value().strip():
+            raise ValueError(
+                "audit_backend='postgres' 需要 AUDIT_POSTGRES_DSN;"
+                "未提供 DSN 时不会回退到 SQLite。"
+            )
+        secret = dsn.get_secret_value()
+        # 语法校验:不可解析的连接串在**启动期**就响亮失败,而不是等第一次
+        # 写审计才炸。刻意 `from None` —— 实测 psycopg 的解析错误文本会内嵌
+        # 连接串片段("missing \"=\" after \"...\" in connection info string"),
+        # 把 `__cause__` 链上去等于把口令写进 traceback。
+        try:
+            conninfo_to_dict(secret)
+        except Exception:
+            raise ValueError(
+                "AUDIT_POSTGRES_DSN 不是合法的 libpq 连接串(内容不回显)"
+            ) from None
+        return PostgresAuditStore(secret)
+    return SqliteAuditStore(settings.audit_db_path)
+
+
+def close_audit_store(store: AuditStore) -> None:
+    """释放审计后端的进程级资源(幂等)。
+
+    只有持有连接池的后端需要清理。**刻意不把 `close()` 加进
+    `AuditStore` Protocol**:SQLite 版每次操作新开连接、用完即关,
+    根本没有可关闭的长期资源 —— 为一个后端的具体需求给所有实现强加
+    一个方法,会让契约描述"实现细节"而不是"行为"。这里按具体类型判断。
+
+    `SqliteAuditStore` 无 `close()`,因此走 isinstance 分支而不是
+    `getattr` 探测:后者会静默接受任何恰好叫 close 的属性。
+    """
+    if isinstance(store, PostgresAuditStore):
+        store.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """启动时装配进程级依赖,进程内复用。
+    """启动时装配进程级依赖,进程内复用;退出时释放后端资源。
 
     为什么在 lifespan 而不是模块顶层创建:
     - 依赖只在服务真正启动时初始化,导入 app 不会产生副作用(也不会读 .env);
@@ -75,27 +156,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     InMemorySaver 是进程内的 checkpoint 存储。创建两次 = 两套互不可见的
     state,暂停在 A 上、去 B 里 resume 只会命中"未知 thread"。
     它是一个**有状态单例**,不是可以随手 new 的配置对象。
+
+    资源归属(Phase v0.2.0-M1c):审计后端的连接池由**本函数**拥有,
+    且**每个进程只建一个** —— 绝不在请求处理里建池。`finally` 覆盖
+    "正常退出"与"部分启动失败"两条路径:例如 LLMClient() 抛错时,
+    已经建好的连接池必须被关掉,否则进程退出前一直占着数据库连接。
     """
     settings = get_settings()
     # audit_db_path 来自 Settings(D5);logs_path / intel_path 不注入,
     # 由工具层默认值提供(HitlConfig 的 None 语义)。
-    store = SqliteAuditStore(settings.audit_db_path)
+    store = build_audit_store(settings)
     # 同一实例既供写入路径(HITL 图 + TriageService),也供只读审计端点
     # (GET /audit/events)。端点只调用 list_audit,不会产生新的写入点。
     app.state.audit_store = store
-
-    # 一个 LLMClient 给两条链路共用:bind_tools 每次返回新的 runnable,
-    # 不存在互相污染;少建一个 ChatOpenAI 实例。
-    llm = LLMClient()
-    app.state.agent = SecurityAgent(llm)
-    app.state.triage_service = TriageService(
-        create_agent_graph(
-            llm,
-            hitl=HitlConfig(checkpointer=InMemorySaver(), audit_store=store),
-        ),
-        store,
-    )
-    yield
+    try:
+        # 一个 LLMClient 给两条链路共用:bind_tools 每次返回新的 runnable,
+        # 不存在互相污染;少建一个 ChatOpenAI 实例。
+        llm = LLMClient()
+        app.state.agent = SecurityAgent(llm)
+        app.state.triage_service = TriageService(
+            create_agent_graph(
+                llm,
+                hitl=HitlConfig(checkpointer=InMemorySaver(), audit_store=store),
+            ),
+            store,
+        )
+        yield
+    finally:
+        # 幂等:SQLite 后端没有可关闭的资源,这里是 no-op。
+        close_audit_store(store)
 
 
 def _triage_status_for(exc: TriageError) -> int:
@@ -159,8 +248,11 @@ def _request_id_of(request: Request) -> str | None:
     return getattr(request.state, "request_id", None)
 
 
-def _require_store(request: Request) -> SqliteAuditStore:
-    """取出进程级 SqliteAuditStore(与 _require_agent / _require_service 同构)。
+def _require_store(request: Request) -> AuditStore:
+    """取出进程级审计后端(与 _require_agent / _require_service 同构)。
+
+    返回 `AuditStore` 契约而不是具体类:端点只用到 list_audit,
+    与后端是 SQLite 还是 PostgreSQL 无关。
 
     缺失时给明确的 503,而不是让 AttributeError 变成带 traceback 的 500:
     后者既难排查,又会把内部结构泄露给客户端。这个分支只在"注入了 agent /
@@ -186,19 +278,25 @@ def _to_response(result: TriageResult) -> TriageResponse:
 def create_app(
     agent: SecurityAgent | None = None,
     triage_service: TriageService | None = None,
-    audit_store: SqliteAuditStore | None = None,
+    audit_store: AuditStore | None = None,
 ) -> FastAPI:
     """构建 FastAPI 应用。
 
     参数:
         agent: 已组装好的 SecurityAgent(测试注入 Fake 用);
         triage_service: 已组装好的 TriageService(测试注入 Fake graph 用);
-        audit_store: 已组装好的 SqliteAuditStore(测试注入只读审计端点用)。
+        audit_store: 已组装好的**任意** AuditStore 实现(测试注入只读审计
+                     端点用)。类型是契约而不是 `SqliteAuditStore` ——
+                     PostgreSQL 后端同样可以被注入。
 
     注入**任意一个**即视为"调用方接管了装配",lifespan 不再运行 ——
     否则它会去构造真实 LLMClient(需要 .env),测试根本跑不起来。
     代价是只注入 agent 时 /triage 与 /audit/events 不可用(503),以此类推;
-    生产路径 create_app() 不带参数,三者都会装配好。
+    生产路径 create_app() 不带参数,三者都会装配好(后端由
+    Settings.audit_backend 决定)。
+
+    注意:注入式装配**不**接管资源释放 —— 若注入的是 PostgresAuditStore,
+    由注入方自己负责 `close()`(lifespan 没运行,不会替你关池)。
     """
     use_lifespan = agent is None and triage_service is None and audit_store is None
     app = FastAPI(
@@ -351,9 +449,10 @@ def create_app(
     ) -> list[AuditRecord]:
         """只读查询审计流(Phase 9.3-F)。
 
-        这是**只读**端点:它只调用 SqliteAuditStore.list_audit,不追加任何
+        这是**只读**端点:它只调用 AuditStore.list_audit,不追加任何
         审计(读审计不会再写一条审计)、不触发策略/审批/resume/checkpoint、
         不调用工具 / MCP / provider / 模型,也不发起外部网络请求。
+        `AuditStore` 是契约:后端是 SQLite 还是 PostgreSQL 对本端点透明。
 
         **本端点没有任何认证** —— 它是只读的,但**不是** "authorized
         endpoint"。措辞上不得暗示调用方已通过身份校验、或只有审计员可见;
@@ -384,11 +483,15 @@ def create_app(
                 limit=limit,
                 descending=order == "desc",
             )
-        except (sqlite3.Error, ValueError) as exc:
-            # sqlite3.Error: 库损坏 / 表缺失 / 锁 / 无法打开等持久化层失败。
-            # ValueError: 覆盖 json.JSONDecodeError 与 pydantic ValidationError
-            #   (二者都是 ValueError 子类)—— 即"持久化行解码/校验失败"。
-            # 两类都在**读边界**收敛成同一个窄类型,由上面的处理器映射成 503。
+        except _STORE_READ_FAILURES as exc:
+            # 两类后端各自的**持久化层**失败都在读边界收敛成同一个窄类型,
+            # 由上面的处理器映射成 503:
+            #   sqlite3.Error          —— 库损坏 / 表缺失 / 锁 / 无法打开;
+            #   ValueError             —— json.JSONDecodeError 与 pydantic
+            #                             ValidationError(持久化行解码/校验失败);
+            #   POSTGRES_STORE_ERRORS  —— psycopg 的连接/协议/权限失败与连接池
+            #                             借出超时(PoolTimeout 是其子类)。
+            # 注意这里**不**捕获 Exception:读路径自身的 bug 必须继续是 500。
             raise AuditStoreUnavailableError() from exc
 
     return app

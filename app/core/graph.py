@@ -93,7 +93,7 @@ from app.schemas.policy import PolicyDecision
 from app.schemas.response import ResponsePlan
 from app.security.audit import build_audit_record
 from app.security.policy import evaluate_policy
-from app.security.store import SqliteAuditStore
+from app.security.store_protocol import AuditStore
 from app.tools import DEFAULT_TOOLS
 from app.tools.query_logs import DEFAULT_DATA_PATH as LOGS_DATA_PATH
 from app.tools.query_threat_intel import DEFAULT_DATA_PATH as INTEL_DATA_PATH
@@ -128,10 +128,15 @@ class HitlConfig:
 
     logs_path / intel_path 省略时用工具层默认路径(data/*.jsonl);
     测试通过它们注入 tmp_path,保证 hermetic。
+
+    `audit_store` 的类型是 **`AuditStore` 契约**(Phase v0.2.0-M1c),
+    不是具体后端 —— 图只依赖"能 append_audit"这一件事,因此 SQLite 与
+    PostgreSQL 后端可以互换而不改动本模块一个字节。后端选择只发生在
+    组合根(app/api/main.py),图里没有任何 backend 分支。
     """
 
     checkpointer: BaseCheckpointSaver
-    audit_store: SqliteAuditStore
+    audit_store: AuditStore
     logs_path: Path | None = None
     intel_path: Path | None = None
 
