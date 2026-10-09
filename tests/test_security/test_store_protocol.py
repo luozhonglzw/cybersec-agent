@@ -5,9 +5,15 @@
 - 每个方法的**签名**(参数名、参数种类、默认值、注解、返回注解)必须逐字相等;
 - 任一侧改了签名而另一侧没跟上,测试必须失败。
 
-为了证明这些断言**有牙**,文件末尾给了两个变异负对照:
+v0.3.0-A3-2 把方法集从 8 扩到 10(`record_thread_ownership` /
+`get_thread_ownership`)。这里**只需跟着改 `EXPECTED_METHODS`** —— 签名比对
+与 keyword-only 断言都是参数化在集合上的,新方法自动被同一批断言覆盖。
+既有 8 个方法的签名一个字没改,因此那 8 条断言的结果与 v0.2.0 完全一致。
+
+为了证明这些断言**有牙**,文件末尾给了三个变异负对照:
 - 少一个方法的桩 → 必须被判为"不满足契约";
-- 改一个参数默认值的桩 → 必须被签名比对捕获。
+- 改一个参数默认值的桩 → 必须被签名比对捕获;
+- 改一个参数种类(KEYWORD_ONLY → POSITIONAL_OR_KEYWORD)的桩 → 同上。
 
 本文件**不依赖任何数据库**,因此留在默认离线套件里(不带 `postgres` 标记)。
 """
@@ -37,12 +43,15 @@ def _public_callables(cls: type) -> set[str]:
 
 
 # 契约方法集(显式写死,顺序即文档顺序)
+# v0.3.0-A3-2:8 → 10。两个归属方法**纯增量**,既有 8 个的签名与行为未动。
 EXPECTED_METHODS = {
     "record_incident",
     "record_action_request",
     "append_audit",
+    "record_thread_ownership",
     "get_incident",
     "get_approval_request",
+    "get_thread_ownership",
     "list_action_rows",
     "pending_action_rows",
     "list_audit",
@@ -142,10 +151,11 @@ def test_protocol_module_imports_no_database_driver() -> None:
     }
     assert leaked == set(), f"契约模块泄漏了驱动依赖: {sorted(leaked)}"
 
-    # 正对照:契约**必须** import 三个领域模型,否则上面的收集器是坏的
+    # 正对照:契约**必须** import 四个领域模型,否则上面的收集器是坏的
     assert "app.schemas.audit" in imported
     assert "app.schemas.approval" in imported
     assert "app.schemas.incident" in imported
+    assert "app.schemas.ownership" in imported
 
 
 def test_store_module_remains_the_only_sqlite_implementation() -> None:
@@ -161,13 +171,19 @@ def test_store_module_remains_the_only_sqlite_implementation() -> None:
 
 
 class _MissingOneMethod:
-    """少一个方法 —— 必须被判为不满足契约。"""
+    """**恰好**少一个方法(`list_audit`)—— 必须被判为不满足契约。
+
+    刻意补齐到 9/10 而不是"少三个":只有"只差一个"才真正证明方法集断言
+    是逐方法比的,而不是被大段缺失蒙对。
+    """
 
     def record_incident(self, incident) -> None: ...
     def record_action_request(self, request, *, incident_id=None) -> list: ...
     def append_audit(self, record) -> None: ...
+    def record_thread_ownership(self, ownership) -> None: ...
     def get_incident(self, incident_id): ...
     def get_approval_request(self, thread_id): ...
+    def get_thread_ownership(self, thread_id): ...
     def list_action_rows(self, *, thread_id=None, incident_id=None) -> list: ...
     def pending_action_rows(self, *, thread_id=None) -> list: ...
     # list_audit 刻意缺失

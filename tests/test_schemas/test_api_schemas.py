@@ -120,7 +120,7 @@ def test_response_dto_does_not_forbid_extra():
 def test_extra_field_is_ignored_not_rejected():
     """行为层:多发字段被忽略(而不是抛 ValidationError)。"""
     req = TriageRequest.model_validate(
-        {"indicator": "203.0.113.66", "junk": 1, "nested": {"a": 2}}
+        {"indicator": "203.0.113.66", "approvers": ["bob"], "junk": 1, "nested": {"a": 2}}
     )
     assert req.indicator == "203.0.113.66"
     assert not hasattr(req, "junk")
@@ -134,7 +134,11 @@ def test_client_supplied_thread_id_is_dropped():
     thread"就成了劫持向量。这里锁住"进不来"。
     """
     req = TriageRequest.model_validate(
-        {"indicator": "203.0.113.66", "thread_id": "attacker-chosen"}
+        {
+            "indicator": "203.0.113.66",
+            "approvers": ["bob"],
+            "thread_id": "attacker-chosen",
+        }
     )
     assert not hasattr(req, "thread_id")
 

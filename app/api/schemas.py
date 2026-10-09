@@ -50,6 +50,16 @@ class TriageRequest(BaseModel):
     """POST /triage 的请求体。
 
     刻意不含 thread_id(见模块 docstring)。
+
+    **v0.3.0-A3-3 新增 `approvers`(必填)**:发起一次判定的人必须**显式**
+    说清"这条线程由谁来审批"。此前审批人是从角色推导的默认值(任何持有
+    approver 角色的人都能审批任何线程)—— 那让"谁能审批"变成一个**没人
+    记录过**的事实。现在它是一条被写下来的指派,并且:
+    非空、无重复、每个都必须是一个**已配置的 approver**、且不得包含发起人
+    自己(禁止自审批,D-7)。违反任一条 → 422,**在任何图调用或归属写入之前**。
+
+    发起人身份**不**来自本请求体:属主取自已认证主体的 subject,客户端
+    无法指定(与 thread_id 同一条理由 —— 能指定就等于能伪造)。
     """
 
     model_config = _REQUEST_EXTRA
@@ -60,15 +70,35 @@ class TriageRequest(BaseModel):
     event_type: str | None = Field(
         default=None, description="可选:限定统计的日志事件类型,如 login_failed"
     )
+    approvers: list[str] = Field(
+        min_length=1,
+        description=(
+            "显式指派的审批人 subject 列表(必填、非空、无重复;"
+            "每个都必须是已配置的 approver 角色主体,且不得是发起人自己)"
+        ),
+    )
 
 
 class ApprovalDecisionRequest(BaseModel):
-    """人工审批的决定字段(不含 thread_id,由 ResumeRequest 组合)。"""
+    """人工审批的决定字段(不含 thread_id,由 ResumeRequest 组合)。
+
+    ⚠️ `operator` 自 **v0.3.0-A3-3** 起**不是**权威身份:审批的 `actor`
+    一律取自已认证主体的 subject(见 `app/api/main.py` 的 `resume` 端点)。
+    这个字段仍然**必填**,只为保持既有线上请求的**错误兼容性**
+    (缺字段仍 422),它的值**被忽略** —— 服务端不会把它写进审计、
+    也不会拿它做任何判定。客户端无法通过伪造它来改变权威 actor。
+    """
 
     model_config = _REQUEST_EXTRA
 
     status: ApprovalStatus = Field(description="决定:approved / denied")
-    operator: str = Field(min_length=1, description="审批人标识")
+    operator: str = Field(
+        min_length=1,
+        description=(
+            "审批人标识(**非权威**:服务端忽略其值,actor 取自已认证主体;"
+            "字段保留仅为线上请求的错误兼容性)"
+        ),
+    )
     reason: str | None = Field(default=None, description="审批意见(可选)")
 
 

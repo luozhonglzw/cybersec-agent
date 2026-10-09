@@ -32,6 +32,7 @@ from app.core.graph import HitlConfig, create_agent_graph
 from app.core.llm import FakeLLMClient
 from app.core.triage import TriageService
 from app.security.store import SqliteAuditStore
+from tests.conftest import APPROVER_HEADERS, TEST_APPROVER_SUBJECT
 
 # 30 次失败登录 + 恶意情报 → critical → 策略要求人工审批
 BRUTE_FORCE_IP = "203.0.113.66"
@@ -120,12 +121,45 @@ def _service(store, logs: Path, intel: Path, checkpointer) -> TriageService:
 
 
 @pytest.fixture
-def client(tmp_path: Path, data_paths) -> TestClient:
-    """同时装配 /chat 与 /triage —— 两条链路都要能被关联断言覆盖。"""
+def store(tmp_path: Path) -> SqliteAuditStore:
+    return SqliteAuditStore(tmp_path / "audit.db")
+
+
+@pytest.fixture
+def service(store, data_paths) -> TriageService:
     logs, intel = data_paths
-    store = SqliteAuditStore(tmp_path / "audit.db")
-    service = _service(store, logs, intel, InMemorySaver())
-    return TestClient(create_app(agent=SecurityAgent(FakeLLMClient()), triage_service=service))
+    return _service(store, logs, intel, InMemorySaver())
+
+
+@pytest.fixture
+def client(service, store) -> TestClient:
+    """同时装配 /chat 与 /triage —— 两条链路都要能被关联断言覆盖。
+
+    A3-3 起必须注入 `audit_store`(/triage 写归属、/resume 读归属)。
+    """
+    return TestClient(
+        create_app(
+            agent=SecurityAgent(FakeLLMClient()),
+            triage_service=service,
+            audit_store=store,
+        )
+    )
+
+
+@pytest.fixture
+def approver_client(service, store) -> TestClient:
+    """**审批人**身份 —— /resume 用它(与发起人不同,禁止自审批 D-7)。
+
+    与 `client` 共享同一个 service/store(同一张图、同一个 checkpointer)。
+    """
+    return TestClient(
+        create_app(triage_service=service, audit_store=store),
+        headers=APPROVER_HEADERS,
+    )
+
+
+#: A3-3:发起判定必须显式指派审批人,且不能是发起人自己。
+APPROVERS = [TEST_APPROVER_SUBJECT]
 
 
 def _events(caps, name: str) -> list[dict]:
@@ -179,7 +213,7 @@ def test_t2_two_requests_get_distinct_request_ids(client):
 
 def test_t3_triage_service_and_graph_events_carry_request_and_thread_id(client):
     with capture_logs() as caps:
-        resp = client.post("/triage", json={"indicator": LOW_RISK_IP})
+        resp = client.post("/triage", json={"indicator": LOW_RISK_IP, "approvers": APPROVERS})
 
     assert resp.status_code == 200
     thread_id = resp.json()["thread_id"]
@@ -202,7 +236,7 @@ def test_t3_triage_service_and_graph_events_carry_request_and_thread_id(client):
 
 def test_t4_hitl_interrupt_keeps_request_thread_and_interrupt_id(client):
     with capture_logs() as caps:
-        resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP})
+        resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS})
 
     body = resp.json()
     assert resp.status_code == 200
@@ -226,13 +260,13 @@ def test_t4_hitl_interrupt_keeps_request_thread_and_interrupt_id(client):
 # T5 — /resume 生成新 request_id、复用 thread_id / interrupt_id
 # =====================================================================
 
-def test_t5_resume_gets_new_request_id_same_thread_and_interrupt(client):
+def test_t5_resume_gets_new_request_id_same_thread_and_interrupt(client, approver_client):
     with capture_logs() as caps_triage:
-        paused = client.post("/triage", json={"indicator": BRUTE_FORCE_IP}).json()
+        paused = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS}).json()
     request_id_a = _request_id_of(caps_triage)
 
     with capture_logs() as caps_resume:
-        resp = client.post("/resume", json={
+        resp = approver_client.post("/resume", json={
             "thread_id": paused["thread_id"],
             "status": "approved",
             "operator": "analyst-1",
@@ -258,7 +292,7 @@ def test_t5_resume_gets_new_request_id_same_thread_and_interrupt(client):
 
 def test_t6_graph_events_enriched_without_changing_result(client):
     with capture_logs() as caps:
-        resp = client.post("/triage", json={"indicator": LOW_RISK_IP})
+        resp = client.post("/triage", json={"indicator": LOW_RISK_IP, "approvers": APPROVERS})
 
     body = resp.json()
     # 图结果与既有契约完全一致
@@ -282,11 +316,14 @@ def test_t7_exception_path_preserves_status_and_correlation(tmp_path, data_paths
     logs, intel = data_paths
     store = SqliteAuditStore(tmp_path / "audit.db")
     missing = tmp_path / "missing.jsonl"
-    app = create_app(triage_service=_service(store, missing, intel, InMemorySaver()))
+    app = create_app(
+        triage_service=_service(store, missing, intel, InMemorySaver()),
+        audit_store=store,
+    )
     client = TestClient(app)
 
     with capture_logs() as caps:
-        resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP})
+        resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS})
 
     # 既有 HTTP 语义不变:数据源不可用 → 503,detail 不含路径
     assert resp.status_code == 503
@@ -364,7 +401,7 @@ def test_t8_sensitive_material_absent_from_logs(client):
 
     # /triage 路径同样检查
     with capture_logs() as caps2:
-        client.post("/triage", json={"indicator": BRUTE_FORCE_IP})
+        client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS})
     for rec in caps2:
         keys = set(rec) - {"event", "log_level"}
         assert keys <= _ALLOWED_LOG_KEYS
@@ -397,17 +434,17 @@ def _run_hitl_flow(tmp_path: Path, data_paths, *, capture: bool) -> tuple[dict, 
     logs, intel = data_paths
     store = SqliteAuditStore(tmp_path / f"audit-{capture}.db")
     service = _service(store, logs, intel, InMemorySaver())
-    client = TestClient(create_app(triage_service=service))
+    client = TestClient(create_app(triage_service=service, audit_store=store))
 
     if capture:
         with capture_logs():
-            paused = client.post("/triage", json={"indicator": BRUTE_FORCE_IP}).json()
-            client.post("/resume", json={
+            paused = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS}).json()
+            client.post("/resume", headers=APPROVER_HEADERS, json={
                 "thread_id": paused["thread_id"], "status": "approved", "operator": "analyst-1",
             })
     else:
-        paused = client.post("/triage", json={"indicator": BRUTE_FORCE_IP}).json()
-        client.post("/resume", json={
+        paused = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS}).json()
+        client.post("/resume", headers=APPROVER_HEADERS, json={
             "thread_id": paused["thread_id"], "status": "approved", "operator": "analyst-1",
         })
     return paused, paused["thread_id"], _audit_semantics(store, paused["thread_id"])
@@ -440,10 +477,10 @@ def test_t9b_audit_thread_and_interrupt_linkage_preserved(tmp_path, data_paths):
     logs, intel = data_paths
     store = SqliteAuditStore(tmp_path / "audit.db")
     service = _service(store, logs, intel, InMemorySaver())
-    client = TestClient(create_app(triage_service=service))
+    client = TestClient(create_app(triage_service=service, audit_store=store))
 
-    paused = client.post("/triage", json={"indicator": BRUTE_FORCE_IP}).json()
-    client.post("/resume", json={
+    paused = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS}).json()
+    client.post("/resume", headers=APPROVER_HEADERS, json={
         "thread_id": paused["thread_id"], "status": "approved", "operator": "analyst-1",
     })
 

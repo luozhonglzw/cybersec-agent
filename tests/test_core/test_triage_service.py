@@ -542,15 +542,28 @@ def test_resume_does_not_accept_interrupt_id():
     assert params == {"self", "thread_id", "status", "operator", "reason", "request_id"}
 
 
-def test_triage_does_not_accept_thread_id():
-    """D3:thread_id 只能服务端生成,方法签名里没有它。
+def test_triage_thread_id_is_never_client_supplied():
+    """D3(A3-3 修订):thread_id 只能由**服务端**决定,客户端无法指定。
 
-    request_id(9.3-D)是运维关联参数,不参与 thread_id 的生成或选择 ——
-    thread_id 仍恒为服务端 uuid4,本护栏不放松。
+    A3-3 起 `TriageService.triage` 多了一个**可选**的 `thread_id` 参数 ——
+    存在它的唯一理由是:HTTP 边界必须**在跑图之前**写好线程归属,而归属
+    记录里要带 thread_id。这不改变 D3 的性质:
+
+    - 参数默认 `None` ⇒ 不传时本方法照旧自己生成 uuid4;
+    - 请求 DTO(`TriageRequest`)里**没有** thread_id 字段 ⇒ 客户端仍然
+      没有任何输入面,无法复用别人暂停中的 state。
+
+    这条护栏同时钉住"签名被改宽了"与"DTO 被加回了 thread_id"两件事。
     """
-    params = set(inspect.signature(TriageService.triage).parameters)
-    assert "thread_id" not in params
-    assert params == {"self", "indicator", "event_type", "request_id"}
+    params = inspect.signature(TriageService.triage).parameters
+    assert params["thread_id"].default is None
+    assert set(params) == {
+        "self", "indicator", "event_type", "request_id", "thread_id",
+    }
+
+    from app.api.schemas import TriageRequest
+
+    assert "thread_id" not in TriageRequest.model_fields
 
 
 def test_triage_module_does_not_import_api_layer():

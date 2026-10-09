@@ -14,6 +14,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.security.auth import AuthKeyEntry, AuthKeyring
+
 #: 审计后端取值集(Phase v0.2.0-M1c)。
 #:
 #: - `sqlite`   —— **默认**,与 v0.1.0 行为完全一致(本地文件库);
@@ -69,6 +71,22 @@ class Settings(BaseSettings):
     #   迁移与 DDL 由 migration-owner 角色在 Alembic 里做。
     audit_postgres_dsn: SecretStr | None = None
 
+    # ---- 认证与角色(Phase v0.3.0-A3-1)----
+    # 必填,**至少一条**。这是"认证始终开启"的落地方式:
+    # 没有 `AUTH_ENABLED=false` 之类的开关 —— 想放开匿名访问的部署必须
+    # 显式建一个匿名主体,那个主体在配置里**看得见**、在审计里**可归属**;
+    # 而一个布尔开关一旦配错,就是一个开放 API,且与"有意为之"在日志里
+    # 无从区分。
+    #
+    # 配置里只有**摘要**(sha256,64 位小写十六进制),没有原始密钥:
+    # 运维生成密钥、只出示一次,配置泄露不会直接给出可用凭据。
+    # 形态为:
+    #   AUTH_API_KEYS=[{"sha256":"<64 hex>","subject":"alice","role":"approver"}]
+    #
+    # 校验分两层:条目形态 / 角色封闭集由 `AuthKeyEntry` 在**解析期**拒绝;
+    # 重复 subject / 重复摘要由 `AuthKeyring` 在下面的 validator 里拒绝。
+    auth_api_keys: list[AuthKeyEntry] = Field(min_length=1)
+
     @model_validator(mode="after")
     def _require_dsn_when_postgres(self) -> "Settings":
         """选了 postgres 却没给 DSN → 启动期就响亮失败。
@@ -84,6 +102,21 @@ class Settings(BaseSettings):
                     "audit_backend='postgres' 需要 AUDIT_POSTGRES_DSN;"
                     "未提供 DSN 时不会回退到 SQLite。"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _require_valid_auth_keys(self) -> "Settings":
+        """认证配置非法 → 启动期就响亮失败(Phase v0.3.0-A3-1)。
+
+        与 `_require_dsn_when_postgres` 同一条论证:把"没配密钥"当成
+        "关掉认证",会让"这个 API 是已认证的"变成一个**未经核实**的假设。
+        宁可进程起不来。
+
+        条目级规则(形态 / 角色封闭集 / 非空)已经由 `AuthKeyEntry` 在解析期
+        拒绝;**集合级**规则(至少一条、subject 不重复、摘要不重复)在这里
+        交给 `AuthKeyring` —— 规则的实现只有一份,两个边界都用它。
+        """
+        AuthKeyring.from_entries(self.auth_api_keys)
         return self
 
 

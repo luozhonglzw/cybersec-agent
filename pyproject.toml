@@ -1,6 +1,6 @@
 [project]
 name = "cybersec-agent"
-version = "0.2.0"
+version = "0.3.0"
 description = "A LangGraph-based security operations agent with deterministic policy, human approval, and auditable tool use."
 readme = "README.md"
 requires-python = ">=3.12"

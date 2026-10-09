@@ -34,6 +34,7 @@ from app.core.llm import FakeLLMClient
 from app.schemas.audit import AuditRecord
 from app.security.audit import build_audit_record
 from app.security.store import SqliteAuditStore
+from tests.conftest import VIEWER_HEADERS
 
 BASE_TS = datetime(2026, 9, 20, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -57,8 +58,14 @@ def store(tmp_path: Path) -> SqliteAuditStore:
 
 @pytest.fixture
 def client(store: SqliteAuditStore) -> TestClient:
-    """只注入 audit_store → lifespan 不运行(无需 .env / 真实 LLM)。"""
-    return TestClient(create_app(audit_store=store))
+    """只注入 audit_store → lifespan 不运行(无需 .env / 真实 LLM)。
+
+    **以 `viewer` 身份**发请求(A3-3 起):本模块验证的是查询契约本身
+    (参数集 / 排序 / 分页 / 过滤 / 503),而 `viewer` 是唯一允许**未过滤**
+    读取的角色。按角色的读取范围收敛由
+    `tests/test_api/test_object_authorization.py` 覆盖。
+    """
+    return TestClient(create_app(audit_store=store), headers=VIEWER_HEADERS)
 
 
 def _seed(
@@ -489,6 +496,11 @@ _FORBIDDEN_CALL_NAMES = frozenset({
     "list_action_rows",
     "get_incident",
     "get_approval_request",
+    # v0.3.0-A3-2 新增的归属**写**方法 —— 审计读端点不得触达。
+    # (`get_thread_ownership` 自 A3-3 起**是允许的**:读取范围收敛必须
+    #  先查归属,否则 analyst / approver 的范围判定无从做起。归属的
+    #  **写**仍然禁止 —— 读路径不建立归属。)
+    "record_thread_ownership",
     # 策略 / 图 / 服务 / 工具 / provider —— 读路径不得触达
     "evaluate_policy",
     "triage",

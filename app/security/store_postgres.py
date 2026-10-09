@@ -1,9 +1,10 @@
 """PostgreSQL 持久化层 —— Phase v0.2.0-M1b。
 
 `SqliteAuditStore` 的 PostgreSQL 对等实现,满足 `app.security.store_protocol.AuditStore`
-的**全部 8 个方法**。装配在**组合根**(`app/api/main.py` 的 `build_audit_store`)
-按 `Settings` 的后端设置显式 opt-in(Phase v0.2.0-M1c);本模块自身不做后端
-选择,默认后端仍是 SQLite。
+的**全部 10 个方法**(v0.3.0-A3-2 从 8 扩到 10:新增 `record_thread_ownership` /
+`get_thread_ownership`,既有 8 个的签名与行为未动)。装配在**组合根**
+(`app/api/main.py` 的 `build_audit_store`)按 `Settings` 的后端设置显式 opt-in
+(Phase v0.2.0-M1c);本模块自身不做后端选择,默认后端仍是 SQLite。
 
 ## 与 SQLite 版的**逐条对齐**(这些是刻意的,不是巧合)
 
@@ -39,7 +40,8 @@ PostgreSQL 是**权限层 + 触发器层两道独立防线** ——
 
 1. 连接身份是受限的 `cybersec_app` 角色,它**没有** `UPDATE` / `DELETE` /
    `TRUNCATE` 权限,在 schema 上也没有 `CREATE`;
-2. 即便用表 owner 身份,9 条库层触发器也会 `RAISE EXCEPTION`。
+2. 即便用表 owner 身份,12 条库层触发器(0001 的 9 条 + 0002 的 3 条)也会
+   `RAISE EXCEPTION`。
 
 本模块**只发 INSERT**,不含 `UPDATE` / `DELETE` / `UPSERT` / `ON CONFLICT`
 —— 由 `tests/test_postgres/test_store_postgres_specific.py` 的源码级护栏守着。
@@ -84,11 +86,20 @@ from psycopg_pool import ConnectionPool
 from app.schemas.approval import ApprovalRequest
 from app.schemas.audit import AuditRecord
 from app.schemas.incident import Incident
+from app.schemas.ownership import ThreadOwnership
 from app.schemas.response import ResponseAction, ResponsePlan
 
 # 时间语义**复用** SQLite 版的实现 —— 单一真相源,杜绝两侧漂移。
-# 只 import 两个纯函数,不 import 那个类,也不触碰 store.py 的任何内容。
-from app.security.store import _from_iso, _to_iso
+# 同理复用审批集合的规范序列化/严格反序列化(`_serialize_approvers` /
+# `_deserialize_approvers`):"同一指派必须只有一个字节表示"与"畸形存储值
+# 必须响亮失败"这两条是承重性质,两侧各写一份迟早会分叉。
+# 只 import 这几个纯函数,不 import 那个类,也不触碰 store.py 的任何内容。
+from app.security.store import (
+    _deserialize_approvers,
+    _from_iso,
+    _serialize_approvers,
+    _to_iso,
+)
 
 #: 写入列清单 —— **不含 `seq`**(identity 列由数据库生成,显式赋值会被拒绝)。
 _ACTION_REQUEST_COLUMNS = (
@@ -326,6 +337,42 @@ class PostgresAuditStore:
                 ),
             )
 
+    # ---------- 写:thread_owners(v0.3.0-A3-2) ----------
+
+    def record_thread_ownership(self, ownership: ThreadOwnership) -> None:
+        """写入一条线程归属(属主 + **完整**审批集合),**单条 INSERT**。
+
+        与 SQLite 版**同语义**:A3-2-FIX2 起归属是**一行**(属主与规范序的
+        审批集合同处一行),因此原子性是**结构性**的 —— 一条 INSERT 要么
+        落地要么不落地,不存在"属主行在、审批集合缺"的中间态,也就不可能
+        出现一条"看起来已指派、其实没人能审批"的线程。孤儿审批行同样在
+        结构上不可能存在:审批集合没有独立的行。
+
+        失败即抛,**不做任何补救**:不重试、不吞、**不降级到 SQLite**、
+        不"补写剩下几行"。`/triage` 在生成任何东西之前调用本方法,所以
+        抛出去就是 fail closed —— 没有线程、没有审计行。
+        重复注册由 `thread_owners.thread_id` 主键拒绝(与 SQLite 的
+        `IntegrityError` 对应的是 `psycopg.errors.UniqueViolation`,同为
+        `IntegrityError` 子类),本方法**不得**把它吞掉或改成 upsert。
+        并发注册同一 thread_id 时,唯一约束保证**恰好一个**胜者,落库的
+        审批集合就是胜者的那一份(不存在合并)。
+
+        本方法不做任何授权判定(不检查 subject 是否存在 / 是否持 approver
+        角色 / 是否等于属主)—— 那些是服务层的判定(A5)。
+        """
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO thread_owners"
+                " (thread_id, owner, approvers, created_at)"
+                " VALUES (%s, %s, %s, %s)",
+                (
+                    ownership.thread_id,
+                    ownership.owner,
+                    _serialize_approvers(ownership.approvers),
+                    _to_iso(ownership.created_at),
+                ),
+            )
+
     # ---------- 读:incidents ----------
 
     def get_incident(self, incident_id: str) -> Incident | None:
@@ -344,6 +391,35 @@ class PostgresAuditStore:
             score=row["score"],
             summary=row["summary"],
             plan=ResponsePlan.model_validate_json(row["plan_json"]),
+        )
+
+    # ---------- 读:thread_owners(v0.3.0-A3-2) ----------
+
+    def get_thread_ownership(self, thread_id: str) -> ThreadOwnership | None:
+        """按 thread_id 读回归属(属主 + 完整审批集合);不存在返回 None。
+
+        **无归属 ⇒ None,绝不回退**(与 SQLite 版同语义):调用方拿到 `None`
+        只能拒绝(A5 的 `/resume` 对无归属线程一律 404),不得读成
+        "那就用任意 approver" 或"那就用属主" —— 那两种都是 fail-open。
+
+        读取同样重新过 Pydantic 校验(与 SQLite 版 / `get_incident` 同惯例),
+        且 `approvers` 的反序列化是**严格的**(见 `_deserialize_approvers`):
+        畸形 / 空 / 非数组的存储值一律响亮失败,绝不被静默读成
+        "这条线程没有审批人"。顺序由模型归一化,不依赖存储里的书写顺序。
+        """
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT thread_id, owner, approvers, created_at FROM thread_owners"
+                " WHERE thread_id = %s",
+                (thread_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ThreadOwnership(
+            thread_id=row["thread_id"],
+            owner=row["owner"],
+            approvers=_deserialize_approvers(row["approvers"]),
+            created_at=_from_iso(row["created_at"]),
         )
 
     # ---------- 读:action_requests ----------

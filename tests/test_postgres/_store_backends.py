@@ -32,6 +32,7 @@ import psycopg
 
 from app.schemas.approval import ApprovalRequest
 from app.schemas.incident import Incident
+from app.schemas.ownership import ThreadOwnership
 from app.schemas.response import ResponseAction, ResponsePlan
 from app.schemas.risk import RiskAssessment, RiskEvidence
 
@@ -129,6 +130,29 @@ def make_request(
             else ["动作按属性需要人工审批"]
         ),
         requested_at=requested_at,
+    )
+
+
+#: 归属测试用的主体名。**必须**是不同的字面量:`owner not in approvers` 是
+#: 模型的硬校验,用同一个名字会让用例在构造期就炸,而不是在断言处失败。
+OWNER = "alice"
+APPROVER_B = "bob"
+APPROVER_C = "carol"
+
+
+def make_ownership(
+    *,
+    thread_id: str,
+    owner: str = OWNER,
+    approvers: tuple[str, ...] = (APPROVER_B,),
+    created_at: datetime = TS,
+) -> ThreadOwnership:
+    """v0.3.0-A3-2 的归属聚合 —— 两个后端共用同一份输入。"""
+    return ThreadOwnership(
+        thread_id=thread_id,
+        owner=owner,
+        approvers=approvers,
+        created_at=created_at,
     )
 
 

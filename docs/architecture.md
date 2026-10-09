@@ -136,6 +136,8 @@ LLM 只能产生：
 > 蓝图里画出且**已落地**的：`app/api/`、`app/schemas/`、`app/tools/`、`app/security/`（policy / audit / store）、`app/evaluation/`（离线架构 harness + 真实 provider 评估 harness，见 §6 / §14）、`app/mcp/`（Phase 9.3-E，见 §8 Flow C）。
 >
 > **路由命名的实现偏离**：蓝图写 `/chat /approve /audit`，实际实现为 `/chat /triage /resume`。审批不是独立端点——审批决定（`status` + `operator`）是 `/resume` 的请求载荷，与恢复句柄 `thread_id` 一起构成一次完整的恢复请求，拆成两个端点会引入"审批了但没恢复"的中间态。审计写入走 `app/security/store.py`；审计**读接口**已于 Phase 9.3-F 落地为只读的 `GET /audit/events`（蓝图里的 `/audit` 这个具体路径名未采用，见 §8 Flow D）。
+>
+> **认证与授权（Phase v0.3.0-A3-1 / A3-3）**：四条业务路由（`/chat` / `/triage` / `/resume` / `/audit/events`）都要求 `Authorization: Bearer <key>`；文档路由（`/openapi.json` / `/docs` / `/docs/oauth2-redirect` / `/redoc`）按设计保持公开。角色准入（viewer / analyst / approver）与逐线程对象授权见 §11.7。
 
 ### 为什么是单进程 + FastAPI + SQLite + ChromaDB？
 
@@ -240,12 +242,12 @@ cybersec-agent/
 cybersec-agent/
 ├── app/
 │   ├── core/       # config / llm / agent / graph（编排层单文件）/ triage（无独立 logging.py：结构化日志用 structlog 内联在既有模块中）
-│   ├── schemas/    # log_event / threat_intel / risk / response / approval / incident / audit
+│   ├── schemas/    # log_event / threat_intel / risk / response / approval / incident / audit / ownership
 │   ├── tools/      # query_logs / query_threat_intel / risk_analyzer / response_planner
-│   ├── security/   # policy / audit / store（Phase 8）+ store_protocol（AuditStore 契约）/ store_postgres（可选后端，Phase v0.2.0）
+│   ├── security/   # policy / audit / store（Phase 8）+ store_protocol（AuditStore 契约）/ store_postgres（可选后端，Phase v0.2.0）+ auth（静态 API Key 认证与角色准入，Phase v0.3.0-A3-1）
 │   ├── evaluation/ # 离线架构 harness（runner / metrics / oracles / cases / golden）+ llm/（真实 provider 评估：budget / runner / confinement / offline_guard / pilot ...）
 │   ├── mcp/        # Phase 9.3-E：只读 MCP 适配器（tools.py）+ 本地 stdio 入口（server.py）
-│   └── api/        # main（/chat /triage /resume + 只读 /audit/events）+ schemas
+│   └── api/        # main（/chat /triage /resume + 只读 /audit/events；四条业务路由均需 Bearer 认证）+ schemas
 ├── data/           # security_events.jsonl / threat_intel.jsonl（**仅 JSONL**）
 ├── scripts/        # seed_logs.py / seed_threat_intel.py；pg/ 下是角色引导 SQL
 ├── tests/          # test_api / test_core / test_schemas / test_security / test_tools / test_mcp / test_evaluation / test_evaluation_llm / test_postgres（真实 PG，默认不收集）
@@ -354,7 +356,15 @@ HTTP Client
 
 **路径边界**：请求契约里没有路径参数 —— 客户端**不能**选择审计库路径；服务端继续使用受信任的配置存储（`Settings.audit_db_path`，由组合根在 lifespan 注入）。未声明的 path-like 查询参数会被 FastAPI **忽略**（不是拒绝），因此无法把读取重定向到别的库。
 
-**认证边界**：本端点是**只读**的，**不等于**已认证 / 已授权 —— 本原型仍**没有**生产级认证 / 授权层，端点不是 "authorized endpoint"，也不应被描述为"仅审计员可见"。`actor` 字段仍只是调用方自称的字符串（见 §11.4 已知局限）。
+**认证与范围边界（Phase v0.3.0-A3-1 / A3-3）**：本端点要求已认证主体（`Authorization: Bearer`），并且**在取回任何审计内容之前**按角色收敛读取范围（见 §11.7；实现是 `app/api/main.py` 的 `_authorize_audit_scope`）：
+
+| 角色 | 范围 |
+|---|---|
+| `viewer` | 全量可读（含历史无归属线程）；`thread_id` 可省可给 |
+| `analyst` | **必须**给 `thread_id`，且只能是**自己拥有**的线程 |
+| `approver` | **必须**给 `thread_id`，且只能是**自己拥有或显式被指派审批**的线程 |
+
+analyst / approver 不带范围 → **403**；带了但线程不在范围内（含无归属 / 不存在）→ **404**（文案与"线程不存在"逐字相同，不给枚举预言机）。这是**对象授权**，不是"取全量再在 Python 里筛"——未授权时根本不调用 `list_audit`。审计 `actor` 取自已认证主体，客户端无法伪造（见 §11.7 与 §11.4）。
 
 append-only 语义不受本端点影响：它**不能** UPDATE / DELETE / 清空审计，**不能**批准 / 拒绝 / resume，**不能**执行工具或调用 provider/model（见 §11.3）。
 
@@ -480,17 +490,20 @@ class AgentState(TypedDict, total=False):
 
 ### 11.1 实际落地的表（`app/security/store.py`，Phase 8.2）
 
-三张 SQLite 表，字段以 DDL 为准：
+四张 SQLite 表，字段以 DDL 为准：
 
 | 表 | 用途 | 关键字段 | 引入 Phase |
 |---|---|---|---|
 | incidents | 分析结论沉淀 | id, created_at, indicator, risk_level, score, summary, plan_json | 8 |
 | action_requests | HITL 审批单 | id, incident_id, thread_id, indicator, risk_level, score, summary, policy_reasons, action_type, priority, target, rationale, requires_approval, reversible, requested_at | 8 |
 | audit_logs | 审计流水 | id, ts, actor, event, incident_id, thread_id, interrupt_id, outcome, reason, plan_digest, detail_json | 8 |
+| thread_owners | 线程归属（**单行不可变**：属主 + 完整审批集合） | thread_id（主键）, owner, approvers, created_at | v0.3.0-A3-2 |
 
 > **`action_requests` 没有 `status` 列** —— 这不是遗漏，见 §11.3。
 
-> PostgreSQL 后端（Phase v0.2.0-M1a）落地的是**同一组三张表**，字段与约束以 `migrations/versions/0001_baseline_audit_schema.py` 的 DDL 为准（`seq` 是 identity 主键列，替代 SQLite 的隐式 `rowid`），库层禁改触发器从 6 条扩到 9 条（每表多一条 `BEFORE TRUNCATE`）。**checkpoint 不在此列** —— 见 §11.2 与 §11.6。
+> **`thread_owners` 是单行不可变设计（A3-2-FIX2）**：属主与**完整**审批集合同处一行，因此"属主已写、审批集合缺"这种部分写入在结构上不可能存在。该表**没有**独立的、可单独写的审批人表 —— 审批集合只能随归属行一次性写入，写入即不可改。逐线程归属与审批指派的语义见 §11.7。
+
+> PostgreSQL 后端（Phase v0.2.0-M1a / A3-2）落地的是**同一组四张表**，字段与约束以 `migrations/versions/0001_baseline_audit_schema.py` 与 `0002_thread_ownership.py` 的 DDL 为准（`seq` 是 identity 主键列，替代 SQLite 的隐式 `rowid`），库层禁改触发器为 12 条（四张业务表 × `UPDATE` / `DELETE` / `TRUNCATE`）。**checkpoint 不在此列** —— 见 §11.2 与 §11.6。
 
 ### 11.2 蓝图 vs 实现（未被实现为 SQLite 表的部分）
 
@@ -509,7 +522,7 @@ ChromaDB collections（`mitre_techniques` / `cve_entries` / `threat_reports`）�
 
 1. **纯 INSERT 写入路径**：store 不提供任何 UPDATE / DELETE / INSERT OR REPLACE 接口；
 2. **`id` 为 PRIMARY KEY**：重复写入抛 `IntegrityError`（响亮失败，不静默覆盖）；
-3. **库层禁改触发器**：每张表 `BEFORE UPDATE` / `BEFORE DELETE` 各一条 `RAISE(ABORT, ...)` —— 绕过应用层直连 `sqlite3` 也改不动（共 6 条触发器）；
+3. **库层禁改触发器**：每张表 `BEFORE UPDATE` / `BEFORE DELETE` 各一条 `RAISE(ABORT, ...)` —— 绕过应用层直连 `sqlite3` 也改不动（四张表 × 2 = 共 8 条触发器）；
 4. **表中不存在可变状态列**：`action_requests` 没有 `status`；
 5. **待审批状态是派生值**：某 `thread_id` 在 `audit_logs` 里既没有对应的 `approval.decided`、也没有 `approval.timeout` 行 → 仍为 pending。状态是 `NOT EXISTS` 的查询结果，不是被改写的字段。
    - Phase 9.1-A 起有**两个终态事件**（人工决定 / 审批超时）。超时若不解除 pending，已过期的 thread 会每轮惰性清理都重复写一条 `approval.timeout` —— 审计是事实日志，重复计数就是失真。
@@ -533,7 +546,7 @@ AuditEvent = Literal[
 `plan.failed` 的 `detail` 只含 `indicator` 与 `error_type`，**不记异常 message、不记绝对路径、不记 traceback** —— 审计库里的路径会永久留存，泄露内部目录结构。
 
 > 已知局限（必须文档化，不得掩盖）：
-> - 本阶段**没有身份认证** —— `actor` 只是调用方自称的字符串，**不具备不可否认性**。认证 / 签名留到 Phase 10（或后续引入最小 API key）。
+> - **认证自 Phase v0.3.0-A3-1 起已启用**（静态 API Key → `Principal(subject, role)`），`actor` 自 **A3-3** 起取自已认证主体、客户端无法伪造。但仍**不具备不可否认性**：没有签名，也没有把"客户端自述身份"与"已验证身份"分别记录（A6 才补 `verified_subject` + 签名）。持有有效密钥的主体仍可否认自己做过该动作。
 > - `audit_logs.incident_id` 对图节点与 `approval.timeout` 均为 `NULL`（incident 在图跑完之后才创建，D4）；按 incident 查审计流查不到本次判定，须改用 `thread_id`。
 
 ### 11.5 incident 持久化为何延后到 Phase 8（历史决策）
@@ -548,7 +561,7 @@ AuditEvent = Literal[
 
 #### 契约，而非实现
 
-`app/security/store_protocol.py` 的 `AuditStore` 是**唯一**的持久化契约（`@runtime_checkable`，恰好 8 个方法）。HITL 图节点（`app/core/graph.py` 的 `HitlConfig.audit_store`）、`TriageService`、以及只读端点 `GET /audit/events` 都只依赖这个契约。
+`app/security/store_protocol.py` 的 `AuditStore` 是**唯一**的持久化契约（`@runtime_checkable`，**恰好 10 个方法**：原 8 个读写方法，加上 A3-2 新增的 `record_thread_ownership` / `get_thread_ownership`）。HITL 图节点（`app/core/graph.py` 的 `HitlConfig.audit_store`）、`TriageService`、以及只读端点 `GET /audit/events` 都只依赖这个契约。
 
 - **后端选择只发生一次**：`app/api/main.py` 的 `build_audit_store(settings)`。全项目只有 `app/api/main.py` 与 `app/core/config.py` 读 `audit_backend` / `audit_postgres_dsn`；图节点、triage、端点里没有任何"是 sqlite 还是 postgres"的分支（由 AST 结构护栏钉住）。
 - **`close()` 刻意不进契约**：只有持有连接池的后端才有可释放的长期资源；SQLite 版每次操作新开连接、用完即关。为一个后端的具体需要给所有实现强加一个方法，会让契约描述**实现细节**而不是**行为**。释放由组合根按具体类型判断（`close_audit_store`），连接池**归 lifespan 所有**、每进程一个，绝不按请求建池；`finally` 同时覆盖"正常退出"与"部分启动失败"。
@@ -559,12 +572,12 @@ AuditEvent = Literal[
 - **不自动回退**：`AUDIT_BACKEND=postgres` 而 DSN 缺失或为空 → 启动期 `ValidationError`，**绝不**悄悄退回 SQLite。`AuditBackend` 是封闭取值集，刻意不含 `auto` / `fallback` 之类的取值。
 - **不双写、不做数据迁移转换**：一个进程只有一个审计 store，不存在"两边都写"，也没有 SQLite ↔ PostgreSQL 的搬迁或自动转换。
 - **不做运行时 DDL**：运行期角色 `cybersec_app` 只有 `SELECT` / `INSERT`，没有 `UPDATE` / `DELETE` / `TRUNCATE`，也没有 `public` 上的 `CREATE`。建表与迁移只走 Alembic，且必须以 migration-owner 角色 `cybersec_migrator` 身份运行（基线迁移里有一条显式守卫拒绝以 `cybersec_app` 运行）。
-- **不是 checkpoint 存储**：PostgreSQL 只承载 `incidents` / `action_requests` / `audit_logs` 三张表。LangGraph checkpoint 仍是 `InMemorySaver`（进程内内存，**不落盘**），因此**跨进程恢复仍不可用**，停在 `human_approval` 的 run 在进程重启后无法恢复 —— 换审计后端**不改变**这一点。
+- **不是 checkpoint 存储**：PostgreSQL 只承载 `incidents` / `action_requests` / `audit_logs` / `thread_owners` 四张表。LangGraph checkpoint 仍是 `InMemorySaver`（进程内内存，**不落盘**），因此**跨进程恢复仍不可用**，停在 `human_approval` 的 run 在进程重启后无法恢复 —— 换审计后端**不改变**这一点。
 - **不引入** PostgreSQL checkpointer、认证 / RBAC、Redis、RAG、多 Agent、后台调度器；默认拓扑 `compose.yaml` 不改动。
 
 #### append-only 的边界（必须一起说清楚）
 
-PostgreSQL 侧与 SQLite 侧同样是**库层强制**的 append-only，且覆盖更全：每张表 3 条禁改触发器（`BEFORE UPDATE` / `BEFORE DELETE` / `BEFORE TRUNCATE`，共 9 条）。
+PostgreSQL 侧与 SQLite 侧同样是**库层强制**的 append-only，且覆盖更全：四张业务表每张 3 条禁改触发器（`BEFORE UPDATE` / `BEFORE DELETE` / `BEFORE TRUNCATE`，共 12 条）。
 
 为什么 PostgreSQL 需要多一条 `TRUNCATE`：行级 `FOR EACH ROW` 触发器在**命中 0 行**时不会触发，而 `TRUNCATE` 是语句级操作、不逐行走触发器 —— 不单独拦它，就等于留下一条"整表清空"的路。
 
@@ -572,7 +585,7 @@ PostgreSQL 侧与 SQLite 侧同样是**库层强制**的 append-only，且覆盖
 
 - 触发器拦的是**应用与运行期角色**发出的 `UPDATE` / `DELETE` / `TRUNCATE`；
 - 它**拦不住**超级用户、表 owner、有足够权限的管理员，也**拦不住**一条伪造的 `INSERT`（写进一条看起来完全合理的记录）；
-- 没有签名、没有外部锚定、没有不可否认性 —— `actor` 仍只是调用方自称的字符串（见 §11.4）。
+- 没有签名、没有外部锚定、没有不可否认性 —— `actor` 自 A3-3 起取自已认证主体（客户端无法伪造），但**仍不具备**不可否认性（见 §11.4 与 §11.7）。
 
 另外两处必须写明的语义：
 
@@ -585,6 +598,38 @@ PostgreSQL 侧与 SQLite 侧同样是**库层强制**的 append-only，且覆盖
 - store 侧不打印 DSN、不把它写进异常消息；`__repr__` 走 `redact_dsn` 把口令换成 `***`，解析失败也**不回显原文**。
 - 组合根在语法校验失败时 `raise ... from None` —— 实测 psycopg 的解析错误文本会**内嵌连接串片段**，把 `__cause__` 挂上去等于把口令写进 traceback。
 - 仓库里**没有**真实凭据。`compose.postgres.yaml` / `scripts/pg/bootstrap_roles.sql` / CI 工作流里的是**一次性本地与 CI 测试凭据**：不是机密、不得复用、不得承载真实数据。`alembic.ini` 的 `sqlalchemy.url` 是**空**的，迁移连接串只来自环境变量 `CYBERSEC_PG_MIGRATION_DSN`。
+
+### 11.7 认证与授权（Phase v0.3.0-A3-1 / A3-2 / A3-3）
+
+**认证是始终开启的**：`app/security/auth.py` 把 `Authorization: Bearer <key>` 解析成 `Principal(subject, role)`。配置 `AUTH_API_KEYS` 里只存 **SHA-256 摘要**，不存原始密钥；配置缺失 / 非法（空、坏 JSON、角色不在封闭集、摘要非 64 位小写十六进制、subject 或摘要重复）→ `Settings` 启动期 `ValidationError`，进程**拒绝启动**。刻意**没有** `AUTH_ENABLED=false` 这类开关 —— 想放开匿名访问的部署应当显式建一个匿名主体，那样它在配置里看得见、在审计里可归属。
+
+为什么是 SHA-256 而不是 bcrypt / argon2：API Key 是高熵随机串（≥32 字节），没有字典可防；慢 KDF 只会给每个请求加延迟。这里要防的是"配置泄露后密钥还能直接用"。
+
+为什么不用 JWT / OIDC：本阶段冻结的范围是"静态 API Key 映射到 Principal"；JWT 会引入签名密钥管理、过期 / 刷新语义、时钟依赖与新依赖，均不在授权内。
+
+**角色是封闭集**（`viewer` / `analyst` / `approver`）。`subject` 是身份（用于归属与指派），`role` 是授权（用于路由准入）—— 刻意不合并：合并会让"两个人共用 approver 角色"无法表达，而"至少两个独立主体"正是禁止自审批能落地的前提。
+
+**路由授权矩阵（角色准入）**：
+
+| 路由 | 准入 | 说明 |
+|---|---|---|
+| `POST /chat` | analyst / approver | 纯 LLM 对话；**不**经 HITL 图、**不**做策略判定、**不**写审计、**不**要求审批。不得描述成"受策略 / 审批保护" |
+| `POST /triage` | analyst / approver | 发起一次 HITL 判定；属主 = 已认证 subject |
+| `POST /resume` | 仅 approver | 角色准入 + 逐线程对象授权（见下） |
+| `GET /audit/events` | 任一已认证主体 | 按角色收敛读取范围（见 §8 Flow D） |
+| `/openapi.json` / `/docs` / `/docs/oauth2-redirect` / `/redoc` | 公开 | 文档路由按设计保持公开 |
+
+**对象级授权（逐线程）** —— 角色准入只管"角色对不对"，对象授权管"对没对这条线程"。两者都必须在：前者挡"角色不对的人"，后者挡"角色对但没被指派到这条线程的人"。
+
+- `/triage`：`approvers` 必填；在**任何图调用或归属写入之前**校验非空、无重复、每个都是**已配置的 approver 主体**、且**不含发起人自己**（禁止自审批）。任一条违反 → **422**。校验通过后先写归属（单行：属主 + 完整审批集合），再跑图。
+- `/resume`：在 `_validate_resumable` 与任何 graph / checkpointer 访问**之前**读归属：无归属（未知 / 历史无归属 / 与本主体无关）→ **404**；属主自审批 → **403**；未被指派 → **404**（与"线程不存在"逐字相同，不给枚举预言机）。
+- **权威 actor**：`/resume` **忽略**请求体里的 `operator`，把 `principal.subject` 交给服务层。因此审计 `actor` 取自已认证主体，客户端无法伪造。字段保留只为线上请求的错误兼容性。
+
+**执行顺序（冻结，不得重排）**：认证 / 角色准入 → body 校验 → 审批指派校验 → 取 store / service → 写归属 → 跑图。非法指派不得留下归属行，更不得触发图执行。
+
+**归属注册在图之前；图失败时归属合法保留**：若图随后失败（例如数据源不可用），已写的归属行**保留** —— 它是不可变的，不会被静默删除或改写。这样的线程是惰性的：没有 `approval.requested`，因此不可 resume；对无关 analyst / approver 不可读；重复注册同一 `thread_id` 被主键响亮拒绝。唯一写入的审计事件是一条诚实的 `plan.failed`。
+
+**未做（不得声称）**：没有 JWT / OIDC，没有限流，没有签名审计，**没有不可否认性**；v0.3.0 **不是**生产就绪版本。
 
 ## 12. Phase Roadmap
 
@@ -824,6 +869,15 @@ OpenAI-compatible LLM
 - **边界纪律**：本阶段**未**引入 Kubernetes / PostgreSQL / Redis / nginx / 多副本 / 健康检查，**未**声称 production-ready 或可水平扩展；容器以最小可用为准。
 - 全量测试计数不变（Phase 9.3-F 基线 1,463）：本阶段只新增非测试文件、不新增测试，因此套件规模不变。测试仍保持既有的 hermetic 约束（不读仓库 `data/`，数据由 `tmp_path` 现场生成）。
 
+> 2026-10-09 · Phase v0.3.0-A3 完成（认证 + 角色准入 + 逐线程对象授权 + 可信审计 actor）
+
+在**不改动** 5 节点图结构、审计 5 前提、`AuditStore` 既有 8 方法签名、以及 `0001` 迁移的前提下，新增一层 API 边界的安全能力（设计见 §11.7）：
+
+- **A3-1 认证与角色准入**：`app/security/auth.py` —— 静态 API Key（配置只存 SHA-256 摘要）→ `Principal(subject, role)`；角色是封闭集（viewer / analyst / approver）；`AUTH_API_KEYS` 缺失 / 非法 → 启动期拒绝（fail-closed）。四条业务路由都要求 `Authorization: Bearer`；文档路由保持公开。
+- **A3-2 单行不可变线程归属**：`thread_owners(thread_id, owner, approvers, created_at)` —— 属主与完整审批集合同处一行，迁移 `0002_thread_ownership` 落地；`AuditStore` 由 8 → 10 方法（纯增量）。库层禁改触发器 SQLite 6 → 8，PostgreSQL 9 → 12。
+- **A3-3 逐线程对象授权 + 可信 actor**：`/triage` 要求显式 `approvers` 并在跑图前校验（422）；`/resume` 在任何 graph / checkpointer 访问前读归属（未指派 404 / 自审批 403）；`/audit/events` 在取回内容前收敛范围；`/resume` 忽略客户端 `operator`，`actor` 取自已认证 subject。
+- **未做**：JWT / OIDC、限流、签名审计、不可否认性。
+
 ### Implementation Deviation Note（与 §12 Roadmap 的实现偏离说明）
 
 > §12 Roadmap 的原始设计保持不变；本节只记录实际实现与蓝图之间的有意偏离及原因。
@@ -838,12 +892,13 @@ OpenAI-compatible LLM
 
 ## 当前架构快照（**当前维护**；小节初版 2026-09-19，之后随 Phase 持续更新）
 
-> 完成状态：**Phase 0-8.5 已完成；Phase 9.1-A 已完成**（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 护栏对齐）；**Phase 9.3-G 已完成**（最小 Docker / Compose 容器化，见 §8 Flow E）；**Phase v0.2.0 已交付可选 PostgreSQL 审计后端**（M0R–M1c：Alembic 迁移 / 迁移与运行期角色分离 / 组合根装配 / 集成测试；M1d：独立 CI job 与文档 —— 见 §11.6）。SQLite 仍是默认后端。
+> 完成状态：**Phase 0-8.5 已完成；Phase 9.1-A 已完成**（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 护栏对齐）；**Phase 9.3-G 已完成**（最小 Docker / Compose 容器化，见 §8 Flow E）；**Phase v0.2.0 已交付可选 PostgreSQL 审计后端**（M0R–M1c：Alembic 迁移 / 迁移与运行期角色分离 / 组合根装配 / 集成测试；M1d：独立 CI job 与文档 —— 见 §11.6）；**Phase v0.3.0-A3 已交付认证与授权**（A3-1 静态 API Key 认证与角色准入 / A3-2 单行不可变线程归属与审批集合 / A3-3 逐线程对象授权与可信审计 actor —— 见 §11.7）。SQLite 仍是默认后端。
 
 ```
 HTTP Client
  ↓
-FastAPI（POST /chat | POST /triage | POST /resume，Pydantic 校验，
+FastAPI（POST /chat | POST /triage | POST /resume | GET /audit/events，Pydantic 校验，
+         Authorization: Bearer 认证 + 角色准入 + 逐线程对象授权，
          LLM 错误 → 502，领域错误 → 404 / 409 / 503）
  ↓
 ┌─────────────────────────── /chat ───────────────────────────┐
@@ -874,14 +929,15 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 安全层（app/security/，横切）
    policy.py           evaluate_policy(plan) → allow / require_approval（永不解析 messages）
    audit.py            compute_plan_digest / build_audit_record
-   store_protocol.py   AuditStore 契约（8 个方法，@runtime_checkable）—— 图 / triage / API 只依赖它
-   store.py            SqliteAuditStore（**默认**）：incidents / action_requests / audit_logs
-                       append-only（纯 INSERT + PRIMARY KEY + 6 条禁改触发器 + 无状态列 + 状态派生）
+   auth.py             静态 API Key 认证 → Principal(subject, role) + 端点角色准入（viewer / analyst / approver）
+   store_protocol.py   AuditStore 契约（10 个方法，@runtime_checkable）—— 图 / triage / API 只依赖它
+   store.py            SqliteAuditStore（**默认**）：incidents / action_requests / audit_logs / thread_owners
+                       append-only（纯 INSERT + PRIMARY KEY + 8 条禁改触发器 + 无状态列 + 状态派生）
    store_postgres.py   PostgresAuditStore（**可选**，Phase v0.2.0）：同一契约、同一 append-only
-                       约束、9 条禁改触发器；只由组合根按 Settings.audit_backend 装配（见 §11.6）
+                       约束、12 条禁改触发器；只由组合根按 Settings.audit_backend 装配（见 §11.6）
  ↓
-持久化：SQLite（**默认**：业务表 + 审计，append-only，6 条禁改触发器）
-        或 PostgreSQL（**可选**审计后端，见 §11.6：同样 append-only，9 条禁改触发器）
+持久化：SQLite（**默认**：业务表 + 审计，append-only，8 条禁改触发器）
+        或 PostgreSQL（**可选**审计后端，见 §11.6：同样 append-only，12 条禁改触发器）
         checkpoint = InMemorySaver（进程内内存，**不落盘**）—— 换审计后端不影响它
  ↓
 容器化运行边界（Phase 9.3-G，可选部署路径，见 §8 Flow E）
@@ -897,7 +953,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
 - 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided` / `approval.timeout` —— 6 个全部有生产写入路径（`approval.timeout` 由 Phase 9.1-A 的惰性超时补齐）
 - **部署面（Phase 9.3-G）**：容器化只增加部署文件（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`），**不改变**上面任何一条运行时语义 —— 图结构、工具集、审计写入路径、HITL 行为全部不变。当前是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）。
-- 测试基线：默认离线运行 **1,517 passed / 311 deselected**（`pytest -q`）。被取消收集的 311 例是 `postgres` 标记的集成用例，需要真实 PostgreSQL，由独立的 CI job 显式运行（`pytest -m postgres`）。离线计数与 hermetic 性质来自**本地实测**。**远端 CI 已执行**：最新一次经验证的观测是 run `37737872748`（提交 `4334b14d`），其中 `test` = **1,517 passed / 311 deselected / 2 warnings**、`test-postgres` = **311 passed / 1,517 deselected / 7 warnings**，两个 job 均成功；更早的历史观测是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`（GitHub-hosted Ubuntu 24.04，见 §14）。以上均为**某一次特定 run 的记录**，不是对当前 HEAD 的长期保证 —— 最新结果以 Actions 页为准。
+- 测试基线：默认离线运行 **1,737 passed / 366 deselected**（`pytest -q`）。被取消收集的 366 例是 `postgres` 标记的集成用例，需要真实 PostgreSQL，由独立的 CI job 显式运行（`pytest -m postgres`）。离线计数与 hermetic 性质来自**本地实测**。**远端 CI 已执行**：最新一次经验证的观测是 run `37737872748`（提交 `4334b14d`），其中 `test` = **1,517 passed / 311 deselected / 2 warnings**、`test-postgres` = **311 passed / 1,517 deselected / 7 warnings**，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`（GitHub-hosted Ubuntu 24.04，见 §14）。以上均为**某一次特定 run 的记录**，不是对当前 HEAD 的长期保证 —— 最新结果以 Actions 页为准。
 
 ## 尚未实现（按 §12 Roadmap）
 
@@ -907,7 +963,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - 超时的**观测面**——`TriageOutcome.status` 不新增 `timed_out`，也没有"查询 thread 状态"的端点，所以超时在 API 响应里只以 409 的形式出现，终态事实只能从 `audit_logs` 读
 - 跨进程 checkpoint 恢复——当前 `InMemorySaver` 只在进程存活期内有效（`langgraph-checkpoint-sqlite` 未安装）
 - `completed` / `allowed` 的 checkpoint 清理——9.1-A 的清理范围只有 `failed` 与 `timed_out`，这两个终态仍留在内存里
-- 身份认证 / 不可否认性——`actor` 只是自称字符串（Phase 10）
+- **不可否认性**——认证（静态 API Key，A3-1）与可信 `actor`（取自已认证主体，A3-3）已落地；仍**没有**签名、也**没有**把"客户端自述身份"与"已验证身份"分别记录（A6 计划补 `verified_subject` + 签名）。JWT/OIDC、限流、审计导出 / 聚合、游标分页均未引入
 - 审计读接口的**导出 / 聚合 / 游标分页**——只读查询端点 `GET /audit/events` 已于 Phase 9.3-F 落地（见 §8 Flow D）
 - Observability / Evaluation——Phase 9
 - PostgreSQL 后端的运维面——**没有**备份 / 恢复、连接池调优、只读副本、审计导出、跨进程 checkpoint。append-only 由库层触发器强制，但**不是**防篡改：超级用户、表 owner、以及一条伪造的 `INSERT` 都不受它拦（见 §11.6）
@@ -944,17 +1000,17 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 
 | 目录 | 覆盖对象 |
 |---|---|
-| `tests/test_api/` | FastAPI 路由、错误码、消息透传、DTO 契约 |
+| `tests/test_api/` | FastAPI 路由、错误码、消息透传、DTO 契约；**认证与授权**（401 / 403 / 404 / 422 矩阵、对象级授权、审计可见性、可信 actor —— `test_auth_endpoints.py` / `test_object_authorization.py`） |
 | `tests/test_core/` | agent / graph / HITL 图 / llm / config / tool schema / evidence fusion / risk 集成 / response 集成 / triage service / **审批生命周期（超时与终态清理）** |
-| `tests/test_schemas/` | LogEvent / ThreatIntelRecord / RiskAssessment / ResponsePlan / ApprovalRequest / AuditRecord 的校验边界、seed 可复现、API DTO 策略 |
-| `tests/test_security/` | 策略引擎 / 审计记录构造 / append-only store（含"源码里无 UPDATE/DELETE"的结构护栏） |
+| `tests/test_schemas/` | LogEvent / ThreatIntelRecord / RiskAssessment / ResponsePlan / ApprovalRequest / AuditRecord / **ThreadOwnership** 的校验边界、seed 可复现、API DTO 策略 |
+| `tests/test_security/` | 策略引擎 / 审计记录构造 / append-only store（含"源码里无 UPDATE/DELETE"的结构护栏）/ **静态 API Key 认证与密钥环** / **线程归属 store（单行不可变 + 并发唯一胜者）** |
 | `tests/test_tools/` | 四个工具核心函数的过滤、排序、规则分支与错误契约 |
 | `tests/test_mcp/` | 只读 MCP 适配器与本地 stdio server（工具发布面、schema 不暴露路径参数） |
 | `tests/test_evaluation/` | 离线架构 harness：runner / metrics / oracles / cases / golden digest |
 | `tests/test_evaluation_llm/` | 真实 provider 评估 harness：budget / confinement / offline_guard / runner / pilot 等（全部离线，不触网） |
 | `tests/test_postgres/` | 真实 PostgreSQL 集成：连接 / schema / 迁移 / 角色与触发器 / 排序 / 存储契约（双后端参数化）/ 并发 / 应用集成（**默认不收集**，需要真实实例） |
 
-当前基线：默认运行 **1,517 passed / 311 deselected**（`pytest -q`，本地实测）；311 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行。最新远端 CI 观测是 run `37737872748`（提交 `4334b14d`）：`test` = 1,517 passed / 311 deselected、`test-postgres` = 311 passed / 1,517 deselected，两个 job 均成功；更早的历史观测（Phase 9.3-G 文档提交 `b4f9d4e4` 的 1,463 passed）见 §14。
+当前基线：默认运行 **1,737 passed / 366 deselected**（`pytest -q`，本地实测）；366 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行。最新远端 CI 观测是 run `37737872748`（提交 `4334b14d`）：`test` = 1,517 passed / 311 deselected、`test-postgres` = 311 passed / 1,517 deselected，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测（Phase 9.3-G 文档提交 `b4f9d4e4` 的 1,463 passed）见 §14。
 
 ### 6. hermetic 约束（Phase 8.5 收口）
 
@@ -962,7 +1018,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 
 ```bash
 cd <任意不含 data/ 的目录>
-<python> -m pytest <repo>/tests -q              # 期望:1,517 passed, 311 deselected
+<python> -m pytest <repo>/tests -q              # 期望:1,737 passed, 366 deselected
 <python> -m pytest <repo>/tests -m postgres -q  # 需真实 PostgreSQL;同样不读仓库 data/
 ```
 

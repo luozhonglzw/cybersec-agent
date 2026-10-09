@@ -18,6 +18,8 @@ This is a research and engineering prototype. It is not production-ready and not
                      FastAPI — app/api/main.py
           POST /chat     POST /triage     POST /resume     GET /audit/events
                                  │
+              Authorization: Bearer <key> on all four; docs routes stay public
+                                 │
             ┌────────────────────┴────────────────────┐
             │                                         │
         /chat path                          /triage + /resume path
@@ -57,12 +59,15 @@ This is a research and engineering prototype. It is not production-ready and not
   Security layer — app/security/  (cross-cutting)
     policy.py           evaluate_policy(ResponsePlan) → allow | require_approval
     audit.py            plan digest + audit-record construction     (pure)
-    store_protocol.py   AuditStore — the eight-method contract that the graph,
+    auth.py             static API-key authentication → Principal(subject, role);
+                        route-level role admission (viewer / analyst / approver)
+    store_protocol.py   AuditStore — the ten-method contract that the graph,
                         the triage service and the API depend on
     store.py            SQLite backend (default): incidents / action_requests /
-                        audit_logs — append-only, enforced by six database triggers
+                        audit_logs / thread_owners — append-only, enforced by
+                        eight database triggers
     store_postgres.py   PostgreSQL backend (explicit opt-in): same contract, same
-                        append-only controls, nine database triggers
+                        append-only controls, twelve database triggers
                         read path: list_audit() — bounded, ordered SELECT only
 
   Data
@@ -85,12 +90,99 @@ The orchestration layer is a `StateGraph` rather than a hand-written loop becaus
 
 LangGraph supplies the state machine and the interrupt/resume mechanism — **not** the security properties above, which come from the graph's shape and from the policy gate being a node rather than a tool.
 
-## Audit Query API (read-only)
+## Authentication and Authorization
 
-The append-only audit trail is also readable over HTTP through a **read-only audit query endpoint**. It is an additional read interface over the existing authoritative audit store — not a second audit system, not a second audit writer, and not an authorization mechanism.
+Every business route (`/chat`, `/triage`, `/resume`, `/audit/events`) requires an
+`Authorization: Bearer <key>` header. Authentication is **always on**: there is no
+`AUTH_ENABLED=false` switch, and a missing or invalid `AUTH_API_KEYS` configuration
+makes the process **refuse to start** rather than serve an open API.
+
+Configuration holds **only SHA-256 digests** of the keys, never the keys themselves:
 
 ```bash
-curl "http://127.0.0.1:8000/audit/events?thread_id=<from /triage>&limit=50&order=desc"
+# 1. generate a key and store it now — it is shown only here
+KEY=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+echo "store this API key: $KEY"
+
+# 2. put only its digest into AUTH_API_KEYS
+printf '%s' "$KEY" | sha256sum
+```
+
+```dotenv
+AUTH_API_KEYS=[{"sha256":"<64 lowercase hex>","subject":"alice","role":"analyst"},{"sha256":"<64 lowercase hex>","subject":"bob","role":"approver"},{"sha256":"<64 lowercase hex>","subject":"carol","role":"viewer"}]
+```
+
+`subject` is the **identity** (used for ownership and assignment); `role` is the
+**authorization** (used for route admission). They are deliberately separate fields:
+two people can hold the same `approver` role, which is what makes "the submitter and
+the approver are different people" expressible. Subjects must be unique, and the digest
+must be 64 lowercase hex characters.
+
+### Role matrix
+
+| Route | viewer | analyst | approver | Notes |
+| --- | --- | --- | --- | --- |
+| `POST /chat` | 403 | 200 | 200 | Plain LLM conversation. **Not** HITL / policy gated. |
+| `POST /triage` | 403 | 200 | 200 | Starts an HITL run; owner = authenticated subject. |
+| `POST /resume` | 403 | 403 | 200 if assigned | Role admission **and** per-thread object authorization. |
+| `GET /audit/events` | 200 (all) | 200 (own threads) | 200 (owned or assigned) | Scope rules below. |
+| `GET /docs`, `/openapi.json`, `/redoc` | public | public | public | Interactive docs stay open by design. |
+
+### Two layers of authorization
+
+**Role admission** answers "does this authenticated principal have the right role for
+this route" — a `viewer` calling `/triage` gets **403**.
+
+**Object authorization** answers "may this principal act on *this specific thread*" —
+an `approver` who was never assigned to a thread gets **404** from `/resume`,
+byte-identical to the response for a thread that does not exist.
+
+### Approver assignment and the self-approval prohibition
+
+`POST /triage` requires an explicit `approvers` list. Before anything is written or
+executed, the server checks that the list is non-empty, has no duplicates, contains no
+unknown or non-`approver` subjects, and does **not** contain the caller — a submitter
+can never approve their own run. Any violation returns **422** *before* any graph call
+or ownership write. The owner is taken from the authenticated `subject`, never from the
+request body.
+
+### Error expectations
+
+| Condition | Status | Body |
+| --- | --- | --- |
+| Missing / malformed / unknown credential | **401** | `{"detail":"authentication required"}` + `WWW-Authenticate: Bearer` |
+| Authenticated, wrong role for the route | **403** | `{"detail":"insufficient role"}` |
+| Authenticated approver not assigned to the thread | **404** | `{"detail":"not found"}` |
+| Owner attempting to approve their own thread | **403** | `{"detail":"self-approval is prohibited"}` |
+| analyst / approver reading audit without a `thread_id` | **403** | `{"detail":"an explicit thread scope is required for this role"}` |
+| Invalid approver assignment | **422** | validation detail |
+
+The 401 body is byte-identical for missing, malformed, and unknown credentials — the
+response is deliberately **not** an oracle for "does this key exist". The 404 body is
+likewise identical for "unrelated thread" and "unknown thread".
+
+### Audit visibility
+
+`GET /audit/events` is scope-filtered **before** any audit content is fetched — the
+server never loads a thread the caller may not see:
+
+- **viewer** — full read, including **historical threads that have no ownership row**
+  (records written before per-thread ownership existed). `thread_id` is optional.
+- **analyst** — must supply a `thread_id`, and may read only threads it **owns**.
+- **approver** — must supply a `thread_id`, and may read only threads it **owns or was
+  explicitly assigned to approve**.
+
+An analyst / approver that omits `thread_id` gets **403**; one that supplies a thread
+outside its scope (including an ownerless or unknown thread) gets **404**.
+
+## Audit Query API (read-only)
+
+The append-only audit trail is also readable over HTTP through a **read-only audit query endpoint**. It is an additional read interface over the existing authoritative audit store — not a second audit system and not a second audit writer. It is subject to the same authentication and per-thread scope rules as the rest of the API (see [Authentication and Authorization](#authentication-and-authorization)).
+
+```bash
+# a viewer reads the full trail; analyst / approver must add &thread_id=<id>
+curl "http://127.0.0.1:8000/audit/events?limit=50&order=desc" \
+  -H "Authorization: Bearer $VIEWER_KEY"
 ```
 
 | Query parameter | Meaning |
@@ -100,11 +192,11 @@ curl "http://127.0.0.1:8000/audit/events?thread_id=<from /triage>&limit=50&order
 | `limit` | bounded page size, 1–200 (default 50) |
 | `order` | `desc` (default) or `asc` — deterministic ordering by `ts`, with a backend-provided tiebreaker (`rowid` on SQLite, `seq` on PostgreSQL) |
 
-The response is a bare JSON array of `AuditRecord` records — there is no envelope. Empty results and unknown `thread_id` values both return `200 []`.
+The response is a bare JSON array of `AuditRecord` records — there is no envelope. For an **authorized** scope, an empty result returns `200 []`. A `thread_id` outside the caller's scope does **not** return `200 []`: it returns `404` for analyst / approver, because scope is enforced before any content is fetched (see [Audit visibility](#audit-visibility)). A `viewer` may read any thread — including a historical thread with no ownership row — and receives `200 []` for a thread that has no events.
 
 Boundary: the endpoint reads the **existing authoritative audit trail** through the configured `AuditStore`'s `list_audit` (parameterized `SELECT` only) — the same contract whether the backend is the default SQLite file or the opt-in PostgreSQL one. It does not mutate audit state and does not alter policy, approval, HITL, or checkpoint state. The client cannot choose the audit database path or connection string — the server keeps using the configured trusted store from settings — and no raw SQL is exposed.
 
-This endpoint is **read-only**, which is not the same as **authenticated**: as with the rest of this prototype, no production authentication or authorization layer is implemented, and this is not an "authorized" or "protected" API.
+This endpoint is **read-only** and **authenticated**: it requires a valid `Authorization: Bearer` credential, and the read scope is filtered to the caller's role before any audit content is fetched. Read-only is still not the same as tamper-proof — the audit trail is append-only by construction, not notarised (see [Known Limitations](#known-limitations)).
 
 ## PostgreSQL audit backend (opt-in)
 
@@ -168,10 +260,10 @@ The offline suite does not collect these tests (`addopts = -m 'not postgres'` in
 
 ### Scope and limits
 
-- **Audit, incident, and action-request data only.** The PostgreSQL backend stores the same three tables as the SQLite backend. It does **not** store LangGraph checkpoints — checkpointing still uses `InMemorySaver`, which is in-process memory.
+- **Audit, incident, action-request and ownership data only.** The PostgreSQL backend stores the same four tables as the SQLite backend (`incidents`, `action_requests`, `audit_logs`, `thread_owners`). It does **not** store LangGraph checkpoints — checkpointing still uses `InMemorySaver`, which is in-process memory.
 - **HITL state does not survive a process restart.** Because checkpoints are in-process, a run paused at `human_approval` cannot be resumed by another process, and a restart loses the paused run. Moving audit data to PostgreSQL does not change this.
 - **Append-only is a database control, not tamper-proofing.** The triggers stop `UPDATE`, `DELETE`, and `TRUNCATE` issued through the application and through the runtime role. They do not stop a privileged administrator, a superuser, a table owner, or a forged `INSERT` of a plausible-looking record. The trail is append-only by construction, not notarised.
-- **Not production-ready.** No authentication or authorization layer, no high-availability or backup story, no operational guarantees. This is an opt-in persistence backend for a prototype.
+- **Not production-ready.** No high-availability or backup story, no operational guarantees, no rate limiting, no JWT/OIDC and no signed audit. This is an opt-in persistence backend for a prototype.
 - **No performance or capacity claim.** The backend was exercised on one machine against one throwaway server. No throughput, latency, or scaling claim is made, and none should be inferred from it.
 - **No exactly-once claim.** Audit writes are not deduplicated across processes; a retry can append a second record.
 - **`/chat` is not the gated workflow.** `/chat` runs the ReAct graph only. The plan → policy gate → human-approval path exists on `/triage` and `/resume`. Switching the audit backend changes neither.
@@ -210,13 +302,15 @@ Client-visible MCP schemas do not expose `data_path`, `logs_path`, or `intel_pat
 - **Risk-aware response planning** — a pure rule engine that maps a risk assessment to a closed vocabulary of actions, each carrying its own approval requirement and reversibility flag. It consumes the assessment rather than re-deriving it.
 - **Policy enforcement** — a rule-based policy gate implemented as a mandatory graph node rather than a tool, so the decision cannot be skipped.
 - **Human-in-the-loop approval** — a genuine graph interrupt with a server-issued thread handle, a resume validation gate that rejects unknown, completed, expired, or lost threads, and a lazy approval-timeout lifecycle.
-- **Append-only audit trail** — three tables, six anti-mutation triggers on SQLite (nine on PostgreSQL, which adds `TRUNCATE` coverage), a closed six-event vocabulary that includes failure events, and approval state derived from the audit stream rather than stored as a mutable column.
+- **Append-only audit trail** — four tables (`incidents`, `action_requests`, `audit_logs`, `thread_owners`), eight anti-mutation triggers on SQLite (twelve on PostgreSQL, which adds `TRUNCATE` coverage), a closed six-event vocabulary that includes failure events, and approval state derived from the audit stream rather than stored as a mutable column.
 - **Offline evaluation harness** — three baselines, five separately reported metric classes, an independent evidence oracle, metamorphic relations, and no composite score.
 - **Real-provider evaluation harness** — a budget governor, a network-egress guard built on interpreter audit hooks, per-cell raw-record persistence with fsync, and frozen failure taxonomy.
 - **Read-only MCP interface** — three read-only tools (security-log query, threat-intel lookup, deterministic risk analysis) published over a local stdio MCP server, reusing the existing tool functions as an alternate read-only surface. Response planning is not published, and no remote transport or authentication server is implemented.
-- **Read-only audit query API** — `GET /audit/events` exposes the existing append-only audit trail as a bounded, deterministically ordered read surface (`thread_id` / `event` / `limit` / `order`). It is a read path only: no audit writes, no policy / approval / HITL / checkpoint mutation, and no client control over the audit database path.
+- **Read-only audit query API** — `GET /audit/events` exposes the existing append-only audit trail as a bounded, deterministically ordered read surface (`thread_id` / `event` / `limit` / `order`). It is a read path only: no audit writes, no policy / approval / HITL / checkpoint mutation, and no client control over the audit database path. Reads are scope-filtered by role (viewer: all threads; analyst: owned threads; approver: owned or explicitly assigned threads), enforced before any content is fetched.
 - **Optional PostgreSQL audit backend** — an explicit opt-in persistence backend behind the same `AuditStore` contract, with a separated migration-owner role and a runtime role limited to `SELECT` / `INSERT`. SQLite stays the default, there is no automatic fallback and no dual-write, and the PostgreSQL backend stores audit / incident / action-request data only — not LangGraph checkpoints.
-- **Fully offline test suite** — 1,517 tests that require no network access and no API key, plus a PostgreSQL integration suite (311 cases) that the default run deselects and a separate CI job runs against a throwaway server.
+- **Static API-key authentication** — every business route requires `Authorization: Bearer <key>`. Configuration stores only SHA-256 digests; authentication is always on and fail-closed (a missing or invalid key configuration stops the process at startup). Role admission (`viewer` / `analyst` / `approver`) is enforced per route as a FastAPI dependency.
+- **Per-thread object authorization** — `POST /triage` records a single immutable ownership row (owner + full approver set) before the graph runs; `POST /resume` and `GET /audit/events` resolve the authenticated principal against that row before touching any graph, checkpointer, or audit content. Self-approval is rejected, and the audit `actor` is the authenticated principal, not a client-supplied string.
+- **Fully offline test suite** — 1,737 tests that require no network access and no API key, plus a PostgreSQL integration suite (366 cases) that the default run deselects and a separate CI job runs against a throwaway server.
 
 ## Security Design
 
@@ -228,9 +322,13 @@ Client-visible MCP schemas do not expose `data_path`, `logs_path`, or `intel_pat
 
 **Human-in-the-loop.** High-impact actions pause the graph. Resuming requires a decision payload plus a server-issued thread handle, and the resume path verifies that the thread is genuinely awaiting approval before accepting anything. Whether an action needs approval is computed by the rule engine, never inferred by the model.
 
-**Append-only audit trail.** Every decision and every approval is written to an append-only store, and history is enforced as history by the database: the store exposes no update or delete path, primary keys make duplicate writes fail loudly, and per-table triggers abort any UPDATE or DELETE issued outside the application. There is no mutable status column — pending state is derived by querying for the absence of a terminal event. Failures are recorded alongside successes, and failure details deliberately exclude absolute paths and raw exception messages.
+**Explicit approval assignment.** Each triage run records who owns it and which configured approvers may decide it. Only an assigned approver may resume that thread, and the submitter can never approve their own run — the assignment is a recorded fact, not a default derived from a role. Ownership is a single immutable row: owner and the full approver set are written together *before* the graph starts, so a partial assignment ("owner recorded, no approver") cannot exist.
 
-Known limitation: this prototype has no authentication. The audit `actor` field is a self-asserted identifier and carries no non-repudiation.
+**Ownership is registered before the graph runs.** If the graph then fails (for example a required data source is unavailable), the ownership row legitimately remains — it is immutable and is never silently deleted or reassigned. Such a thread is inert: no approval was requested, so it cannot be resumed; it is not readable by an unrelated analyst or approver; and re-registering the same `thread_id` fails loudly on the primary key. The only audit event written is a truthful `plan.failed`.
+
+**Append-only audit trail.** Every decision and every approval is written to an append-only store, and history is enforced as history by the database: the store exposes no update or delete path, primary keys make duplicate writes fail loudly, and per-table triggers abort any UPDATE or DELETE issued outside the application (PostgreSQL adds a `TRUNCATE` trigger, because a statement-level wipe does not fire row-level triggers). There is no mutable status column — pending state is derived by querying for the absence of a terminal event. Failures are recorded alongside successes, and failure details deliberately exclude absolute paths and raw exception messages. The audit `actor` is the **authenticated principal**, not a client-supplied string: `POST /resume` ignores the request body's `operator` field and attributes the decision to the verified subject.
+
+Known limitation: authentication is a **static API key**, and the audit `actor` field is authenticated but **not** non-repudiable — there is no signature and no separate record of a client-claimed identity, so a principal holding a valid key can still deny having acted. No non-repudiation claim is made anywhere in this prototype.
 
 ## Evaluation
 
@@ -254,7 +352,9 @@ Nothing in this evaluation establishes that the system is secure, and no configu
 
 This is a research and engineering prototype. The limitations below are properties of the current implementation, not a backlog of things that were overlooked.
 
-**Not production-ready.** There is no production hardening: no authentication or authorization layer on the HTTP API, no non-repudiation for the audit `actor` field, and no operational guarantees. `GET /audit/events` being *read-only* is not the same as *protected*.
+**Not production-ready.** There is no production hardening: authentication is a static API key (no JWT/OIDC, no rotation, no expiry), there is no rate limiting, no signed audit, and no non-repudiation for the audit `actor` field. `GET /audit/events` is read-only *and* scope-filtered, but that is still not the same as tamper-proof or production-hardened.
+
+**Historical threads may have no ownership row.** Audit records written before per-thread ownership existed carry no owner. A `viewer` can still read them; analyst and approver cannot resolve them, so a scoped audit read or a `/resume` against such a thread returns `404`.
 
 **Single-service, single-instance persistence.** The application is one API process. By default it is backed by a local SQLite file; a PostgreSQL audit backend can be enabled explicitly, but it is optional and the deployment remains a single instance with no cache and no coordination between replicas. Nothing here is claimed to scale horizontally, and the Compose topology is deliberately one service with one named volume.
 
@@ -283,7 +383,7 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                                    # create the environment and install dependencies
 
-cp .env.example .env                       # then fill in LLM_MODEL / LLM_BASE_URL / LLM_API_KEY
+cp .env.example .env                       # then fill in the required variables (below)
 
 uv run python scripts/seed_logs.py         # → data/security_events.jsonl  (144 events)
 uv run python scripts/seed_threat_intel.py # → data/threat_intel.jsonl    (29 IOC records)
@@ -291,26 +391,90 @@ uv run python scripts/seed_threat_intel.py # → data/threat_intel.jsonl    (29 
 uv run uvicorn app.api.main:app --reload
 ```
 
-The seed files are generated rather than committed, and the application validates its configuration at startup — it will refuse to boot without a model name and API key. `data/audit.db` is created on first run. No `AUDIT_*` variable is needed for this default path; to opt into PostgreSQL instead, see [PostgreSQL audit backend (opt-in)](#postgresql-audit-backend-opt-in).
+The application validates its configuration at startup and **refuses to boot** if a
+required value is missing or malformed. Two groups are required:
 
-Interactive API documentation is served at <http://127.0.0.1:8000/docs>.
+- **LLM access** — `LLM_MODEL`, `LLM_BASE_URL`, `LLM_API_KEY`.
+- **API authentication** — `AUTH_API_KEYS`. Without it the process stops with a
+  validation error (`auth_api_keys: Field required`).
+
+`data/audit.db` is created on first run. No `AUDIT_*` variable is needed for this
+default path; to opt into PostgreSQL instead, see
+[PostgreSQL audit backend (opt-in)](#postgresql-audit-backend-opt-in).
+
+### 1. Generate API keys and configure `AUTH_API_KEYS`
+
+Keys are generated by you and shown **once**; the configuration stores only their
+SHA-256 digests, so a leaked config does not hand over a usable credential.
 
 ```bash
-# Conversational analysis
+# repeat once per principal; keep each raw key in your secret store
+KEY=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+echo "alice's key (store it now): $KEY"
+printf '%s' "$KEY" | sha256sum     # → put this digest into AUTH_API_KEYS
+```
+
+A minimal three-role configuration — **all values are placeholders**, replace the
+digests with your own:
+
+```dotenv
+AUTH_API_KEYS=[{"sha256":"<alice-digest-64-hex>","subject":"alice","role":"analyst"},{"sha256":"<bob-digest-64-hex>","subject":"bob","role":"approver"},{"sha256":"<carol-digest-64-hex>","subject":"carol","role":"viewer"}]
+```
+
+Export the **raw** keys (not the digests) so the examples below can use them:
+
+```bash
+export ALICE_KEY="<alice raw key>"
+export BOB_KEY="<bob raw key>"
+export CAROL_KEY="<carol raw key>"
+```
+
+### 2. Call the API
+
+Every business route requires the bearer header. Below, `alice` is an `analyst`, `bob`
+an `approver`, and `carol` a `viewer`.
+
+```bash
+# Conversational analysis (analyst / approver)
 curl -X POST http://127.0.0.1:8000/chat \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ALICE_KEY" \
   -d '{"message": "分析一下 203.0.113.66 最近的登录活动"}'
 
-# Start a triage run; high-impact actions pause for human approval
+# Start a triage run (analyst / approver). `approvers` is required and must list
+# configured approver subjects other than the caller.
 curl -X POST http://127.0.0.1:8000/triage \
   -H "Content-Type: application/json" \
-  -d '{"indicator": "203.0.113.66", "event_type": "login_failed"}'
+  -H "Authorization: Bearer $ALICE_KEY" \
+  -d '{"indicator": "203.0.113.66", "event_type": "login_failed", "approvers": ["bob"]}'
 
-# Resume a paused run with a decision (thread_id comes from the /triage response)
+# Resume the paused run (approver only, and only an assigned one).
+# thread_id comes from the /triage response.
 curl -X POST http://127.0.0.1:8000/resume \
   -H "Content-Type: application/json" \
-  -d '{"thread_id": "<from /triage>", "status": "approved", "operator": "analyst-1"}'
+  -H "Authorization: Bearer $BOB_KEY" \
+  -d '{"thread_id": "<from /triage>", "status": "approved", "operator": "bob"}'
+
+# A viewer reads the whole trail
+curl "http://127.0.0.1:8000/audit/events?limit=50&order=desc" \
+  -H "Authorization: Bearer $CAROL_KEY"
+
+# A scoped read — analyst / approver must supply thread_id
+curl "http://127.0.0.1:8000/audit/events?thread_id=<from /triage>&order=asc" \
+  -H "Authorization: Bearer $ALICE_KEY"
 ```
+
+`operator` is retained for request compatibility only: the authoritative audit `actor`
+is the authenticated principal, so `POST /resume` attributes the decision to `bob`
+regardless of what the body says.
+
+Expected errors (full table under
+[Authentication and Authorization](#authentication-and-authorization)): no header or a
+bad key → **401**; a `viewer` calling `/triage` → **403**; an unassigned approver
+resuming a thread → **404**; a missing or invalid `approvers` list → **422**.
+
+Interactive API documentation is served at <http://127.0.0.1:8000/docs> — the docs
+routes themselves stay public.
 
 Run the test suite — it needs no API key and makes no network calls:
 
@@ -318,7 +482,7 @@ Run the test suite — it needs no API key and makes no network calls:
 uv run pytest -q
 ```
 
-CI runs on GitHub-hosted Ubuntu in two independent jobs. The `test` job installs the locked `uv` environment and runs the offline pytest suite. The `test-postgres` job starts a throwaway PostgreSQL 16 service container, provisions the two separated roles, and runs `pytest -m postgres` explicitly — a missing or unreachable database fails that job rather than skipping it. Both jobs have been executed on a remote runner. The most recent verified observation is run [`37737872748`](https://github.com/luozhonglzw/cybersec-agent/actions/runs/37737872748) at commit `4334b14d`, where the `test` job reported **1,517 passed, 311 deselected, 2 warnings** and the `test-postgres` job reported **311 passed, 1,517 deselected, 7 warnings**, with both jobs succeeding. An earlier observation was the Phase 9.3-F commit `dd295c8`, which passed 1,463 tests on GitHub-hosted Ubuntu 24.04. Each figure records one specific run on one specific commit — it is not a standing guarantee about the current head, and it is not a claim of universal Linux compatibility. Check the Actions tab for the latest result.
+CI runs on GitHub-hosted Ubuntu in two independent jobs. The `test` job installs the locked `uv` environment and runs the offline pytest suite. The `test-postgres` job starts a throwaway PostgreSQL 16 service container, provisions the two separated roles, and runs `pytest -m postgres` explicitly — a missing or unreachable database fails that job rather than skipping it. Both jobs have been executed on a remote runner. The suite has grown since the run below (the current local count is 1,737 offline / 366 PostgreSQL; see [Project Structure](#project-structure)). The most recent verified remote observation is run [`37737872748`](https://github.com/luozhonglzw/cybersec-agent/actions/runs/37737872748) at commit `4334b14d`, where the `test` job reported **1,517 passed, 311 deselected, 2 warnings** and the `test-postgres` job reported **311 passed, 1,517 deselected, 7 warnings**, with both jobs succeeding. An earlier observation was the Phase 9.3-F commit `dd295c8`, which passed 1,463 tests on GitHub-hosted Ubuntu 24.04. Each figure records one specific run on one specific commit — it is not a standing guarantee about the current head, and it is not a claim of universal Linux compatibility. Check the Actions tab for the latest result.
 
 ### Demo Walkthrough
 
@@ -334,20 +498,26 @@ uv run uvicorn app.api.main:app --reload       # 2. start the API
 # 3. ask the agent a question — the model selects tools, the answer is prose
 curl -X POST http://127.0.0.1:8000/chat \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ALICE_KEY" \
   -d '{"message": "帮我分析一下最近服务器有没有受到攻击"}'
 
-# 4. start a triage run — a high-impact plan pauses for approval
+# 4. start a triage run — a high-impact plan pauses for approval.
+#    `approvers` must name a configured approver other than the caller.
 curl -X POST http://127.0.0.1:8000/triage \
   -H "Content-Type: application/json" \
-  -d '{"indicator": "203.0.113.66", "event_type": "login_failed"}'
+  -H "Authorization: Bearer $ALICE_KEY" \
+  -d '{"indicator": "203.0.113.66", "event_type": "login_failed", "approvers": ["bob"]}'
 
-# 5. resume the paused run with a decision (thread_id comes from /triage)
+# 5. resume the paused run — only an assigned approver may do this
+#    (thread_id comes from /triage)
 curl -X POST http://127.0.0.1:8000/resume \
   -H "Content-Type: application/json" \
-  -d '{"thread_id": "<from /triage>", "status": "approved", "operator": "analyst-1"}'
+  -H "Authorization: Bearer $BOB_KEY" \
+  -d '{"thread_id": "<from /triage>", "status": "approved", "operator": "bob"}'
 
-# 6. read the audit trail the run produced
-curl "http://127.0.0.1:8000/audit/events?thread_id=<from /triage>&limit=50&order=desc"
+# 6. read the audit trail the run produced (viewer, or the assigned approver)
+curl "http://127.0.0.1:8000/audit/events?thread_id=<from /triage>&limit=50&order=desc" \
+  -H "Authorization: Bearer $BOB_KEY"
 ```
 
 What is **stable** in this walkthrough: the four routes and their contracts, that `/triage` either ends in a policy decision or pauses for approval, that resuming requires a decision plus the server-issued handle, and that each step appends audit events. What is **not** stable: the model's exact wording, and whether a given indicator trips the approval gate — the risk level and the approval requirement are produced by the rule engine, not by the model.
@@ -407,14 +577,14 @@ app/
   api/          FastAPI application, routes, request/response contracts
   core/         configuration, model client, LangGraph state graph, agent, triage service
   schemas/      Pydantic models: events, threat intel, risk, response, approval, audit
-  security/     policy engine, audit-record construction, append-only audit store (SQLite default, PostgreSQL opt-in)
+  security/     policy engine, static API-key authentication and role admission, per-thread object authorization, append-only audit store (SQLite default, PostgreSQL opt-in)
   tools/        security tools (pure core functions + LangChain wrappers)
   evaluation/   offline architecture harness and real-provider evaluation harness
   mcp/          read-only MCP adapters and the local stdio server
 data/           generated seed data and the runtime audit database (not committed)
 docs/           architecture design notes
 scripts/        deterministic seed-data generators; scripts/pg/ holds the role bootstrap SQL
-tests/          1,517 offline tests, plus a PostgreSQL integration suite (deselected by default)
+tests/          1,737 offline tests, plus a PostgreSQL integration suite (deselected by default)
 migrations/     Alembic environment and the hand-written baseline schema
 alembic.ini     Alembic configuration — the connection URL comes from the environment, never from this file
 Dockerfile      minimal container image (Phase 9.3-G)
@@ -440,6 +610,8 @@ compose.postgres.yaml  opt-in, isolated PostgreSQL test service (outside the def
 | MCP interoperability | Implemented |
 | Structured application logging | Implemented |
 | Audit read / query API | Implemented |
+| Static API-key authentication and role admission | Implemented |
+| Per-thread object authorization and trusted audit actor | Implemented |
 | PostgreSQL audit backend (opt-in) | Implemented |
 | Containerized deployment | Implemented |
 

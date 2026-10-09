@@ -284,6 +284,7 @@ class TriageService:
         *,
         event_type: str | None = None,
         request_id: str | None = None,
+        thread_id: str | None = None,
     ) -> TriageResult:
         """对 indicator 发起一次 HITL 判定。
 
@@ -293,6 +294,15 @@ class TriageService:
             图直接跑完(策略 allow)→ status=completed,interrupt_id=None。
 
         thread_id 由服务端生成(D3):见模块 docstring 的 4 个框架行为。
+
+        thread_id(v0.3.0-A3-3 新增,可选):**HTTP 边界可以预先分配**一个
+        thread_id 传进来。存在这个参数的**唯一**理由:线程归属必须在图开始
+        执行**之前**写好,而归属记录里必须带 thread_id —— 于是调用方需要
+        先知道它。默认 `None` ⇒ 本方法照旧自己生成一个 uuid4。
+
+        ⚠️ 它**绝不是**客户端输入面:调用方(API 边界)只传自己生成的
+        uuid4,永不回填请求体里的任何值。D3 的性质(客户端无法指定
+        thread_id)因此没有改变 —— 改变的只是"由服务端的哪一层生成"。
 
         request_id(Phase 9.3-D):本**HTTP 请求**的运维身份,由 API 边界生成,
         与 thread_id 语义不同、绝不互相派生。它经 graph 的 `configurable`
@@ -304,7 +314,12 @@ class TriageService:
         """
         await self.reap_expired(request_id=request_id)
 
-        thread_id = uuid.uuid4().hex
+        if thread_id is None:
+            thread_id = uuid.uuid4().hex
+        elif not isinstance(thread_id, str) or not thread_id.strip():
+            # 预分配的 id 必须是一个非空字符串 —— 空值会让 checkpoint 与
+            # 归属记录落到一个"无名线程"上,后续任何 resume 都无处可依。
+            raise ValueError("thread_id must be a non-empty string when provided")
         config = {"configurable": {"thread_id": thread_id, "request_id": request_id}}
 
         try:
@@ -410,6 +425,17 @@ class TriageService:
 
         interrupt_id **由服务端恢复**,不接受客户端传入(D7):
         客户端能指定 interrupt_id 就等于能伪造"审批的是哪一次暂停"。
+
+        operator(v0.3.0-A3-3 起语义收紧):它是**已认证主体**的 subject,
+        由 API 边界从 `Principal` 取出后传入 —— **不是**调用方自述值。
+        它会被写进 `Command(resume=...)`,图节点据此写审计 `actor`,
+        因此审计归属从这一阶段起可信(客户端无法伪造)。图本身仍只读
+        `decision.operator`(单一真相源未变);改变的是"谁往里填值"。
+
+        **对象级授权不在这里**:本方法只做领域操作,不做"你有没有被指派
+        审批这条线程"的判定 —— 那是 HTTP 边界的职责(`app/api/main.py`
+        的 `_authorize_thread_read`),因为状态码(404/403)是 HTTP 概念。
+        直接调用本方法的内部代码不经过那道闸门,这是**已知边界**。
 
         request_id(Phase 9.3-D):**本次** /resume HTTP 请求的运维身份。
         它与发起暂停那次 /triage 的 request_id **必然不同**(两次独立请求),

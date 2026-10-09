@@ -14,9 +14,14 @@
 - detail 是**自包含**的取证负载:审计记录必须能独立回答"依据是什么",
   不依赖其他表是否还存在。
 
-已知局限(Phase 8,必须文档化,不得掩盖):
-    本阶段没有身份认证 —— actor 只是调用方自称的字符串,**不具备不可否认性**。
-    认证 / 签名留到 Phase 10(或后续引入最小 API key)。
+已知局限(必须文档化,不得掩盖):
+    `actor` 自 Phase **v0.3.0-A3-3** 起取自**已认证主体**:`/resume` 的
+    HTTP 边界把 `principal.subject` 交给服务层,调用方自述的 `operator`
+    被忽略 —— 因此**客户端无法伪造 actor**。
+    但它**仍不具备不可否认性**:没有签名、没有同时留存"声明值"与
+    "已验证值"的对照,数据库持有者依然可以改写历史。可信归属的完整形态
+    (同时记录 `verified_subject` 与 `claimed_operator`)与审计签名
+    在后续的 A6 与更后面的阶段。本阶段**不得**声称已实现不可否认性。
 """
 from datetime import datetime
 from typing import Literal

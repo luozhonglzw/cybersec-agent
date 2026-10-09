@@ -21,6 +21,18 @@ pytestmark = pytest.mark.postgres
 
 APPEND_ONLY_MARKER = "is append-only"
 
+#: 全部受 append-only 保护的表。
+#:
+#: v0.3.0-A3-2 从三张扩到四张 —— 归属表与审计三表受**同一套**保护,
+#: 因此权限层与触发器层的用例一律按这个集合参数化,不留"新表没被测到"的缝。
+#: (A3-2-FIX2 把归属收成单行,`thread_approvers` 已从物理 schema 移除。)
+_ALL_TABLES = (
+    "incidents",
+    "action_requests",
+    "audit_logs",
+    "thread_owners",
+)
+
 
 def _insert_audit(cur, *, actor: str = "system") -> str:
     row_id = uuid.uuid4().hex
@@ -80,11 +92,38 @@ def _insert_action_request(cur) -> str:
     return row_id
 
 
+def _insert_thread_owner(cur) -> str:
+    """插一行 thread_owners(v0.3.0-A3-2;A3-2-FIX2 起含 approvers 列)。
+
+    返回 thread_id。审批集合是**同一行**里的规范序 JSON 数组 —— 没有独立的
+    审批行表,所以这里不需要(也不可能)配套插第二张表。
+    """
+    thread_id = f"th-{uuid.uuid4().hex}"
+    cur.execute(
+        "INSERT INTO thread_owners (thread_id, owner, approvers, created_at)"
+        " VALUES (%s, %s, %s, %s)",
+        (thread_id, "alice", '["bob"]', "2026-10-08T00:00:00+00:00"),
+    )
+    return thread_id
+
+
 #: 每张表的"插入一行"辅助 —— 触发器负向用例必须先有真实的行。
 _INSERT_ONE = {
     "incidents": _insert_incident,
     "action_requests": _insert_action_request,
     "audit_logs": _insert_audit,
+    "thread_owners": _insert_thread_owner,
+}
+
+#: 每张表"按主键定位一行"用的列名。
+#:
+#: v0.3.0-A3-2 新增的归属表**没有 `id` 列**(主键是 `thread_id`),所以行触发器
+#: 用例不能再硬写 `id`。
+_ROW_KEY = {
+    "incidents": "id",
+    "action_requests": "id",
+    "audit_logs": "id",
+    "thread_owners": "thread_id",
 }
 
 
@@ -104,7 +143,7 @@ def test_tables_are_owned_by_migrator_not_by_the_runtime_role(
         )
         owners = dict(cur.fetchall())
 
-    for table in ("incidents", "action_requests", "audit_logs", "alembic_version"):
+    for table in (*_ALL_TABLES, "alembic_version"):
         assert owners[table] == "cybersec_migrator", f"{table} owner 不是迁移角色"
 
 
@@ -189,21 +228,21 @@ def test_runtime_role_cannot_delete(pg_app_connection) -> None:
             cur.execute("DELETE FROM audit_logs WHERE id = %s", (row_id,))
 
 
-@pytest.mark.parametrize("table", ["incidents", "action_requests", "audit_logs"])
+@pytest.mark.parametrize("table", _ALL_TABLES)
 def test_runtime_role_cannot_truncate(pg_app_connection, table: str) -> None:
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         with pg_app_connection.cursor() as cur:
             cur.execute(f"TRUNCATE TABLE {table}")
 
 
-@pytest.mark.parametrize("table", ["incidents", "action_requests", "audit_logs"])
+@pytest.mark.parametrize("table", _ALL_TABLES)
 def test_runtime_role_cannot_alter_schema(pg_app_connection, table: str) -> None:
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         with pg_app_connection.cursor() as cur:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN smuggled TEXT")
 
 
-@pytest.mark.parametrize("table", ["incidents", "action_requests", "audit_logs"])
+@pytest.mark.parametrize("table", _ALL_TABLES)
 def test_runtime_role_cannot_drop_tables(pg_app_connection, table: str) -> None:
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         with pg_app_connection.cursor() as cur:
@@ -237,7 +276,7 @@ def test_runtime_role_cannot_read_alembic_version(pg_app_connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("table", ["incidents", "action_requests", "audit_logs"])
+@pytest.mark.parametrize("table", _ALL_TABLES)
 def test_migrator_update_is_blocked_by_trigger(pg_migrator_connection, table: str) -> None:
     """owner 有 DML 权限,所以拦住它的是触发器,而不是权限。
 
@@ -250,12 +289,15 @@ def test_migrator_update_is_blocked_by_trigger(pg_migrator_connection, table: st
 
     with pytest.raises(psycopg.errors.IntegrityError) as excinfo:
         with pg_migrator_connection.cursor() as cur:
-            cur.execute(f"UPDATE {table} SET id = id WHERE id = %s", (row_id,))
+            key = _ROW_KEY[table]
+            cur.execute(
+                f"UPDATE {table} SET {key} = {key} WHERE {key} = %s", (row_id,)
+            )
     assert APPEND_ONLY_MARKER in str(excinfo.value)
     assert "UPDATE rejected" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("table", ["incidents", "action_requests", "audit_logs"])
+@pytest.mark.parametrize("table", _ALL_TABLES)
 def test_migrator_delete_is_blocked_by_trigger(pg_migrator_connection, table: str) -> None:
     """同 UPDATE:必须命中真实的行,否则触发器不触发。"""
     with pg_migrator_connection.cursor() as cur:
@@ -263,12 +305,13 @@ def test_migrator_delete_is_blocked_by_trigger(pg_migrator_connection, table: st
 
     with pytest.raises(psycopg.errors.IntegrityError) as excinfo:
         with pg_migrator_connection.cursor() as cur:
-            cur.execute(f"DELETE FROM {table} WHERE id = %s", (row_id,))
+            key = _ROW_KEY[table]
+            cur.execute(f"DELETE FROM {table} WHERE {key} = %s", (row_id,))
     assert APPEND_ONLY_MARKER in str(excinfo.value)
     assert "DELETE rejected" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("table", ["incidents", "action_requests", "audit_logs"])
+@pytest.mark.parametrize("table", _ALL_TABLES)
 def test_row_trigger_does_not_fire_when_no_row_is_targeted(
     pg_migrator_connection, table: str
 ) -> None:
@@ -282,15 +325,16 @@ def test_row_trigger_does_not_fire_when_no_row_is_targeted(
     - 整表清空走 `TRUNCATE`,行触发器不管,靠语句级 TRUNCATE 触发器;
     - 批量改写虽然会命中行,但真正的第一道防线是运行时角色没有 UPDATE/DELETE 权限。
     """
+    key = _ROW_KEY[table]
     with pg_migrator_connection.cursor() as cur:
-        cur.execute(f"UPDATE {table} SET id = id WHERE false")
+        cur.execute(f"UPDATE {table} SET {key} = {key} WHERE false")
         assert cur.rowcount == 0, "该 UPDATE 本应命中 0 行"
     with pg_migrator_connection.cursor() as cur:
         cur.execute(f"DELETE FROM {table} WHERE false")
         assert cur.rowcount == 0, "该 DELETE 本应命中 0 行"
 
 
-@pytest.mark.parametrize("table", ["incidents", "action_requests", "audit_logs"])
+@pytest.mark.parametrize("table", _ALL_TABLES)
 def test_migrator_truncate_is_blocked_by_trigger(pg_migrator_connection, table: str) -> None:
     """TRUNCATE 不触发行触发器 —— 靠语句级 TRUNCATE 触发器拦住。"""
     with pytest.raises(psycopg.errors.IntegrityError) as excinfo:
@@ -322,7 +366,13 @@ def test_trigger_uses_integrity_violation_sqlstate(pg_migrator_connection) -> No
     assert excinfo.value.sqlstate == "23000"
 
 
-def test_all_nine_triggers_exist(pg_migrator_connection) -> None:
+def test_all_twelve_triggers_exist(pg_migrator_connection) -> None:
+    """触发器集合**双向相等**。
+
+    v0.3.0-A3-2 从 9 条扩到 12 条:0001 的 3 表 × (UPDATE/DELETE/TRUNCATE)
+    加上 0002 的 1 表 × (UPDATE/DELETE/TRUNCATE)。用 `==` 而不是 `>=` ——
+    少一条会被抓,多出一条来路不明的触发器同样会被抓。
+    """
     with pg_migrator_connection.cursor() as cur:
         cur.execute(
             "SELECT tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid"
@@ -332,9 +382,10 @@ def test_all_nine_triggers_exist(pg_migrator_connection) -> None:
 
     expected = {
         f"{table}_no_{op}"
-        for table in ("incidents", "action_requests", "audit_logs")
+        for table in _ALL_TABLES
         for op in ("update", "delete", "truncate")
     }
+    assert len(expected) == 12
     assert names == expected
 
 

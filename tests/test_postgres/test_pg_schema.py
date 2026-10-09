@@ -22,6 +22,18 @@ _TABLES = ("incidents", "action_requests", "audit_logs")
 #: 只有这两张表有 identity seq 列(SQLite 的隐式 rowid 的对应物)。
 _SEQ_TABLES = ("action_requests", "audit_logs")
 
+#: v0.3.0-A3-2 新增的归属表(A3-2-FIX2 起为**单行**)。
+#:
+#: 它**没有** `seq` 列(从不按序读取),列顺序也必须与 SQLite 逐列一致 ——
+#: 冻结设计 §4.5 的"Table shapes: identical columns and keys ✅"由此可证。
+_OWNERSHIP_TABLES = ("thread_owners",)
+
+#: 归属表里必须是 TEXT 的列:审批集合是**规范序 JSON 数组文本**,时间列与
+#: 0001 同口径(刻意不用 timestamptz / jsonb / text[])。
+_OWNERSHIP_MUST_STAY_TEXT = {
+    "thread_owners": ("approvers", "created_at"),
+}
+
 #: 时间列与 JSON 列在 PG 里必须仍是 TEXT。改成 timestamptz / jsonb 会让
 #: `_from_iso()` / `json.loads(row[...])` 拿到非字符串而崩 —— 那是静默的
 #: 语义变更,不是"优化"。
@@ -63,14 +75,18 @@ def _insert_audit(cur, **overrides) -> str:
 
 @pytest.fixture(scope="module")
 def sqlite_column_order(tmp_path_factory) -> dict[str, list[str]]:
-    """用真实 `SqliteAuditStore` 建临时库,读回 SQLite 侧的列顺序。"""
+    """用真实 `SqliteAuditStore` 建临时库,读回 SQLite 侧的列顺序。
+
+    v0.3.0-A3-2 起也覆盖归属表(A3-2-FIX2 起为单行)—— 期望值仍然是
+    **现场读出来**的,不是抄来的常量。
+    """
     db_path = tmp_path_factory.mktemp("sqlite-parity") / "audit.db"
     SqliteAuditStore(db_path)
     conn = sqlite3.connect(db_path)
     try:
         return {
             table: [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
-            for table in _TABLES
+            for table in (*_TABLES, *_OWNERSHIP_TABLES)
         }
     finally:
         conn.close()
@@ -121,6 +137,83 @@ def test_incidents_has_no_seq_column(pg_migrator_connection, sqlite_column_order
     """`incidents` 只按主键读,没有排序需求,因此刻意不加 seq。"""
     assert "seq" not in _pg_columns(pg_migrator_connection, "incidents")
     assert "seq" not in sqlite_column_order["incidents"]
+
+
+# ---------------------------------------------------------------------------
+# v0.3.0-A3-2:归属表的 SQLite / PostgreSQL 形状对等
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("table", _OWNERSHIP_TABLES)
+def test_ownership_columns_match_sqlite_exactly(
+    table: str, pg_migrator_connection, sqlite_column_order
+) -> None:
+    """列名与**列顺序**必须与 SQLite 逐字一致(不加 seq,不做任何调整)。
+
+    期望值来自现场建的 SQLite 库,所以任一侧改了列,这里立刻失败。
+    """
+    assert _pg_columns(pg_migrator_connection, table) == sqlite_column_order[table]
+
+
+@pytest.mark.parametrize("table", _OWNERSHIP_TABLES)
+def test_ownership_tables_have_no_seq_column(table: str, pg_migrator_connection) -> None:
+    """归属表从不按序读取 ⇒ 不需要 0001 那种 identity tiebreaker。"""
+    assert "seq" not in _pg_columns(pg_migrator_connection, table)
+
+
+@pytest.mark.parametrize("table", _OWNERSHIP_TABLES)
+def test_ownership_text_columns_stay_text(table: str, pg_migrator_connection) -> None:
+    """`approvers` 与时间列必须是 TEXT。
+
+    `approvers` 换成 `jsonb` / `text[]` 会让读侧的 `json.loads` + 严格校验这条
+    单一解析路径分叉;时间列换成 `timestamptz` 会让 `_from_iso()` 拿到
+    `datetime`。两者都是静默的语义变更,不是"优化"。
+    """
+    for column in _OWNERSHIP_MUST_STAY_TEXT[table]:
+        assert _pg_column_type(pg_migrator_connection, table, column) == "text"
+
+
+def test_there_is_no_appendable_approver_table(pg_migrator_connection) -> None:
+    """**结构性的不可变成员集合**:审批集合没有自己的表。
+
+    A3-2-FIX2 的核心 —— 只要存在一张可 INSERT 的 `thread_approvers`,
+    成员集合就是可变的。这里在 PG 侧断言它不存在,并以归属表存在做正对照。
+    """
+    with pg_migrator_connection.cursor() as cur:
+        cur.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+        )
+        tables = {row[0] for row in cur.fetchall()}
+    assert "thread_approvers" not in tables
+    assert "thread_owners" in tables, "正对照:归属表必须存在"
+
+
+@pytest.mark.parametrize(
+    ("table", "expected"),
+    [
+        ("thread_owners", ("thread_id",)),
+    ],
+)
+def test_ownership_primary_keys_match_the_sqlite_contract(
+    table: str, expected: tuple[str, ...], pg_migrator_connection
+) -> None:
+    """主键形态是"重复注册必须响亮失败"的**库层**保障,两侧必须一致。
+
+    `thread_owners` 是单列主键 `thread_id` —— 它同时保证"同一线程只有一行",
+    因此**并发注册只有一个胜者**,且落库的审批集合不会被合并。
+    """
+    with pg_migrator_connection.cursor() as cur:
+        cur.execute(
+            "SELECT a.attname"
+            " FROM pg_index i"
+            " JOIN pg_class c ON c.oid = i.indrelid"
+            " JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)"
+            " WHERE c.relname = %s AND i.indisprimary"
+            " ORDER BY array_position(i.indkey, a.attnum)",
+            (table,),
+        )
+        columns = tuple(row[0] for row in cur.fetchall())
+    assert columns == expected
 
 
 @pytest.mark.parametrize("table", _SEQ_TABLES)

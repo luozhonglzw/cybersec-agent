@@ -733,7 +733,13 @@ def test_trigger_rejects_update_of_real_row(store: SqliteAuditStore, tmp_path: P
 
 
 def test_triggers_exist_for_every_table(store: SqliteAuditStore, tmp_path: Path):
-    """六条触发器(UPDATE/DELETE × 三张表)必须都在 —— 否则上面两条测试会假通过。"""
+    """三张审计表的触发器(UPDATE/DELETE)必须都在 —— 否则上面两条测试会假通过。
+
+    v0.3.0-A3-2 起库里共 **8** 条触发器(归属表 `thread_owners` 另加两条,
+    A3-2-FIX2 起归属是单行)。本用例只钉住审计表那 6 条;归属表的触发器由
+    `tests/test_security/test_ownership_store.py` 单独钉住,两边都不断言总数
+    以外的东西 —— 这样将来再加表不会让这条用例失败。
+    """
     conn = sqlite3.connect(tmp_path / "audit.db")
     try:
         names = {
@@ -811,12 +817,22 @@ def test_source_contains_no_update_or_delete_statements():
             assert not re.search(pattern, text, flags=re.IGNORECASE), (pattern, text)
 
 
-def test_source_has_exactly_three_insert_targets():
-    """写入面只有 INSERT INTO 三张表,没有第四个写入点。"""
+def test_source_has_exactly_the_expected_insert_targets():
+    """写入面只有 INSERT INTO 这四张表,没有第五个写入点。
+
+    v0.3.0-A3-2 把集合从 3 扩到 4(新增 `thread_owners`);A3-2-FIX2 把归属
+    收成单行后,集合就是这四张。断言仍是**集合相等**,不是"包含" ——
+    悄悄多出一个写入点(例如重新引入一张可追加的审批行表)照样会被抓到。
+    """
     targets: set[str] = set()
     for text in _code_strings(store_module):
         targets.update(re.findall(r"INSERT\s+INTO\s+(\w+)", text, flags=re.IGNORECASE))
-    assert targets == {"incidents", "action_requests", "audit_logs"}
+    assert targets == {
+        "incidents",
+        "action_requests",
+        "audit_logs",
+        "thread_owners",
+    }
 
 
 def test_trigger_ddl_is_present_in_source():

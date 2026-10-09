@@ -18,8 +18,25 @@ core 层只声明依赖(构造函数参数),不自己去找依赖。
 审计后端选择(Phase v0.2.0-M1c)也**只在这里**发生一次 —— 见
 `build_audit_store`。图节点、TriageService 与端点里没有任何
 "是 sqlite 还是 postgres" 的分支;它们只依赖 `AuditStore` 契约。
+
+认证与端点准入(Phase v0.3.0-A3-1)同样在本模块装配:4 条业务路由各挂
+一条**显式 FastAPI 依赖**(`require_analyst` / `require_approver` /
+`require_principal`),认证密钥环在 `lifespan` 里构建一次并挂到
+`app.state.auth_keyring`。文档路由(`/openapi.json` / `/docs` /
+`/docs/oauth2-redirect` / `/redoc`)按冻结设计保持公开。
+
+**对象级授权与可信 actor(Phase v0.3.0-A3-3)也在这里** —— 因为它们是
+**HTTP 边界的判定**(状态码是 HTTP 概念),而且需要同时看到已认证主体与
+线程归属:
+
+    /triage  校验审批指派(422)→ 生成 thread_id → **先写归属** → 再跑图
+    /resume  先读归属做对象授权(404 / 403)→ 再把**已认证 subject**
+             当作 operator 交给服务层(权威 actor)
+    /audit/events  先按角色收敛读取范围(403 / 404)→ 再读审计内容
+
+三条判定都在**任何副作用之前**完成。`AuditStore` 的 10 方法契约**未改**。
 """
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 import sqlite3
 import time
@@ -27,7 +44,7 @@ from typing import Literal
 import uuid
 
 import structlog
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from langgraph.checkpoint.memory import InMemorySaver
 from psycopg.conninfo import conninfo_to_dict
@@ -51,7 +68,16 @@ from app.core.triage import (
     TriageService,
     UnknownThreadError,
 )
+from app.schemas.approval import utc_now
 from app.schemas.audit import AuditEvent, AuditRecord
+from app.schemas.ownership import ThreadOwnership
+from app.security.auth import (
+    AuthKeyring,
+    Principal,
+    require_analyst,
+    require_approver,
+    require_principal,
+)
 from app.security.store import SqliteAuditStore
 from app.security.store_postgres import POSTGRES_STORE_ERRORS, PostgresAuditStore
 from app.security.store_protocol import AuditStore
@@ -84,6 +110,160 @@ class AuditStoreUnavailableError(Exception):
     严格限定在审计读边界内 —— 全局处理器会把**写路径**上的 sqlite 故障
     也一并改写成 503,那是本次未获授权的行为变更。
     """
+
+
+#: Phase v0.3.0-A3-3:对象级授权失败的固定文案。
+#:
+#: - `_SELF_APPROVAL_DETAIL`(403)—— 属主试图审批自己发起的线程。
+#:   用**专属**文案而不是通用的 "insufficient role":后者会让人以为
+#:   是角色问题,而事实是"角色对、但对象关系不允许"。属主本来就知道
+#:   这条线程存在(是他发起的),所以这里不存在存在性泄露。
+#: - `_AUDIT_SCOPE_REQUIRED_DETAIL`(403)—— analyst / approver 未给
+#:   `thread_id`。审计范围必须**显式**收敛到一条线程,不允许"不带范围
+#:   地全量读取";viewer 不受此限(它的职责就是全量只读)。
+#: - `_AUDIT_NOT_FOUND_DETAIL`(404)—— 非 viewer 请求了一条**与他无关**
+#:   或**无归属**的线程。文案**不区分**这两种情形(也不区分"线程不存在"),
+#:   否则响应差异就成了"这条线程存不存在"的探测预言机。
+_SELF_APPROVAL_DETAIL = "self-approval is prohibited"
+_AUDIT_SCOPE_REQUIRED_DETAIL = "an explicit thread scope is required for this role"
+_AUDIT_NOT_FOUND_DETAIL = "not found"
+
+
+def _approver_eligible_subjects(request: Request) -> frozenset[str]:
+    """配置里持有 `approver` 角色的全部 subject。
+
+    这是"某个 subject 有没有资格被指派为审批人"的**唯一**答案来源 ——
+    调用方自述、请求体字段、请求头都不是。密钥环缺失(例如应用不是经
+    `lifespan` 装配的)时 fail-closed:给 503 而不是"校验不了就放行"。
+    生产路径上 `require_analyst` 已经先要求过密钥环,所以这个分支只在
+    测试/装配异常时出现。
+    """
+    keyring = getattr(request.app.state, "auth_keyring", None)
+    if not isinstance(keyring, AuthKeyring):
+        raise HTTPException(
+            status_code=503, detail="authentication configuration unavailable"
+        )
+    return keyring.subjects_with_role("approver")
+
+
+def _validate_approver_assignment(
+    request: Request, *, owner: str, approvers: Sequence[str]
+) -> tuple[str, ...]:
+    """校验 `/triage` 的审批指派,返回**规范序**(字典序)的审批人元组。
+
+    在任何图调用或归属写入**之前**执行;任一条不满足 → 422:
+
+    1. 非空(`TriageRequest.approvers` 的 `min_length=1` 已先挡一层,这里
+       再挡一层是为了让"绕过 schema 直接构造"也无处可逃);
+    2. 每个都是非空、无前后空白的字符串;
+    3. **无重复** —— 重复的指派是调用方的笔误,不是"两个人";
+    4. **不得包含发起人自己**(禁止自审批,D-7);
+    5. 每个都必须是**已配置的 approver 角色主体**。
+
+    第 4、5 条是这一层的核心:**"谁能审批"必须来自被记录下来的配置事实,
+    而不是从角色推导的默认值**。一个未配置或没有 approver 角色的 subject
+    被指派进来,意味着这条线程可能**永远没人能审批** —— 那正是冻结设计里
+    的 fail-closed 终态,绝不能在**发起时**悄悄埋下。
+
+    返回排序后的元组:与 `ThreadOwnership` 的归一化一致,保证同一指派
+    只有一种表示。
+    """
+    eligible = _approver_eligible_subjects(request)
+    seen: set[str] = set()
+    for index, subject in enumerate(approvers):
+        if not isinstance(subject, str) or not subject.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"approvers[{index}] must be a non-empty subject identifier",
+            )
+        if subject != subject.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"approvers[{index}] must not carry surrounding whitespace",
+            )
+        if subject in seen:
+            raise HTTPException(
+                status_code=422,
+                detail=f"duplicate approver subject at index {index}: {subject!r}",
+            )
+        seen.add(subject)
+        if subject == owner:
+            raise HTTPException(status_code=422, detail=_SELF_APPROVAL_DETAIL)
+        if subject not in eligible:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"approver {subject!r} is not a configured principal "
+                    "holding the approver role"
+                ),
+            )
+    return tuple(sorted(seen))
+
+
+def _authorize_thread_read(
+    store: AuditStore, principal: Principal, thread_id: str
+) -> None:
+    """`/resume` 的对象级授权 —— 在**任何** graph / checkpointer 访问之前。
+
+    判定(顺序刻意固定):
+
+        ownership 不存在            → 404(未知 / 历史无归属 / 与本主体无关)
+        主体 == ownership.owner     → 403(属主自审批,D-7)
+        主体 ∉ ownership.approvers  → 404(未被指派到这条线程)
+
+    "未被指派" 与 "线程不存在" 必须**给同一个响应**:把 403 用在这里会
+    让任何 approver 都能通过状态码差异枚举"哪些 thread_id 是存在的"。
+    属主自审批之所以可以给 403,是因为属主**本来就知道**这条线程存在
+    (是他自己发起的),这里没有新增泄露。
+
+    本函数只读归属、不碰 checkpoint / 图 / 审计内容,因此"未授权即拒绝"
+    不会产生任何副作用。
+    """
+    ownership = store.get_thread_ownership(thread_id)
+    if ownership is None:
+        raise UnknownThreadError("未知的 thread_id")
+    if principal.subject == ownership.owner:
+        raise HTTPException(status_code=403, detail=_SELF_APPROVAL_DETAIL)
+    if principal.subject not in ownership.approvers:
+        raise UnknownThreadError("未知的 thread_id")
+
+
+def _authorize_audit_scope(
+    store: AuditStore, principal: Principal, thread_id: str | None
+) -> None:
+    """`/audit/events` 的读取范围收敛 —— 在**取回审计内容之前**。
+
+    角色矩阵(冻结):
+
+        viewer   全量可读(含历史无归属的线程),`thread_id` 可省可给;
+        analyst  **必须**给出 `thread_id`,且只能是**自己拥有**的线程;
+        approver **必须**给出 `thread_id`,且只能是**自己拥有或显式被指派
+                 审批**的线程。
+
+    403 = 该角色**不允许**做这次读取(缺少显式 thread 范围);
+    404 = 允许做,但**这条线程不在他的范围里**(含无归属/不存在)。
+
+    两条刻意守住的边界:
+    - 这是**对象授权**,不是"取全量再在 Python 里筛":未授权时根本
+      不调用 `list_audit`,因此越权者拿不到任何审计内容;
+    - 404 的文案对"无关线程"与"不存在的线程"**完全相同**,不给枚举预言机。
+    """
+    if principal.role == "viewer":
+        return
+    if thread_id is None:
+        raise HTTPException(status_code=403, detail=_AUDIT_SCOPE_REQUIRED_DETAIL)
+    ownership = store.get_thread_ownership(thread_id)
+    if ownership is None:
+        raise HTTPException(status_code=404, detail=_AUDIT_NOT_FOUND_DETAIL)
+    if principal.role == "analyst":
+        if ownership.owner != principal.subject:
+            raise HTTPException(status_code=404, detail=_AUDIT_NOT_FOUND_DETAIL)
+        return
+    # approver:自己拥有的,或显式被指派审批的
+    if ownership.owner != principal.subject and principal.subject not in (
+        ownership.approvers
+    ):
+        raise HTTPException(status_code=404, detail=_AUDIT_NOT_FOUND_DETAIL)
 
 
 def build_audit_store(settings: Settings) -> AuditStore:
@@ -161,8 +341,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     且**每个进程只建一个** —— 绝不在请求处理里建池。`finally` 覆盖
     "正常退出"与"部分启动失败"两条路径:例如 LLMClient() 抛错时,
     已经建好的连接池必须被关掉,否则进程退出前一直占着数据库连接。
+
+    认证密钥环(Phase v0.3.0-A3-1)同样**只在这里**构建一次,并挂到
+    `app.state.auth_keyring` 供 `require_principal` 取用。它的配置在
+    `get_settings()` 里已经校验过:配置缺失/非法 → 这里直接抛错,
+    进程**拒绝启动**(fail-closed)。密钥环本身不可变,构建后不再改动。
     """
     settings = get_settings()
+    # 认证边界先于任何业务装配:配置不对就没必要再往下建 store / LLM。
+    app.state.auth_keyring = AuthKeyring.from_entries(settings.auth_api_keys)
     # audit_db_path 来自 Settings(D5);logs_path / intel_path 不注入,
     # 由工具层默认值提供(HitlConfig 的 None 语义)。
     store = build_audit_store(settings)
@@ -301,7 +488,7 @@ def create_app(
     use_lifespan = agent is None and triage_service is None and audit_store is None
     app = FastAPI(
         title="CyberSec Agent",
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan if use_lifespan else None,
     )
     if agent is not None:
@@ -402,38 +589,103 @@ def create_app(
             status_code=503, content={"detail": "audit store unavailable"}
         )
 
-    @app.post("/chat", response_model=ChatResponse)
+    @app.post(
+        "/chat",
+        response_model=ChatResponse,
+        # 准入:analyst / approver。依赖而不是中间件 —— 这样既有的 API 测试
+        # 可以用 app.dependency_overrides 换掉认证缝,而不必改动它们自己。
+        dependencies=[Depends(require_analyst)],
+    )
     async def chat(payload: ChatRequest, request: Request) -> ChatResponse:
-        """对话式安全分析入口。校验交给 Pydantic,业务交给 Agent。"""
+        """对话式安全分析入口。校验交给 Pydantic,业务交给 Agent。
+
+        **准入是 analyst / approver,仅此而已**(Phase v0.3.0-A3-3 明确):
+        本端点**不**经过 HITL 图、**不**做策略判定、**不**写审计、**不**要求
+        审批 —— 它是一条纯 LLM 对话路径。不得把它描述成"受策略/审批保护",
+        那会让调用方以为这里的输出已经过人工把关。
+        """
         reply = await _require_agent(request).chat(
             payload.message, request_id=_request_id_of(request)
         )
         return ChatResponse(response=reply)
 
     @app.post("/triage", response_model=TriageResponse)
-    async def triage(payload: TriageRequest, request: Request) -> TriageResponse:
+    async def triage(
+        payload: TriageRequest,
+        request: Request,
+        principal: Principal = Depends(require_analyst),
+    ) -> TriageResponse:
         """发起一次 HITL 判定。
 
         thread_id 由服务端生成(D3):请求体里没有这个字段,客户端无法指定。
+        A3-3 起它在这里生成 —— 因为**归属必须在跑图之前写好**,而归属要带
+        thread_id。生成者是服务端(HTTP 边界),不是客户端,所以 D3 的性质
+        (客户端无法指定 thread_id)没有改变。
+
+        **执行顺序(冻结,不得重排)**:
+
+            1. 认证 + 角色准入(依赖)—— 401 / 403;
+            2. body 校验 —— 缺 `approvers` 等 → 422;
+            3. **审批指派校验** —— 空 / 重复 / 自指派 / 非配置 approver → 422;
+            4. 取 store / service —— 缺失 → 503;
+            5. **写归属**(owner = 已认证 subject,审批集合 = 规范序);
+            6. 调用服务层跑图。
+
+        第 3 步必须在第 5、6 步之前:任何一次非法的指派都不得留下归属行,
+        更不得触发图执行。"先校验、再落库、最后才跑图"是这里唯一正确的顺序。
         """
-        result = await _require_service(request).triage(
+        approvers = _validate_approver_assignment(
+            request, owner=principal.subject, approvers=payload.approvers
+        )
+        service = _require_service(request)
+        store = _require_store(request)
+        thread_id = uuid.uuid4().hex
+        store.record_thread_ownership(
+            ThreadOwnership(
+                thread_id=thread_id,
+                owner=principal.subject,
+                approvers=approvers,
+                created_at=utc_now(),
+            )
+        )
+        result = await service.triage(
             payload.indicator,
             event_type=payload.event_type,
             request_id=_request_id_of(request),
+            thread_id=thread_id,
         )
         return _to_response(result)
 
     @app.post("/resume", response_model=TriageResponse)
-    async def resume(payload: ResumeRequest, request: Request) -> TriageResponse:
+    async def resume(
+        payload: ResumeRequest,
+        request: Request,
+        principal: Principal = Depends(require_approver),
+    ) -> TriageResponse:
         """对暂停中的判定给出人工决定,并把图跑完。
 
         interrupt_id 不在请求体里(D7):服务端从 checkpoint 恢复,
         客户端无法指定"审批的是哪一次暂停"。
+
+        **两道闸门(Phase v0.3.0-A3-3)**:
+
+        1. **角色准入**(依赖 `require_approver`)—— 不是已认证 approver → 401/403;
+        2. **对象级授权**(`_authorize_thread_read`)—— 必须在
+           `_validate_resumable` 与任何 graph / checkpointer 访问**之前**:
+           未指派 → 404,属主自审批 → 403。
+
+        **权威 actor**:`payload.operator` 是调用方自述值,**被忽略**;
+        交给服务层的 operator 是 `principal.subject`(已认证主体)。
+        因此审计 `actor` 不再能被客户端伪造。字段本身保留只为线上请求的
+        错误兼容性(缺字段仍 422),它不影响任何判定。
         """
-        result = await _require_service(request).resume(
+        store = _require_store(request)
+        service = _require_service(request)
+        _authorize_thread_read(store, principal, payload.thread_id)
+        result = await service.resume(
             payload.thread_id,
             status=payload.status,
-            operator=payload.operator,
+            operator=principal.subject,
             reason=payload.reason,
             request_id=_request_id_of(request),
         )
@@ -442,25 +694,36 @@ def create_app(
     @app.get("/audit/events", response_model=list[AuditRecord])
     async def list_audit_events(
         request: Request,
+        principal: Principal = Depends(require_principal),
         thread_id: str | None = None,
         event: AuditEvent | None = None,
         limit: int = Query(default=50, ge=1, le=200),
         order: Literal["desc", "asc"] = Query(default="desc"),
     ) -> list[AuditRecord]:
-        """只读查询审计流(Phase 9.3-F)。
+        """只读查询审计流(Phase 9.3-F;读取范围收敛于 v0.3.0-A3-3)。
 
         这是**只读**端点:它只调用 AuditStore.list_audit,不追加任何
         审计(读审计不会再写一条审计)、不触发策略/审批/resume/checkpoint、
         不调用工具 / MCP / provider / 模型,也不发起外部网络请求。
         `AuditStore` 是契约:后端是 SQLite 还是 PostgreSQL 对本端点透明。
 
-        **本端点没有任何认证** —— 它是只读的,但**不是** "authorized
-        endpoint"。措辞上不得暗示调用方已通过身份校验、或只有审计员可见;
-        认证留到后续阶段。
+        **准入(Phase v0.3.0-A3-1)**:要求已认证主体
+        (`require_principal`)—— viewer / analyst / approver 三者皆可。
 
-        响应是**裸列表** `list[AuditRecord]`,无信封;空结果(含未知
-        thread_id / 无匹配过滤)一律 200 + `[]`,不区分"不存在"与"无数据"
-        (避免用响应差异探测库里有什么)。
+        **读取范围(Phase v0.3.0-A3-3,冻结矩阵)**:
+
+            viewer   全量可读,含**历史无归属**的线程;`thread_id` 可省可给;
+            analyst  必须给出 `thread_id`,且只能是**自己拥有**的线程;
+            approver 必须给出 `thread_id`,且只能是**自己拥有或显式被指派
+                     审批**的线程。
+
+        analyst / approver 不带 `thread_id` → **403**;带了但线程不在自己的
+        范围里(含无归属 / 不存在)→ **404**。授权在**取回任何审计内容之前**
+        完成 —— 不做"先全量取回再在 Python 里过滤",那样越权者虽然看不到
+        结果,却已经让服务端把不属于他的数据读了出来。
+
+        响应是**裸列表** `list[AuditRecord]`,无信封;对**已授权**的范围,
+        空结果一律 200 + `[]`。
 
         参数刻意只有四个,且都是**声明式**的:
             thread_id / event  —— 等值过滤(全部参数绑定,无字符串拼接);
@@ -476,6 +739,7 @@ def create_app(
         校验失败一律 422(FastAPI 默认);审计库读失败 → 503 固定文案。
         """
         store = _require_store(request)
+        _authorize_audit_scope(store, principal, thread_id)
         try:
             return store.list_audit(
                 thread_id=thread_id,

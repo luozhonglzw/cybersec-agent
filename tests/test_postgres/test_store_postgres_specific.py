@@ -7,6 +7,7 @@
 - DSN 脱敏;
 - SQL 注入抵抗(参数绑定的实证);
 - 连接身份是受限角色,且该角色**没有** UPDATE / DELETE / TRUNCATE / DDL;
+- **并发**注册同一线程只有一个胜者(v0.3.0-A3-2-FIX2);
 - **源码级**护栏:写路径只有 INSERT,没有 UPDATE / DELETE / UPSERT / ON CONFLICT,
   也没有任何 DDL。
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import re
+import threading
 from pathlib import Path
 
 import psycopg
@@ -24,8 +26,12 @@ import app.security.store_postgres as pg_store_module
 from app.security.audit import build_audit_record
 from app.security.store_postgres import PostgresAuditStore, redact_dsn
 from tests.test_postgres._store_backends import (
+    APPROVER_B,
+    APPROVER_C,
+    OWNER,
     TS,
     make_incident,
+    make_ownership,
     make_request,
     uid,
 )
@@ -441,12 +447,22 @@ def test_source_contains_no_mutating_or_ddl_statements() -> None:
             assert not re.search(pattern, text, flags=re.IGNORECASE), (pattern, text)
 
 
-def test_source_has_exactly_three_insert_targets() -> None:
-    """写入面只有 INSERT INTO 三张表,没有第四个写入点。"""
+def test_source_has_exactly_the_expected_insert_targets() -> None:
+    """写入面只有 INSERT INTO 这四张表,没有第五个写入点。
+
+    v0.3.0-A3-2 把集合从 3 扩到 4(新增 `thread_owners`);A3-2-FIX2 把归属
+    收成单行后集合就是这四张。断言仍是**集合相等**,不是"包含" —— 悄悄多出
+    一个写入点(例如重新引入可追加的审批行表)照样会被抓到。
+    """
     targets: set[str] = set()
     for text in _code_strings(pg_store_module):
         targets.update(re.findall(r"INSERT\s+INTO\s+(\w+)", text, flags=re.IGNORECASE))
-    assert targets == {"incidents", "action_requests", "audit_logs"}
+    assert targets == {
+        "incidents",
+        "action_requests",
+        "audit_logs",
+        "thread_owners",
+    }
 
 
 def test_source_never_interpolates_caller_values_into_sql() -> None:
@@ -481,12 +497,25 @@ def test_source_sql_literals_are_constant_or_parameterized() -> None:
 
 
 def test_source_imports_timestamp_helpers_from_the_sqlite_module() -> None:
-    """时间语义必须**单一真相源** —— 不得在 PG 侧另写一份。
+    """时间语义与审批集合的序列化必须**单一真相源** —— 不得在 PG 侧另写一份。
 
-    复制一份"归一化到 UTC + 拒绝 naive"的逻辑迟早会漂移,而审计流依赖顺序。
+    复制一份"归一化到 UTC + 拒绝 naive"或"规范序 JSON"的逻辑迟早会漂移,
+    而审计流依赖顺序、"同一指派只有一个字节表示"是承重性质。
     """
     source = Path(pg_store_module.__file__).read_text(encoding="utf-8")
-    assert "from app.security.store import _from_iso, _to_iso" in source
+    assert "from app.security.store import (" in source
+    for helper in (
+        "_deserialize_approvers",
+        "_from_iso",
+        "_serialize_approvers",
+        "_to_iso",
+    ):
+        assert helper in source, f"PG store 没有复用 {helper}"
+    # 负对照:不得在 PG 侧**定义**一份同名的本地实现(那会绕开单一真相源)
+    assert "def _serialize_approvers" not in source
+    assert "def _deserialize_approvers" not in source
+    assert "def _to_iso" not in source
+    assert "def _from_iso" not in source
 
 
 def test_source_does_not_modify_the_sqlite_module() -> None:
@@ -497,3 +526,121 @@ def test_source_does_not_modify_the_sqlite_module() -> None:
     # 既有实现里不得出现任何针对 PG 的适配痕迹
     assert "psycopg" not in source
     assert "store_postgres" not in source
+
+
+# ---------------------------------------------------------------------------
+# 7. 线程归属的数据库级不可变性(v0.3.0-A3-2-FIX2)
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_role_late_approver_insert_is_rejected(pg_app_dsn: str) -> None:
+    """**D-GATE-1 的 PG 侧回归**:运行时角色无法在注册之后追加审批人。
+
+    运行时角色**有** `INSERT ON thread_owners`(那是正常注册路径需要的),
+    因此"追加"只能表现为**再插一行同一 `thread_id`** —— 被主键拒绝。
+    而"改写既有行的 approvers 列"则被权限层拒绝(没有 UPDATE)。
+
+    这两条合起来,把旧两表设计里"直连 INSERT 一行就多一个审批人"的缺口
+    彻底关掉。
+    """
+    store = PostgresAuditStore(pg_app_dsn)
+    try:
+        tid = uid("th")
+        store.record_thread_ownership(
+            make_ownership(thread_id=tid, approvers=(APPROVER_B,))
+        )
+
+        # 1) 追加一行"同一线程的第二个审批人" —— 主键拒绝
+        with pytest.raises(psycopg.errors.IntegrityError):
+            with store._connection() as conn:
+                conn.execute(
+                    "INSERT INTO thread_owners"
+                    " (thread_id, owner, approvers, created_at)"
+                    " VALUES (%s, %s, %s, %s)",
+                    (tid, "mallory", '["mallory"]', TS.isoformat()),
+                )
+
+        # 2) 改写既有行的审批集合 —— 权限层拒绝(无 UPDATE)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with store._connection() as conn:
+                conn.execute(
+                    "UPDATE thread_owners SET approvers = %s WHERE thread_id = %s",
+                    ('["bob","mallory"]', tid),
+                )
+
+        got = store.get_thread_ownership(tid)
+        assert got is not None and got.approvers == (APPROVER_B,)
+    finally:
+        store.close()
+
+
+def test_runtime_role_cannot_delete_or_truncate_ownership(pg_app_dsn: str) -> None:
+    """运行时角色在归属表上没有 DELETE / TRUNCATE。"""
+    store = PostgresAuditStore(pg_app_dsn)
+    try:
+        tid = uid("th")
+        store.record_thread_ownership(make_ownership(thread_id=tid))
+        for statement in (
+            "DELETE FROM thread_owners WHERE false",
+            "TRUNCATE TABLE thread_owners",
+        ):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                with store._connection() as conn:
+                    conn.execute(statement)
+    finally:
+        store.close()
+
+
+def test_concurrent_same_thread_registration_has_one_winner(pg_app_dsn: str) -> None:
+    """**并发**注册同一线程:恰好一个胜者,**审批集合不会被合并**。
+
+    两个线程各自用池里的**不同连接**同时注册同一个 `thread_id`,但带上
+    **不同**的审批集合。唯一约束保证只有一个 INSERT 成功,另一个得到
+    `UniqueViolation`。读回的审批集合必须**恰好等于胜者的那一份** ——
+    不是并集、不是交集、不是"谁最后写谁赢"的覆盖。
+
+    这是旧两表设计无法提供的性质:那里"追加"是合法的,于是并发下集合可能
+    被合并(见 A3-2-FIX 报告的 F-2)。单行结构把这件事变成不可能。
+
+    刻意用 `threading.Barrier` 让两个注册尽量同时发生 —— 但**断言与交错无关**:
+    无论是否真的重叠,主键唯一性都保证结果相同,所以本用例不 flaky。
+    """
+    tid = uid("th-race")
+    store = PostgresAuditStore(pg_app_dsn, min_size=2, max_size=4)
+    barrier = threading.Barrier(2)
+    results: dict[str, str] = {}
+    lock = threading.Lock()
+
+    def attempt(name: str, approvers: tuple[str, ...]) -> None:
+        barrier.wait(timeout=10)
+        try:
+            store.record_thread_ownership(
+                make_ownership(thread_id=tid, approvers=approvers)
+            )
+        except psycopg.errors.IntegrityError:
+            outcome = "rejected"
+        else:
+            outcome = "ok"
+        with lock:
+            results[name] = outcome
+
+    try:
+        threads = [
+            threading.Thread(target=attempt, args=("a", (APPROVER_B,))),
+            threading.Thread(target=attempt, args=("b", (APPROVER_C,))),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert sorted(results.values()) == ["ok", "rejected"], results
+
+        got = store.get_thread_ownership(tid)
+        assert got is not None
+        # 恰好一个胜者:集合大小为 1,且等于 B 或 C 之一 —— 绝不是 {B, C}
+        assert len(got.approvers) == 1, f"审批集合被合并了: {got.approvers}"
+        assert got.approvers in ((APPROVER_B,), (APPROVER_C,))
+        assert got.owner == OWNER
+    finally:
+        store.close()

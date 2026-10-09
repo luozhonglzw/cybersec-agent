@@ -40,6 +40,17 @@ from app.schemas.audit import AuditRecord
 from app.security.audit import build_audit_record
 from app.security.store import SqliteAuditStore
 from app.security.store_postgres import PostgresAuditStore
+from tests.conftest import (
+    ANALYST_HEADERS,
+    APPROVER_HEADERS,
+    OWNER_HEADERS,
+    TEST_APPROVER_SUBJECT,
+    TEST_OWNER_SUBJECT,
+    VIEWER_HEADERS,
+)
+
+#: A3-3:发起判定必须显式指派审批人,且不能是发起人自己。
+APPROVERS = [TEST_APPROVER_SUBJECT]
 
 pytestmark = pytest.mark.postgres
 
@@ -173,7 +184,7 @@ def _events(store: Any, thread_id: str) -> list[str]:
 
 
 def _start_triage(client: TestClient, indicator: str = BRUTE_FORCE_IP) -> str:
-    resp = client.post("/triage", json={"indicator": indicator})
+    resp = client.post("/triage", json={"indicator": indicator, "approvers": APPROVERS})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["status"] == "pending_approval"
@@ -186,10 +197,14 @@ def _start_triage(client: TestClient, indicator: str = BRUTE_FORCE_IP) -> str:
 
 
 class _DelegatingStore:
-    """把 8 个契约方法原样转发给真实 store,可按方法名注入失败。
+    """把 10 个契约方法原样转发给真实 store,可按方法名注入失败。
 
     刻意**不**继承具体后端:它只满足 `AuditStore` 契约,这正是"图与
     triage 服务只依赖契约"的活证据。
+
+    A3-2 把契约从 8 个方法扩到 10 个(新增线程归属的读写),这里必须跟着
+    转发 —— 否则 `/triage` 在登记归属时拿到 `AttributeError` 而不是真实
+    的后端行为,故障注入用例会测到一个**假的** 500。
     """
 
     def __init__(self, inner: Any, *, fail_on: str | None = None, exc=None) -> None:
@@ -218,10 +233,18 @@ class _DelegatingStore:
         self._gate("append_audit")
         return self._inner.append_audit(record)
 
+    def record_thread_ownership(self, ownership) -> None:
+        self._gate("record_thread_ownership")
+        return self._inner.record_thread_ownership(ownership)
+
     # ---- 读 ----
     def get_incident(self, incident_id):
         self._gate("get_incident")
         return self._inner.get_incident(incident_id)
+
+    def get_thread_ownership(self, thread_id):
+        self._gate("get_thread_ownership")
+        return self._inner.get_thread_ownership(thread_id)
 
     def get_approval_request(self, thread_id):
         self._gate("get_approval_request")
@@ -267,7 +290,7 @@ def test_default_backend_is_sqlite_and_unchanged(tmp_path, monkeypatch, data_pat
             assert isinstance(store, SqliteAuditStore)
             assert not isinstance(store, PostgresAuditStore)
             assert (tmp_path / "audit.db").exists()
-            assert client.get("/audit/events").status_code == 200
+            assert client.get("/audit/events", headers=VIEWER_HEADERS).status_code == 200
     finally:
         get_settings.cache_clear()
 
@@ -304,7 +327,7 @@ def test_triage_persists_incident_action_requests_and_audit(client, backend):
 def test_allowed_triage_persists_only_incident(client, backend):
     """策略放行路径:落 incident,但**不**伪造审批单(否则 pending 会失真)。"""
     name, store = backend
-    resp = client.post("/triage", json={"indicator": LOW_RISK_IP})
+    resp = client.post("/triage", json={"indicator": LOW_RISK_IP, "approvers": APPROVERS})
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "completed"
@@ -328,6 +351,7 @@ def test_resume_records_the_decision_and_ends_the_thread(client, backend, decisi
 
     resp = client.post(
         "/resume",
+        headers=APPROVER_HEADERS,
         json={"thread_id": thread_id, "status": decision, "operator": "alice"},
     )
     assert resp.status_code == 200, resp.text
@@ -338,6 +362,7 @@ def test_resume_records_the_decision_and_ends_the_thread(client, backend, decisi
     assert store.pending_action_rows(thread_id=thread_id) == []
     again = client.post(
         "/resume",
+        headers=APPROVER_HEADERS,
         json={"thread_id": thread_id, "status": decision, "operator": "alice"},
     )
     assert again.status_code == 409
@@ -347,6 +372,7 @@ def test_resume_records_the_decision_and_ends_the_thread(client, backend, decisi
 def test_resume_unknown_thread_is_404(client):
     resp = client.post(
         "/resume",
+        headers=APPROVER_HEADERS,
         json={"thread_id": uuid.uuid4().hex, "status": "approved", "operator": "x"},
     )
     assert resp.status_code == 404
@@ -360,6 +386,7 @@ def test_expired_approval_cannot_be_resumed_and_writes_timeout(backend, data_pat
 
     resp = client.post(
         "/resume",
+        headers=APPROVER_HEADERS,
         json={"thread_id": thread_id, "status": "approved", "operator": "alice"},
     )
     assert resp.status_code == 409
@@ -371,6 +398,7 @@ def test_expired_approval_cannot_be_resumed_and_writes_timeout(backend, data_pat
     # 超时不可逆:补批也 409,且不会多写一条 timeout
     again = client.post(
         "/resume",
+        headers=APPROVER_HEADERS,
         json={"thread_id": thread_id, "status": "approved", "operator": "alice"},
     )
     assert again.status_code == 409
@@ -390,6 +418,7 @@ def test_checkpoint_is_in_memory_so_a_restart_cannot_resume(backend, data_paths)
     second = TestClient(build_app(store, data_paths))
     resp = second.post(
         "/resume",
+        headers=APPROVER_HEADERS,
         json={"thread_id": thread_id, "status": "approved", "operator": "alice"},
     )
     assert resp.status_code == 409
@@ -421,37 +450,57 @@ def test_audit_events_returns_backend_records(client, backend):
     thread_id = uuid.uuid4().hex
     ids = _seed(store, 3, thread_id=thread_id)
 
-    asc = client.get("/audit/events", params={"thread_id": thread_id, "order": "asc"})
+    asc = client.get(
+        "/audit/events",
+        headers=VIEWER_HEADERS,
+        params={"thread_id": thread_id, "order": "asc"},
+    )
     assert asc.status_code == 200
     assert [row["id"] for row in asc.json()] == ids
 
-    desc = client.get("/audit/events", params={"thread_id": thread_id})
+    desc = client.get(
+        "/audit/events", headers=VIEWER_HEADERS, params={"thread_id": thread_id}
+    )
     assert [row["id"] for row in desc.json()] == ids[::-1]
 
     limited = client.get(
-        "/audit/events", params={"thread_id": thread_id, "limit": 2, "order": "asc"}
+        "/audit/events",
+        headers=VIEWER_HEADERS,
+        params={"thread_id": thread_id, "limit": 2, "order": "asc"},
     )
     assert [row["id"] for row in limited.json()] == ids[:2]
 
     assert client.get(
-        "/audit/events", params={"thread_id": uuid.uuid4().hex}
+        "/audit/events",
+        headers=VIEWER_HEADERS,
+        params={"thread_id": uuid.uuid4().hex},
     ).json() == []
 
     # 读路径不得产生新的写入
     before = len(store.list_audit(thread_id=thread_id))
-    client.get("/audit/events", params={"thread_id": thread_id})
+    client.get(
+        "/audit/events", headers=VIEWER_HEADERS, params={"thread_id": thread_id}
+    )
     assert len(store.list_audit(thread_id=thread_id)) == before == 3
 
 
 def test_audit_events_after_triage_shows_the_whole_flow(client):
-    """端到端:一次 /triage + /resume 之后,审计流可经 HTTP 读回。"""
+    """端到端:一次 /triage + /resume 之后,审计流可经 HTTP 读回。
+
+    A3-3:`approval.decided` 的 `actor` 取**已认证主体**(approver 的 subject),
+    请求体里那个 `operator: "bob"` 是**客户端伪造**的,不改变权威归属 ——
+    这里同时断言"真实 actor 落库"与"伪造值无效"。
+    """
     thread_id = _start_triage(client)
     client.post(
         "/resume",
+        headers=APPROVER_HEADERS,
         json={"thread_id": thread_id, "status": "denied", "operator": "bob"},
     )
     rows = client.get(
-        "/audit/events", params={"thread_id": thread_id, "order": "asc"}
+        "/audit/events",
+        headers=VIEWER_HEADERS,
+        params={"thread_id": thread_id, "order": "asc"},
     ).json()
     assert [row["event"] for row in rows] == [
         "plan.created",
@@ -460,7 +509,8 @@ def test_audit_events_after_triage_shows_the_whole_flow(client):
         "approval.decided",
     ]
     assert rows[-1]["outcome"] == "denied"
-    assert rows[-1]["actor"] == "bob"
+    assert rows[-1]["actor"] == TEST_APPROVER_SUBJECT
+    assert rows[-1]["actor"] != "bob"
 
 
 # =====================================================================
@@ -477,7 +527,7 @@ def test_unreachable_postgres_never_falls_back_to_sqlite(data_paths):
         assert isinstance(app.state.audit_store, PostgresAuditStore)
         assert not isinstance(app.state.audit_store, SqliteAuditStore)
 
-        resp = client.get("/audit/events")
+        resp = client.get("/audit/events", headers=VIEWER_HEADERS)
         assert resp.status_code == 503
         assert resp.json() == {"detail": "audit store unavailable"}
     finally:
@@ -505,7 +555,7 @@ def test_unreachable_postgres_at_startup_still_does_not_fall_back(monkeypatch, t
             store = client.app.state.audit_store
             assert isinstance(store, PostgresAuditStore)
             assert not isinstance(store, SqliteAuditStore)
-            assert client.get("/audit/events").status_code == 503
+            assert client.get("/audit/events", headers=VIEWER_HEADERS).status_code == 503
         assert not sqlite_path.exists(), "不得因 PostgreSQL 不可用而回退到 SQLite"
     finally:
         get_settings.cache_clear()
@@ -516,7 +566,7 @@ def test_read_path_database_failure_is_503_with_fixed_text(data_paths):
     store = PostgresAuditStore(UNREACHABLE_DSN, open_timeout=0.5, connect_timeout=1)
     try:
         client = TestClient(build_app(store, data_paths))
-        resp = client.get("/audit/events")
+        resp = client.get("/audit/events", headers=VIEWER_HEADERS)
         assert resp.status_code == 503
         assert resp.json() == {"detail": "audit store unavailable"}
         body = resp.text
@@ -535,7 +585,7 @@ def test_read_path_lifecycle_misuse_is_not_masked_as_503(pg_app_dsn, data_paths)
     store = PostgresAuditStore(pg_app_dsn)
     store.close()
     client = TestClient(build_app(store, data_paths), raise_server_exceptions=False)
-    assert client.get("/audit/events").status_code == 500
+    assert client.get("/audit/events", headers=VIEWER_HEADERS).status_code == 500
 
 
 def test_read_path_503_requires_the_postgres_error_mapping(data_paths, monkeypatch):
@@ -547,10 +597,10 @@ def test_read_path_503_requires_the_postgres_error_mapping(data_paths, monkeypat
     store = PostgresAuditStore(UNREACHABLE_DSN, open_timeout=0.5, connect_timeout=1)
     try:
         client = TestClient(build_app(store, data_paths), raise_server_exceptions=False)
-        assert client.get("/audit/events").status_code == 503
+        assert client.get("/audit/events", headers=VIEWER_HEADERS).status_code == 503
 
         monkeypatch.setattr(api_main, "_STORE_READ_FAILURES", (ValueError,))
-        assert client.get("/audit/events").status_code == 500, (
+        assert client.get("/audit/events", headers=VIEWER_HEADERS).status_code == 500, (
             "移除 psycopg 错误映射后仍返回 503 —— 说明 503 与映射无关"
         )
     finally:
@@ -562,7 +612,7 @@ def test_write_path_database_failure_is_500(data_paths):
     store = PostgresAuditStore(UNREACHABLE_DSN, open_timeout=0.5, connect_timeout=1)
     try:
         client = TestClient(build_app(store, data_paths), raise_server_exceptions=False)
-        resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP})
+        resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS})
         assert resp.status_code == 500
         assert "thread_id" not in resp.text
         assert "pending_approval" not in resp.text
@@ -575,7 +625,7 @@ def test_write_path_failure_during_operation_is_500(backend, data_paths):
     _, real = backend
     store = _DelegatingStore(real, fail_on="append_audit", exc=psycopg.OperationalError)
     client = TestClient(build_app(store, data_paths), raise_server_exceptions=False)
-    resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP})
+    resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS})
     assert resp.status_code == 500
     assert store.calls.count("append_audit") == 1
 
@@ -594,7 +644,7 @@ def test_mandatory_persistence_failure_never_returns_false_success(backend, data
     name, real = backend
     store = _DelegatingStore(real, fail_on="record_incident")
     client = TestClient(build_app(store, data_paths), raise_server_exceptions=False)
-    resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP})
+    resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS})
 
     assert resp.status_code == 500
     assert "thread_id" not in resp.text
@@ -617,7 +667,7 @@ def test_best_effort_plan_failed_audit_failure_does_not_replace_the_failure(
     store = _DelegatingStore(real, fail_on="append_audit")
     client = TestClient(build_app(store, missing_data_paths), raise_server_exceptions=False)
 
-    resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP})
+    resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS})
     assert resp.status_code == 503
     assert resp.json() == {"detail": "安全数据源不可用"}
     # 旁路确实被尝试过 —— 否则这条用例什么都没证明
@@ -632,7 +682,7 @@ def test_plan_failed_is_audited_when_the_audit_store_is_healthy(backend, missing
     store = _DelegatingStore(real)
     client = TestClient(build_app(store, missing_data_paths), raise_server_exceptions=False)
 
-    resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP})
+    resp = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS})
     assert resp.status_code == 503
     assert [record.event for record in store.appended] == ["plan.failed"]
     assert store.appended[0].outcome == "failed"
@@ -657,7 +707,7 @@ def test_high_risk_still_requires_approval_and_does_not_auto_execute(client):
     thread_id = _start_triage(client)
     assert thread_id
     # 停在 human_approval:重复 /triage 不会"顺手"把上一个批了
-    body = client.post("/triage", json={"indicator": BRUTE_FORCE_IP}).json()
+    body = client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS}).json()
     assert body["thread_id"] != thread_id
     assert body["status"] == "pending_approval"
 
@@ -667,6 +717,7 @@ def test_denial_is_recorded_and_not_converted_to_approval(client, backend):
     thread_id = _start_triage(client)
     resp = client.post(
         "/resume",
+        headers=APPROVER_HEADERS,
         json={"thread_id": thread_id, "status": "denied", "operator": "mallory"},
     )
     assert resp.status_code == 200
@@ -687,6 +738,162 @@ def test_hitl_toolset_still_excludes_the_planner():
         "plan_response_tool",
     }
     assert "plan_response_tool" not in {tool.name for tool in HITL_TOOLS}
+
+
+# =====================================================================
+# K2. 对象级授权:SQLite / PostgreSQL 对等(同一组断言跑两个后端)
+# =====================================================================
+
+
+def test_object_authorization_is_backend_independent(backend, data_paths):
+    """A3-3:对象级授权读的是**归属表**,行为必须与后端无关。
+
+    归属由 `/triage` 经**真实 store** 落库(SQLite 与 PostgreSQL 各一份),
+    随后同一组负例/正例断言在两个后端上都必须成立 —— 授权判定不得因为
+    "换了后端"而放宽或收紧。这是 TASK 6 的 SQLite/PostgreSQL 对等项:
+    授权是**应用层**逻辑,但它读的事实来自存储层,两侧必须给出同一答案。
+    """
+    name, store = backend
+    client = TestClient(build_app(store, data_paths))
+
+    # ---- 归属经真实后端落库,再原样读回(授权判定的**事实来源**) ----
+    thread_id = _start_triage(client)
+    ownership = store.get_thread_ownership(thread_id)
+    assert ownership is not None, name
+    assert ownership.owner == TEST_OWNER_SUBJECT, name
+    assert ownership.approvers == (TEST_APPROVER_SUBJECT,), name
+
+    # ---- 属主自审批 → 403(两个后端同一判定) ----
+    owner_self = client.post(
+        "/resume",
+        headers=OWNER_HEADERS,
+        json={"thread_id": thread_id, "status": "approved", "operator": "owner"},
+    )
+    assert owner_self.status_code == 403, name
+    assert owner_self.json() == {"detail": "self-approval is prohibited"}, name
+
+    # ---- 未知线程 → 404(角色准入通过,但对象不存在) ----
+    unknown = client.post(
+        "/resume",
+        headers=APPROVER_HEADERS,
+        json={"thread_id": uuid.uuid4().hex, "status": "approved", "operator": "x"},
+    )
+    assert unknown.status_code == 404, name
+
+    # ---- 被指派的 approver 可按线程范围读审计(对象授权**通过**) ----
+    scoped = client.get(
+        "/audit/events",
+        headers=APPROVER_HEADERS,
+        params={"thread_id": thread_id, "order": "asc"},
+    )
+    assert scoped.status_code == 200, name
+    assert [row["event"] for row in scoped.json()] == [
+        "plan.created",
+        "policy.evaluated",
+        "approval.requested",
+    ]
+
+    # ---- approver 不带范围 → 403(两个后端同一判定) ----
+    unfiltered = client.get("/audit/events", headers=APPROVER_HEADERS)
+    assert unfiltered.status_code == 403, name
+    assert unfiltered.json() == {
+        "detail": "an explicit thread scope is required for this role"
+    }, name
+
+    # ---- 无关 / 无归属线程 → 404,且与"根本不存在"不可区分 ----
+    unrelated = client.get(
+        "/audit/events", headers=APPROVER_HEADERS, params={"thread_id": uuid.uuid4().hex}
+    )
+    missing = client.get(
+        "/audit/events", headers=APPROVER_HEADERS, params={"thread_id": uuid.uuid4().hex}
+    )
+    assert unrelated.status_code == missing.status_code == 404, name
+    assert unrelated.json() == missing.json() == {"detail": "not found"}, name
+
+
+# =====================================================================
+# K3. 授权负例:跨线程隔离 / analyst 范围 / 历史无归属读取(两后端)
+# =====================================================================
+
+
+def test_cross_thread_isolation_and_legacy_reads_are_backend_independent(
+    backend, data_paths
+):
+    """A4/TASK 6:补齐 PostgreSQL 侧的授权**负例**覆盖。
+
+    A3-3 的对等用例只覆盖了"属主自审批 / 未知线程 / 未过滤读取"三个格子。
+    这里补上同样容易在换后端时悄悄放宽的另外三格 —— 同一组断言跑
+    SQLite 与 PostgreSQL:
+
+      - **跨线程隔离**:被指派到线程 A 的 approver,在线程 C 上未被指派,
+        C 对他与"不存在"不可区分(404);
+      - **analyst 范围**:只能读**自己拥有**的线程,别人的 → 404;
+      - **历史无归属**:viewer 仍能读到 A3-3 之前留下的无归属审计行。
+
+    末尾放一条**正对照**(被指派者确实能审批 A)—— 否则上面那些 404 可能
+    只是"所有 /resume 都失败"这种恒真的假证据。
+    """
+    name, store = backend
+    client = TestClient(build_app(store, data_paths))
+
+    # 线程 A:owner = test-owner,指派 test-approver(默认主体发起)
+    thread_a = _start_triage(client)
+
+    # 线程 C:owner = test-analyst,指派 test-owner
+    #   ⇒ test-approver **没有**被指派到 C
+    created = client.post(
+        "/triage",
+        json={"indicator": BRUTE_FORCE_IP, "approvers": [TEST_OWNER_SUBJECT]},
+        headers=ANALYST_HEADERS,
+    )
+    assert created.status_code == 200, created.text
+    thread_c = created.json()["thread_id"]
+
+    # ---- 跨线程隔离:test-approver 在 A 上被指派,在 C 上没有 ----
+    isolated = client.post(
+        "/resume",
+        headers=APPROVER_HEADERS,
+        json={"thread_id": thread_c, "status": "approved", "operator": "x"},
+    )
+    assert isolated.status_code == 404, name
+    assert isolated.json() == {"detail": "未知的 thread_id"}, name
+
+    # ---- analyst:自己拥有的 → 200;别人的 → 404 ----
+    own = client.get(
+        "/audit/events",
+        headers=ANALYST_HEADERS,
+        params={"thread_id": thread_c, "order": "asc"},
+    )
+    assert own.status_code == 200, name
+    assert [row["event"] for row in own.json()] == [
+        "plan.created",
+        "policy.evaluated",
+        "approval.requested",
+    ]
+    other = client.get(
+        "/audit/events", headers=ANALYST_HEADERS, params={"thread_id": thread_a}
+    )
+    assert other.status_code == 404, name
+
+    # ---- 历史无归属的审计行:viewer 仍可读 ----
+    ownerless = uuid.uuid4().hex
+    _seed(store, 2, thread_id=ownerless)
+    legacy = client.get(
+        "/audit/events",
+        headers=VIEWER_HEADERS,
+        params={"thread_id": ownerless, "order": "asc"},
+    )
+    assert legacy.status_code == 200, name
+    assert len(legacy.json()) == 2, name
+
+    # ---- 正对照:被指派到 A 的 approver 确实能审批 A ----
+    ok = client.post(
+        "/resume",
+        headers=APPROVER_HEADERS,
+        json={"thread_id": thread_a, "status": "denied", "operator": "x"},
+    )
+    assert ok.status_code == 200, name
+    assert ok.json()["approval"]["status"] == "denied", name
 
 
 # =====================================================================
@@ -730,7 +937,7 @@ def test_repeated_lifespan_startup_shutdown_closes_the_pool(
             with TestClient(create_app()) as client:
                 store = client.app.state.audit_store
                 assert isinstance(store, PostgresAuditStore)
-                assert client.get("/audit/events").status_code == 200
+                assert client.get("/audit/events", headers=VIEWER_HEADERS).status_code == 200
                 assert store._pool is not None, "一次读之后池必须已开"
             assert store._closed is True, "退出 lifespan 必须关池"
         after = _wait_for_connection_count(pg_connection, before)
@@ -744,11 +951,11 @@ def test_pool_is_not_created_per_request(pg_app_dsn, data_paths):
     store = PostgresAuditStore(pg_app_dsn)
     try:
         client = TestClient(build_app(store, data_paths))
-        assert client.get("/audit/events").status_code == 200
+        assert client.get("/audit/events", headers=VIEWER_HEADERS).status_code == 200
         pool = store._pool
         assert pool is not None
         for _ in range(3):
-            assert client.get("/audit/events").status_code == 200
+            assert client.get("/audit/events", headers=VIEWER_HEADERS).status_code == 200
         assert store._pool is pool, "不得每请求建池"
     finally:
         store.close()
@@ -768,7 +975,7 @@ def test_no_real_llm_client_is_ever_constructed(backend, data_paths, monkeypatch
 
     monkeypatch.setattr("app.core.llm.LLMClient.__init__", _tripwire)
     client = TestClient(build_app(store, data_paths))
-    assert client.post("/triage", json={"indicator": BRUTE_FORCE_IP}).status_code == 200
+    assert client.post("/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS}).status_code == 200
     assert client.post("/chat", json={"message": "hi"}).status_code == 200
 
 
@@ -807,7 +1014,9 @@ def test_app_connects_as_the_restricted_runtime_role(pg_app_dsn):
 def test_audit_filter_is_injection_resistant(client, backend, payload):
     """注入载荷一律走参数绑定 → 200 + 空结果,且表结构完好。"""
     _, store = backend
-    resp = client.get("/audit/events", params={"thread_id": payload})
+    resp = client.get(
+        "/audit/events", headers=VIEWER_HEADERS, params={"thread_id": payload}
+    )
     assert resp.status_code == 200
     assert resp.json() == []
     # 表还在,读仍然可用(证明没有语句逃逸)
@@ -818,11 +1027,12 @@ def test_postgres_password_never_leaks_through_the_api(client, pg_app_dsn):
     """凭据不得出现在任何响应体里(含校验失败与错误路径)。"""
     password = conninfo_to_dict(pg_app_dsn)["password"]
     responses = [
-        client.get("/audit/events"),
-        client.get("/audit/events", params={"limit": 0}),
-        client.post("/triage", json={"indicator": LOW_RISK_IP}),
+        client.get("/audit/events", headers=VIEWER_HEADERS),
+        client.get("/audit/events", headers=VIEWER_HEADERS, params={"limit": 0}),
+        client.post("/triage", json={"indicator": LOW_RISK_IP, "approvers": APPROVERS}),
         client.post(
             "/resume",
+            headers=APPROVER_HEADERS,
             json={"thread_id": "x", "status": "approved", "operator": "y"},
         ),
     ]

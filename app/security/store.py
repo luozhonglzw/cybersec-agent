@@ -10,7 +10,7 @@
     行代理主键(uuid4)是本模块自己生成的 —— 那是**存储关注点**;
     业务标识(incident_id / thread_id)一律由调用方给出,本模块不推断。
 
-append-only(三张表,缺一不可的 5 个前提):
+append-only(四张表,缺一不可的 5 个前提):
     1. 只用 INSERT —— 本模块不含 UPDATE / DELETE / INSERT OR REPLACE;
     2. PRIMARY KEY 存在 —— 重复写入抛 sqlite3.IntegrityError(响亮失败,不静默覆盖);
     3. 库层禁改触发器 —— BEFORE UPDATE/DELETE 直接 RAISE(ABORT);
@@ -20,6 +20,10 @@ append-only(三张表,缺一不可的 5 个前提):
        (Phase 9.1-A 起有**两个**终态事件:人工决定 / 审批超时。
        超时若不解除 pending,已过期的 thread 会每轮 reap 都重复写一条
        approval.timeout —— 审计是事实日志,重复计数就是失真。)
+
+    v0.3.0-A3-2 新增的 thread_owners 同样是 append-only(前提 1–4 全适用;
+    第 5 条不适用 —— 归属没有"状态",它就是一条已发生的指派事实)。
+    触发器总数因此从 6 变成 8(1 张新表 × UPDATE/DELETE)。
 
     第 3 条把"我们承诺不 UPDATE"变成"数据库拒绝 UPDATE";第 1 条由
     tests/test_security/test_store.py 的结构性护栏测试守着(读源码断言无
@@ -56,9 +60,16 @@ from pathlib import Path
 from app.schemas.approval import ApprovalRequest
 from app.schemas.audit import AuditRecord
 from app.schemas.incident import Incident
+from app.schemas.ownership import ThreadOwnership
 from app.schemas.response import ResponseAction, ResponsePlan
 
 _TABLES: tuple[str, ...] = ("incidents", "action_requests", "audit_logs")
+
+#: v0.3.0-A3-2 新增的归属表(A3-2-FIX2 起**只有一张**)。**刻意与 `_TABLES`
+#: 分开**:`_TABLES` 是"三张审计表"这个既有概念,文档与既有护栏测试都按它
+#: 取值;把新表混进去会让"审计表"这个集合悄悄改变含义。需要遍历全部表的
+#: 地方显式写 `(*_TABLES, *_OWNERSHIP_TABLES)`。
+_OWNERSHIP_TABLES: tuple[str, ...] = ("thread_owners",)
 
 _ACTION_REQUEST_COLUMNS = (
     "id, incident_id, thread_id, indicator, risk_level, score, summary,"
@@ -85,7 +96,7 @@ def _append_only_triggers(table: str) -> tuple[str, str]:
 
 
 def _schema_statements() -> list[str]:
-    """全部 DDL:三张表 + 索引 + 六条禁改触发器(幂等,可重复执行)。"""
+    """全部 DDL:四张表 + 索引 + 八条禁改触发器(幂等,可重复执行)。"""
     statements = [
         """
         CREATE TABLE IF NOT EXISTS incidents (
@@ -136,8 +147,21 @@ def _schema_statements() -> list[str]:
         "CREATE INDEX IF NOT EXISTS idx_audit_incident ON audit_logs(incident_id)",
         "CREATE INDEX IF NOT EXISTS idx_req_thread ON action_requests(thread_id)",
         "CREATE INDEX IF NOT EXISTS idx_req_incident ON action_requests(incident_id)",
+        # ---- v0.3.0-A3-2:线程归属与显式审批指派(append-only,单行) ----
+        # 审批集合与属主同处一行:`approvers` 是**规范序 JSON 数组**的文本
+        # (模型已把顺序钉成字典序,见 app/schemas/ownership.py)。
+        # 刻意**不**为"按审批人反查"建索引 —— 单行 JSON 列无法用普通索引
+        # 服务该查询,而 v0.3.0 没有任何调用方需要它(A5 若要,再单独设计)。
+        """
+        CREATE TABLE IF NOT EXISTS thread_owners (
+            thread_id   TEXT PRIMARY KEY,
+            owner       TEXT NOT NULL,
+            approvers   TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        )
+        """,
     ]
-    for table in _TABLES:
+    for table in (*_TABLES, *_OWNERSHIP_TABLES):
         statements.extend(_append_only_triggers(table))
     return statements
 
@@ -158,8 +182,66 @@ def _from_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
+def _serialize_approvers(approvers: Sequence[str]) -> str:
+    """审批集合 → **规范序 JSON 数组**文本(单行存储的唯一表示)。
+
+    `ThreadOwnership` 已在构造期把 `approvers` 归一化成字典序、去掉重复并
+    拒绝空集合,因此这里只需把那个**已经规范**的序列原样 dump 出来 ——
+    归一化发生在模型层(唯一真相源),存储层不重复一遍规则。
+
+    刻意用 `ensure_ascii=False`:subject 允许非 ASCII(见模型 docstring 的
+    等价性测试),转义成 `\\uXXXX` 会让同一指派有两种文本表示,破坏
+    "规范序列化"这个前提。
+
+    这是 SQLite 与 PostgreSQL **共用**的序列化实现 —— 两侧都从这里导入,
+    复制一份迟早会漂移,而"同一指派必须只有一个字节表示"正是本设计的
+    承重性质。
+    """
+    return json.dumps(list(approvers), ensure_ascii=False)
+
+
+def _deserialize_approvers(raw: str) -> tuple[str, ...]:
+    """存储里的 `approvers` 文本 → 主体元组;**任何畸形都响亮失败**。
+
+    这条是 A3-2-FIX2 的**读取边界**。关键约束(Controller TASK 2):
+    "Invalid serialized data must not silently become an empty or permissive
+    assignment." 因此**绝不**用 `.get(..., [])` 或 `try/except: return ()`
+    这类宽容解析 —— 那会把"存储被破坏"静默读成"这条线程没有审批人"或
+    "空集合",而两者都会让上层做出错误判断。
+
+    分两类拒绝,都是响亮的:
+
+    1. **形状错误**(本函数直接抛 `ValueError`):不是合法 JSON;不是数组;
+       数组里有非字符串项。刻意显式判 `isinstance(parsed, list)` —— 否则
+       `json.loads('"abc"')` 得到字符串 `"abc"`,`tuple("abc")` 会**静默**
+       变成 `('a','b','c')` 这种"看起来像审批人、其实是被拆开的字符串"。
+    2. **语义错误**(交给 `ThreadOwnership` 抛 `ValidationError`):空数组、
+       重复项、带前后空白的 subject、属主出现在审批人里。本函数不做这些
+       判定,把它们留给模型 —— 规则只有一份。
+
+    返回值尚未归一化(不排序):顺序归一化同样是模型层的职责。
+    """
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "thread_owners.approvers is not valid JSON (stored value is corrupt)"
+        ) from exc
+    if not isinstance(parsed, list):
+        raise ValueError(
+            "thread_owners.approvers must be a JSON array of subject strings"
+        )
+    for item in parsed:
+        if not isinstance(item, str):
+            raise ValueError(
+                "thread_owners.approvers entries must all be strings"
+            )
+    return tuple(parsed)
+
+
 class SqliteAuditStore:
-    """incidents / action_requests / audit_logs 三张 append-only 表的读写入口。
+    """incidents / action_requests / audit_logs 三张 append-only 审计表,
+    加上 thread_owners(线程归属,单行)的读写入口。
 
     db_path 是**必填位置参数,没有默认值** —— 生产默认值由组合根从 Settings
     注入,测试必须显式传 tmp_path,因此不存在"忘记传路径就落到仓库 data/"的
@@ -271,6 +353,42 @@ class SqliteAuditStore:
                 ),
             )
 
+    # ---------- 写:thread_owners(v0.3.0-A3-2) ----------
+
+    def record_thread_ownership(self, ownership: ThreadOwnership) -> None:
+        """写入一条线程归属(属主 + **完整**审批集合),**单条 INSERT**。
+
+        A3-2-FIX2 起归属是**一行**:属主与规范序的审批集合同处一行。因此
+        "原子性"不是靠事务边界换来的,而是**结构性的** —— 一条 INSERT 要么
+        落地要么不落地,不存在"属主行在、审批集合缺"的中间态,也就不可能
+        出现一条"看起来已指派、其实没人能审批"的线程(那正是冻结设计里的
+        fail-closed 终态,会让存储 bug 伪装成正常行为)。
+
+        同理,**孤儿审批行在结构上不可能存在**:审批集合没有独立的行。
+
+        失败即抛(不吞、不重试、不降级):`/triage` 在生成任何东西之前调用
+        本方法,所以抛出去就是 fail closed —— 没有线程、没有审计行。
+        重复注册由 `thread_owners.thread_id` 主键拒绝,本方法**不得**把它
+        吞掉或改成 upsert;并发注册同一 thread_id 时,主键保证**恰好一个**
+        胜者,落库的审批集合就是胜者的那一份(不存在合并)。
+
+        本方法不做任何授权判定:它不检查被指派的 subject 是否存在、是否持有
+        `approver` 角色、是否等于属主。那些是服务层的判定(A5);到这里的
+        `ownership` 必须已经是一个校验过的 `ThreadOwnership`。
+        """
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "INSERT INTO thread_owners"
+                " (thread_id, owner, approvers, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    ownership.thread_id,
+                    ownership.owner,
+                    _serialize_approvers(ownership.approvers),
+                    _to_iso(ownership.created_at),
+                ),
+            )
+
     # ---------- 读:incidents ----------
 
     def get_incident(self, incident_id: str) -> Incident | None:
@@ -289,6 +407,36 @@ class SqliteAuditStore:
             score=row["score"],
             summary=row["summary"],
             plan=ResponsePlan.model_validate_json(row["plan_json"]),
+        )
+
+    # ---------- 读:thread_owners(v0.3.0-A3-2) ----------
+
+    def get_thread_ownership(self, thread_id: str) -> ThreadOwnership | None:
+        """按 thread_id 读回归属(属主 + 完整审批集合);不存在返回 None。
+
+        **无归属 ⇒ None,绝不回退。** 调用方拿到 `None` 只能拒绝(A5 的
+        `/resume` 对无归属线程一律 404),不得把它读成"那就用任意 approver"
+        或"那就用属主" —— 那两种回退都是 fail-open。
+
+        读取重新过 Pydantic 校验(与 get_incident / list_audit 同惯例),
+        且 `approvers` 的**反序列化是严格的**(见 `_deserialize_approvers`):
+        畸形/空/非数组的存储值一律响亮失败,绝不被静默读成"没有审批人" ——
+        后者恰好是 fail-closed 终态,静默降级会把"存储被破坏"伪装成
+        "正常拒绝"。顺序由模型归一化,因此不依赖存储里那串字符的书写顺序。
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT thread_id, owner, approvers, created_at FROM thread_owners"
+                " WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ThreadOwnership(
+            thread_id=row["thread_id"],
+            owner=row["owner"],
+            approvers=_deserialize_approvers(row["approvers"]),
+            created_at=_from_iso(row["created_at"]),
         )
 
     # ---------- 读:action_requests ----------

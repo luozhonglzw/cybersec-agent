@@ -37,6 +37,7 @@ from app.core.triage import TriageService
 from app.security.store import SqliteAuditStore
 from app.security.store_postgres import PostgresAuditStore
 from app.security.store_protocol import AuditStore
+from tests.conftest import VIEWER_HEADERS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APP_ROOT = REPO_ROOT / "app"
@@ -218,11 +219,14 @@ def test_close_closes_the_postgres_pool_and_is_idempotent():
     assert store._closed is True
 
 
-def test_close_is_not_a_ninth_audit_store_protocol_method():
+def test_close_is_not_a_contract_method():
     """TASK 4 约束:`close()` 不得进入 `AuditStore` 契约。
 
     只有 PostgreSQL 后端持有可关闭的资源;把 close 塞进契约等于让契约
     描述实现细节,并强迫 SQLite 实现一个空方法。
+
+    v0.3.0-A3-2 把方法集从 8 扩到 10(新增两个归属方法),这里同步跟上 ——
+    断言仍是**集合相等**,`close` 依然必须不在其中。
     """
     protocol_methods = {
         name
@@ -233,8 +237,10 @@ def test_close_is_not_a_ninth_audit_store_protocol_method():
         "record_incident",
         "record_action_request",
         "append_audit",
+        "record_thread_ownership",
         "get_incident",
         "get_approval_request",
+        "get_thread_ownership",
         "list_action_rows",
         "pending_action_rows",
         "list_audit",
@@ -416,7 +422,9 @@ def test_lifespan_composes_sqlite_by_default(env_llm, tmp_path: Path):
     with TestClient(create_app()) as client:
         store = client.app.state.audit_store
         assert isinstance(store, SqliteAuditStore)
-        assert client.get("/audit/events").status_code == 200
+        # A3-3 起 analyst / approver 必须给显式 thread 范围才能读审计,
+        # 未过滤读取只有 viewer 可以 —— 这里只验"端点可用",用 viewer 身份。
+        assert client.get("/audit/events", headers=VIEWER_HEADERS).status_code == 200
 
 
 def test_lifespan_composes_postgres_when_explicitly_selected(env_llm, tmp_path: Path):

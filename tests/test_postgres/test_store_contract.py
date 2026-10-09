@@ -50,12 +50,16 @@ from app.schemas.audit import AuditRecord
 from app.security.audit import build_audit_record, compute_plan_digest
 from app.security.store_protocol import AuditStore
 from tests.test_postgres._store_backends import (
+    APPROVER_B,
+    APPROVER_C,
     INDICATOR,
+    OWNER,
     TS,
     TS_LATER,
     Backend,
     make_action,
     make_incident,
+    make_ownership,
     make_request,
     postgres_backend,
     sqlite_backend,
@@ -95,21 +99,26 @@ def test_backend_satisfies_the_audit_store_protocol(backend: Backend) -> None:
     assert isinstance(backend.store, AuditStore)
 
 
-def test_backend_exposes_exactly_the_eight_contract_methods(
+def test_backend_exposes_exactly_the_ten_contract_methods(
     backend: Backend,
 ) -> None:
     """公开方法集合与契约**双向相等** —— 既不少,也不多出未声明的行为方法。
 
+    v0.3.0-A3-2 把契约从 8 扩到 10(新增 `record_thread_ownership` /
+    `get_thread_ownership`),两个后端都必须在**同一轮**里跟上 —— 只改一边
+    会让这条断言在另一边失败。
+
     `close` 是**唯一**被允许的例外:它是 `PostgresAuditStore` 的连接池生命周期
-    方法,刻意**不属于** `AuditStore` 契约(契约只管 8 个行为方法;
+    方法,刻意**不属于** `AuditStore` 契约(契约只管 10 个行为方法;
     构造与生命周期是各后端自己的事 —— SQLite 每次操作新开连接,因此没有
     `close`)。这里把它显式减掉,而不是放宽成"包含关系",这样任何**其他**
     多出来的公开方法仍会被抓住。
     """
     expected = {
         "record_incident", "record_action_request", "append_audit",
-        "get_incident", "get_approval_request", "list_action_rows",
-        "pending_action_rows", "list_audit",
+        "record_thread_ownership",
+        "get_incident", "get_approval_request", "get_thread_ownership",
+        "list_action_rows", "pending_action_rows", "list_audit",
     }
     lifecycle = {"close"}
     actual = {
@@ -793,3 +802,290 @@ def test_row_to_audit_rejects_out_of_vocabulary_event(backend: Backend) -> None:
     }
     with pytest.raises(ValidationError):
         backend.store._row_to_audit(row)
+
+
+# ===========================================================================
+# 9. 线程归属与显式审批指派(v0.3.0-A3-2,A3-2-FIX2 修订)
+# ===========================================================================
+#
+# 这些用例覆盖 N-14(两个后端写读结果一致)、N-15(归属表的 append-only)与
+# 归属部分的 N-16(最小授权)。N-17 / N-18 / N-19 是迁移用例,在
+# `test_pg_migration.py` 里(它们需要 alembic,不是 store 行为)。
+#
+# A3-2-FIX2 起归属是**单行**(`thread_owners`),审批集合是同一行里的一个
+# 规范序 JSON 列。因此"原子性 / 无孤儿 / 并发不合并"由**结构**保证,不再有
+# 独立审批行表 —— 本节的用例相应改写,并显式断言那张表**不存在**。
+#
+# **共享库纪律同样适用**:PostgreSQL 侧的归属行删不掉,所以每个用例都用
+# `uid("th")` 生成唯一的 `thread_id`,断言一律按 thread_id 限定作用域。
+#
+# 一条**新增**的纪律:不得向 `thread_owners` 注入"畸形 approvers"的脏数据
+# 去验证"读取会响亮失败" —— 那一行同样删不掉,而 `get_thread_ownership`
+# 只按主键读,所以影响虽然被限定在那一行,却会让**将来**任何以该 id 为准的
+# 用例永久失败。该行为改由 `tests/test_security/test_ownership_store.py`
+# 在 SQLite 上验证(那里每次都是全新库,可以随便注入)。
+
+
+def test_ownership_round_trip(backend: Backend) -> None:
+    """N-14:写进去再读出来必须**相等**(含审批集合的规范序)。"""
+    tid = uid("th")
+    ownership = make_ownership(
+        thread_id=tid, approvers=(APPROVER_C, APPROVER_B)
+    )
+    backend.store.record_thread_ownership(ownership)
+
+    got = backend.store.get_thread_ownership(tid)
+    assert got == ownership
+    # 规范序:输入是 (carol, bob),读回必须是 (bob, carol)
+    assert got is not None and got.approvers == (APPROVER_B, APPROVER_C)
+
+
+def test_ownership_registers_owner_and_every_approver_atomically(
+    backend: Backend,
+) -> None:
+    """一次调用落地**恰好一行**:属主 + 完整审批集合同处一行。"""
+    tid = uid("th")
+    backend.store.record_thread_ownership(
+        make_ownership(thread_id=tid, approvers=(APPROVER_B, APPROVER_C))
+    )
+
+    with backend.raw() as conn:
+        ph = backend.placeholder
+        rows = conn.execute(
+            f"SELECT thread_id, owner, approvers, created_at FROM thread_owners"
+            f" WHERE thread_id = {ph}",
+            (tid,),
+        ).fetchall()
+
+    # `backend.raw()` 刻意**不**设 row_factory —— 两个后端都返回位置元组,
+    # 这样同一份断言不需要为 sqlite3.Row / dict_row 分叉。
+    assert len(rows) == 1, "归属必须恰好一行"
+    got_tid, owner_subject, approvers_raw, created_at = rows[0]
+    assert got_tid == tid
+    assert owner_subject == OWNER
+    assert json.loads(approvers_raw) == [APPROVER_B, APPROVER_C]
+    assert created_at == TS.isoformat()
+
+
+def test_ownership_missing_thread_returns_none(backend: Backend) -> None:
+    """**无归属 ⇒ None**,绝不回退成"任意 approver"或"属主"。"""
+    assert backend.store.get_thread_ownership(uid("th")) is None
+
+
+def test_legacy_thread_without_ownership_is_unassigned(backend: Backend) -> None:
+    """历史线程(0002 之前产生的)刻意**不**被自动指派。
+
+    这条线程有真实的审批请求,却没有任何归属行 —— 正是"迁移不回溯"的
+    预期形态。它必须读回 `None`(⇒ A5 的 `/resume` 对所有人 404),
+    而不是被任何回退规则"补"上一个审批人。
+    """
+    tid = uid("th")
+    backend.store.record_action_request(make_request(thread_id=tid))
+    assert backend.store.get_thread_ownership(tid) is None
+
+
+def test_duplicate_ownership_registration_is_rejected(backend: Backend) -> None:
+    """同一 thread_id 再注册一次必须**响亮失败**,不得静默覆盖。"""
+    tid = uid("th")
+    ownership = make_ownership(thread_id=tid)
+    backend.store.record_thread_ownership(ownership)
+
+    with pytest.raises(backend.integrity_exc):
+        backend.store.record_thread_ownership(ownership)
+
+
+def test_conflicting_owner_for_the_same_thread_is_rejected(backend: Backend) -> None:
+    """同一线程换个属主再注册 —— 同样是配置错误,必须失败。
+
+    v0.3.0 **不支持改派**(L-2):归属是 append-only 的事实,不是可编辑状态。
+    """
+    tid = uid("th")
+    backend.store.record_thread_ownership(make_ownership(thread_id=tid))
+
+    with pytest.raises(backend.integrity_exc):
+        backend.store.record_thread_ownership(
+            make_ownership(thread_id=tid, owner="mallory", approvers=(APPROVER_B,))
+        )
+
+    got = backend.store.get_thread_ownership(tid)
+    assert got is not None and got.owner == OWNER, "被拒的注册不得改变原归属"
+
+
+def test_duplicate_direct_insert_is_rejected_by_the_primary_key(
+    backend: Backend,
+) -> None:
+    """主键让"同一线程第二行归属"在**库层**不可能。
+
+    模型层已经拒绝重复注册;这里证明纵深防御 —— 即使有人绕过 store 直连
+    数据库,重复的 thread_id 依然落不了地。这也是**并发注册只有一个胜者**
+    的机制来源(见 `test_store_postgres_specific.py` 的竞态用例)。
+    """
+    tid = uid("th")
+    backend.store.record_thread_ownership(
+        make_ownership(thread_id=tid, approvers=(APPROVER_B,))
+    )
+    ph = backend.placeholder
+    with pytest.raises(backend.integrity_exc):
+        with backend.raw() as conn:
+            conn.execute(
+                f"INSERT INTO thread_owners"
+                f" (thread_id, owner, approvers, created_at)"
+                f" VALUES ({ph}, {ph}, {ph}, {ph})",
+                (tid, "mallory", json.dumps(["mallory"]), TS.isoformat()),
+            )
+
+
+def test_there_is_no_independently_appendable_approver_table(
+    backend: Backend,
+) -> None:
+    """**结构性的不可变成员集合**(D-GATE-1 的回归):审批集合没有自己的表。
+
+    旧两表设计里,直连 `thread_approvers` 追加一行会被 `get_thread_ownership`
+    原样读回 —— 成员集合因此是**可变的**。现在那张表不存在,追加写入面随之
+    消失。这里在**两个后端**上断言"表不存在",并用归属表本身存在做正对照。
+    """
+    ph = backend.placeholder
+    with backend.raw() as conn:
+        if backend.name == "sqlite":
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        else:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                )
+            }
+    assert "thread_approvers" not in names
+    assert "thread_owners" in names, "正对照:归属表必须存在"
+
+
+def test_approver_set_cannot_be_appended_after_registration(
+    backend: Backend,
+) -> None:
+    """注册之后无法追加审批人:改既有行被触发器拒、加新行被主键拒。"""
+    tid = uid("th")
+    backend.store.record_thread_ownership(
+        make_ownership(thread_id=tid, approvers=(APPROVER_B,))
+    )
+    ph = backend.placeholder
+
+    # 1) 改写既有行的审批集合 —— 被 append-only 拦下
+    with pytest.raises(backend.append_only_update_exc):
+        with backend.raw() as conn:
+            conn.execute(
+                f"UPDATE thread_owners SET approvers = {ph}"
+                f" WHERE thread_id = {ph}",
+                (json.dumps([APPROVER_B, "mallory"]), tid),
+            )
+    # 2) 新增"同一线程的第二个审批人"行 —— 被主键拦下
+    with pytest.raises(backend.integrity_exc):
+        with backend.raw() as conn:
+            conn.execute(
+                f"INSERT INTO thread_owners"
+                f" (thread_id, owner, approvers, created_at)"
+                f" VALUES ({ph}, {ph}, {ph}, {ph})",
+                (tid, "mallory", json.dumps(["mallory"]), TS.isoformat()),
+            )
+
+    got = backend.store.get_thread_ownership(tid)
+    assert got is not None and got.approvers == (APPROVER_B,)
+
+
+@pytest.mark.parametrize("table", ["thread_owners"])
+def test_append_only_rejects_update_on_ownership_tables(
+    backend: Backend, table: str
+) -> None:
+    """N-15:归属表同样禁改(UPDATE)。
+
+    归属表**没有 `id` 列**,所以定位列是 `thread_id`。
+    """
+    tid = uid("th")
+    backend.store.record_thread_ownership(
+        make_ownership(thread_id=tid, approvers=(APPROVER_B,))
+    )
+    with pytest.raises(backend.append_only_update_exc):
+        with backend.raw() as conn:
+            conn.execute(
+                f"UPDATE {table} SET thread_id = thread_id"
+                f" WHERE thread_id = {backend.placeholder}",
+                (tid,),
+            )
+
+
+@pytest.mark.parametrize("table", ["thread_owners"])
+def test_append_only_rejects_delete_on_ownership_tables(
+    backend: Backend, table: str
+) -> None:
+    """N-15:归属表同样禁删(DELETE)。"""
+    tid = uid("th")
+    backend.store.record_thread_ownership(
+        make_ownership(thread_id=tid, approvers=(APPROVER_B,))
+    )
+    with pytest.raises(backend.append_only_delete_exc):
+        with backend.raw() as conn:
+            conn.execute(
+                f"DELETE FROM {table} WHERE thread_id = {backend.placeholder}",
+                (tid,),
+            )
+
+
+def test_rejected_ownership_mutation_did_not_change_the_row(backend: Backend) -> None:
+    """被拒之后归属必须原样 —— 拒绝不能是"先改后报错"。"""
+    tid = uid("th")
+    backend.store.record_thread_ownership(
+        make_ownership(thread_id=tid, approvers=(APPROVER_B,))
+    )
+    with pytest.raises(backend.append_only_update_exc):
+        with backend.raw() as conn:
+            conn.execute(
+                f"UPDATE thread_owners SET owner = 'tampered'"
+                f" WHERE thread_id = {backend.placeholder}",
+                (tid,),
+            )
+    got = backend.store.get_thread_ownership(tid)
+    assert got is not None and got.owner == OWNER
+
+
+def test_ownership_write_and_read_agree_across_backends(backend: Backend) -> None:
+    """N-14 的显式形态:同一份输入在两个后端产出**同一形状**的结果。
+
+    这里断言的是**归一化后的表示**,而不是"两边都返回了东西":
+    属主、审批集合(字典序)、`created_at` 的 UTC 归一化三者都必须一致。
+    """
+    tid = uid("th")
+    later_but_same_instant = datetime(
+        2026, 9, 17, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))
+    )
+    backend.store.record_thread_ownership(
+        make_ownership(
+            thread_id=tid,
+            approvers=(APPROVER_C, APPROVER_B),
+            created_at=later_but_same_instant,
+        )
+    )
+    got = backend.store.get_thread_ownership(tid)
+    assert got is not None
+    assert got.owner == OWNER
+    assert got.approvers == (APPROVER_B, APPROVER_C)
+    # +08:00 的 18:00 == UTC 的 10:00;两个后端都必须归一化到 UTC
+    assert got.created_at == TS
+    assert got.created_at.tzinfo is not None
+    assert got.model_dump(mode="json") == {
+        "thread_id": tid,
+        "owner": OWNER,
+        "approvers": [APPROVER_B, APPROVER_C],
+        "created_at": TS.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def test_ownership_rejects_naive_datetime_at_the_model_boundary(
+    backend: Backend,
+) -> None:
+    """naive datetime 在**模型层**就被拒绝,根本到不了 store。"""
+    with pytest.raises(ValidationError):
+        make_ownership(thread_id=uid("th"), created_at=datetime(2026, 9, 17, 10, 0))

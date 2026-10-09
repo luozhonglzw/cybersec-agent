@@ -13,6 +13,12 @@
 `tests/test_security/test_store_protocol.py` 用 `inspect.signature` 结构性断言守着
 —— 任一侧改了签名而另一侧没跟上,测试立刻失败。
 
+**v0.3.0-A3-2 的增量:8 → 10 个方法,纯增量。**
+新增 `record_thread_ownership` / `get_thread_ownership`,形状与
+`record_incident` / `get_incident` 同款(一个聚合进、一个聚合出)。
+**既有 8 个方法的签名与行为一个字都没动** —— 改既有签名会让所有现有调用方
+的等价性保证静默失效,而加方法是可见、可评审的 diff。
+
 刻意排除构造器(`__init__`):
     构造契约**不属于**行为契约。`SqliteAuditStore(db_path)` 与未来的
     `PostgresAuditStore(dsn)` 参数不同(文件路径 vs 连接串),把构造器塞进
@@ -33,15 +39,21 @@ from typing import Protocol, runtime_checkable
 from app.schemas.approval import ApprovalRequest
 from app.schemas.audit import AuditRecord
 from app.schemas.incident import Incident
+from app.schemas.ownership import ThreadOwnership
 
 
 @runtime_checkable
 class AuditStore(Protocol):
-    """incidents / action_requests / audit_logs 三张 append-only 表的读写契约。
+    """incidents / action_requests / audit_logs 三张 append-only 审计表,加上
+    thread_owners(线程归属,单行)的读写契约。
 
     与 `app.security.store.SqliteAuditStore` 的公开方法**逐一对应**。
     调用方(组合根 / triage 服务 / 评测适配器)只应依赖本 Protocol,
     而不是具体后端。装配点**唯一**:`app/api/main.py` 的 `build_audit_store`。
+
+    归属表的两个方法**只做存储**:它们不校验"谁能被指派"、不校验"谁能审批",
+    也不检查被指派的 subject 是否存在于配置。那些是**授权**判定,属于服务层
+    (A5);本契约只保证"属主 + 完整审批集合"能落库并原样读回。
     """
 
     # ---------- 写 ----------
@@ -66,10 +78,44 @@ class AuditStore(Protocol):
         """追加一条审计记录(append-only)。"""
         ...
 
+    def record_thread_ownership(self, ownership: ThreadOwnership) -> None:
+        """写入一条线程归属(属主 + **完整**审批集合),**单条 INSERT**。
+
+        为什么必须是一个方法而不是"先写属主、再逐个写审批人":部分写入
+        (属主在、审批集合缺)会产生一条**看起来已指派、其实没人能审批**的
+        线程 —— 而"没人能审批"正是冻结设计里的 fail-closed 终态,于是这个
+        bug 会伪装成正常行为。A3-2-FIX2 起归属是**一行**(审批集合与属主同处
+        一行),因此"部分写入"在结构上不可能存在,而不是靠调用方记得按顺序写。
+
+        失败即抛(**不吞、不重试、不降级到另一个后端**):`/triage` 在生成
+        任何东西之前调用本方法,所以这里抛出去就是 fail closed —— 没有线程、
+        没有审计行。
+
+        重复注册(同一 `thread_id` 再来一次)必须**响亮失败**:
+        `thread_owners.thread_id` 是主键,重复插入由数据库拒绝,本方法不得把
+        它吞掉或改成 upsert;并发注册同一 thread_id 时,主键保证**恰好一个**
+        胜者,且落库的审批集合不会被合并。
+        """
+        ...
+
     # ---------- 读 ----------
 
     def get_incident(self, incident_id: str) -> Incident | None:
         """按 id 读回 incident;不存在返回 None。"""
+        ...
+
+    def get_thread_ownership(self, thread_id: str) -> ThreadOwnership | None:
+        """按 thread_id 读回归属(属主 + 完整审批集合);不存在返回 None。
+
+        **无归属 ⇒ 返回 None,绝不回退**。调用方拿到 `None` 只能拒绝
+        (A5 的 `/resume` 对无归属线程一律 404),不得解释成"那就用任意
+        approver"或"那就用属主"。
+
+        审批人集合以**规范序**(字典序)返回,与 `ThreadOwnership` 的归一化
+        一致 —— 否则"写进去再读出来是否相等"这个最基本的往返性质会依赖
+        存储里那串字符的书写顺序。存储值畸形时**响亮失败**,不得静默读成
+        "没有审批人"。
+        """
         ...
 
     def get_approval_request(self, thread_id: str) -> ApprovalRequest | None:
