@@ -1,0 +1,20 @@
+{"query_id": "q01", "query": "Log4j 的 JNDI 查找为什么能被用来执行代码?", "answerable": true, "gold_doc_ids": ["kb-cve-2021-44228"], "must_not_cite": [], "notes": "单文档;症状描述,不直接给编号"}
+{"query_id": "q02", "query": "SMBv1 的缺陷是怎么被用来做蠕虫式传播的?", "answerable": true, "gold_doc_ids": ["kb-cve-2017-0144"], "must_not_cite": [], "notes": "单文档;传播语义"}
+{"query_id": "q03", "query": "Netlogon 全零初始化向量会导致什么后果?", "answerable": true, "gold_doc_ids": ["kb-cve-2020-1472"], "must_not_cite": [], "notes": "单文档;密码学细节"}
+{"query_id": "q04", "query": "远程桌面在认证之前就存在可利用的缺陷吗?", "answerable": true, "gold_doc_ids": ["kb-cve-2019-0708"], "must_not_cite": [], "notes": "单文档;认证前语义"}
+{"query_id": "q05", "query": "FortiOS SSL VPN 的路径穿越泄露的是哪种文件?", "answerable": true, "gold_doc_ids": ["kb-cve-2018-13379"], "must_not_cite": [], "notes": "单文档;泄露对象"}
+{"query_id": "q06", "query": "Windows CryptoAPI 验证椭圆曲线证书时漏掉了什么校验?", "answerable": true, "gold_doc_ids": ["kb-cve-2020-0601"], "must_not_cite": [], "notes": "单文档;根因"}
+{"query_id": "q07", "query": "MOVEit Transfer 的 SQL 注入后来演变成了什么?", "answerable": true, "gold_doc_ids": ["kb-cve-2023-34362"], "must_not_cite": [], "notes": "单文档;利用链"}
+{"query_id": "q08", "query": "Citrix 设备的会话令牌被读取之后会带来什么风险?", "answerable": true, "gold_doc_ids": ["kb-cve-2023-4966"], "must_not_cite": [], "notes": "单文档;影响"}
+{"query_id": "q09", "query": "打印后台处理程序为什么普通用户也能加载驱动?", "answerable": true, "gold_doc_ids": ["kb-cve-2021-34527"], "must_not_cite": [], "notes": "单文档;权限校验"}
+{"query_id": "q10", "query": "Tomcat 的 AJP 连接器默认允许谁连接?", "answerable": true, "gold_doc_ids": ["kb-cve-2020-1938"], "must_not_cite": [], "notes": "单文档;默认配置"}
+{"query_id": "q11", "query": "利用对外暴露的应用获得初始访问,通常经过哪几个阶段?", "answerable": true, "gold_doc_ids": ["kb-attack-t1190", "kb-attack-t1046"], "must_not_cite": [], "notes": "多文档;战术 + 前置侦察"}
+{"query_id": "q12", "query": "凭据被提取之后攻击者怎样在主机之间移动?", "answerable": true, "gold_doc_ids": ["kb-attack-t1003", "kb-attack-t1021"], "must_not_cite": [], "notes": "多文档;凭据转储 + 远程服务"}
+{"query_id": "q13", "query": "攻击者如何在不触发漏洞告警的情况下获得访问权限?", "answerable": true, "gold_doc_ids": ["kb-attack-t1078", "kb-attack-t1110"], "must_not_cite": [], "notes": "多文档;合法账户 + 暴力破解"}
+{"query_id": "q14", "query": "勒索软件在加密之前通常会做哪些准备动作?", "answerable": true, "gold_doc_ids": ["kb-attack-t1486", "kb-attack-t1070"], "must_not_cite": [], "notes": "多文档;影响 + 痕迹清除"}
+{"query_id": "q15", "query": "钓鱼邮件投递之后通常紧接着发生什么?", "answerable": true, "gold_doc_ids": ["kb-attack-t1566", "kb-cve-2021-40444"], "must_not_cite": [], "notes": "多文档;初始访问 + 客户端执行"}
+{"query_id": "q16", "query": "怎样发现伪装成正常应用层协议的对外通信?", "answerable": true, "gold_doc_ids": ["kb-attack-t1071", "kb-attack-t1567"], "must_not_cite": [], "notes": "多文档;C2 通道 + 外传"}
+{"query_id": "q17", "query": "如何在 Linux 内核里绕过 eBPF 校验器?", "answerable": false, "gold_doc_ids": [], "must_not_cite": [], "notes": "不可答;语料不涉及内核与 eBPF"}
+{"query_id": "q18", "query": "蓝牙配对过程中的密钥协商有哪些已知缺陷?", "answerable": false, "gold_doc_ids": [], "must_not_cite": [], "notes": "不可答;语料不涉及蓝牙协议"}
+{"query_id": "q19", "query": "SQL Server 的 CLR 程序集加载权限应该怎么配置?", "answerable": false, "gold_doc_ids": [], "must_not_cite": [], "notes": "不可答;语料不涉及数据库引擎配置"}
+{"query_id": "q20", "query": "Android 应用的签名校验如何绕过?", "answerable": false, "gold_doc_ids": [], "must_not_cite": [], "notes": "不可答;语料不涉及移动端逆向"}

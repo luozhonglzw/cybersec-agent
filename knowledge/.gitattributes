@@ -1,0 +1,13 @@
+# `knowledge/` 的换行策略:**不做任何 EOL 转换**。
+#
+# 为什么需要这一行
+# ----------------
+# `manifest.json` 钉住的是 `corpus.jsonl` 的**字节** sha256。而
+# `core.autocrlf=true`(Windows 上的默认配置)会在 checkout 时把 LF 换成
+# CRLF —— 于是同一次提交在 Windows 上克隆出来,字节不同、哈希不符,
+# 加载直接 fail closed(`CorpusError: manifest-mismatch`)。这不是语料
+# 被改动,却会被当成语料被改动。
+#
+# `-text` 让 git 对这两个文件跳过 EOL 规范化:仓库里是 LF,检出也是 LF,
+# 哈希在 Linux 与 Windows 上一致。
+*.jsonl -text
