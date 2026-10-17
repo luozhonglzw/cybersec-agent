@@ -30,6 +30,7 @@
 review、被 diff。两者混在一起会让"`data/` 可随时清空"这条既有约定失效。
 
 索引产物(向量、元数据)属于生成物,放在 `data/knowledge_index/`,不入库。
+构建/重建/校验命令见 [`docs/qdrant-local.md`](../docs/qdrant-local.md)。
 
 ## 改语料时必须同步 `manifest.json`
 

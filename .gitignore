@@ -18,6 +18,9 @@ venv/
 *.sqlite3
 chroma/
 .chroma/
+# Qdrant Local 索引(v0.5.0-S2-D)。默认落在 data/ 下(data/.gitignore 已是 `*`),
+# 这里再显式挡一层:有人把 --index-dir 指到仓库根时也不会误提交。
+/knowledge_index/
 
 # Logs
 logs/

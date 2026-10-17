@@ -31,6 +31,14 @@ dependencies = [
     # 注意本阶段**未**接线:应用后端仍走 SQLite,组合根不构造 PostgresAuditStore。
     "psycopg[binary]>=3.2,<4",
     "psycopg-pool>=3.2,<4",
+    # v0.5.0-S2-D:Qdrant Local 向量索引(嵌入式模式,不需要 Qdrant 服务端)。
+    # `app/vectorstore/qdrant_local.py` 属于 `app` 包,在**运行时** import 它,
+    # 因此必须是运行时依赖,不能只挂 dev 组 —— 否则
+    # `uv sync --locked --no-dev` 装出的镜像一打开索引就 ImportError。
+    # 上界 `<2` 与 SDK 的破坏性版本节奏对齐:适配器依赖两处具体语义
+    # (Local 模式对存储目录持排他锁;`Filter(must=[])` 匹配全部点),
+    # 大版本升级必须重新实测,见 docs/qdrant-local.md。
+    "qdrant-client>=1.12,<2",
 ]
 
 [dependency-groups]

@@ -30,6 +30,7 @@ from app.rag.chunking import (
     chunk_document,
 )
 from app.rag.corpus import (
+    APPLICATION_ROOT,
     CORPUS_FILENAME,
     DEFAULT_KNOWLEDGE_DIR,
     MANIFEST_FILENAME,
@@ -63,7 +64,7 @@ from app.rag.retriever import (
     build_index_metadata,
     verify_index,
 )
-from app.rag.store import InMemoryVectorStore, VectorStore
+from app.rag.store import InMemoryVectorStore, VectorStore, check_vector
 from app.rag.types import (
     DEFAULT_TOP_K,
     MAX_TOP_K,
@@ -84,6 +85,7 @@ from app.rag.types import (
 )
 
 __all__ = [
+    "APPLICATION_ROOT",
     "CANDIDATE_MULTIPLIER",
     "CHUNKER_VERSION",
     "CHUNK_MAX_CHARS",
@@ -119,6 +121,7 @@ __all__ = [
     "VectorStore",
     "build_in_memory_retriever",
     "build_index_metadata",
+    "check_vector",
     "chunk_corpus",
     "chunk_document",
     "clamp_top_k",

@@ -119,6 +119,17 @@ class Retriever:
     def min_score(self) -> float:
         return self._min_score
 
+    @property
+    def store(self) -> VectorStore:
+        """底层存储。**只读用途**:生命周期(关闭)与诊断。
+
+        为什么公开:S2-D 引入的 Qdrant Local 后端对存储目录持有排他锁,
+        调用方必须能关掉它。`Retriever` 不接管存储的创建,因此也不该
+        假装拥有它 —— 暴露句柄比让 `Retriever` 长出 `close()` 更诚实
+        (后者会让"谁拥有存储"变成模糊的共享所有权)。
+        """
+        return self._store
+
     # ---- 完整性 ----
 
     def verify(self) -> IndexMetadata:

@@ -39,7 +39,13 @@ class VectorStore(Protocol):
         ...
 
 
-def _check_vector(vector: Sequence[float], dim: int, *, label: str) -> None:
+def check_vector(vector: Sequence[float], dim: int, *, label: str) -> None:
+    """校验向量维度与有限性。
+
+    公开而非私有(S2-D):Qdrant 适配器在**另一个包**里,必须复用同一份
+    校验。复制一份会让"什么算合法向量"出现两个真相源 —— 而这条校验是
+    fail closed 的一部分(非有限数会污染排序)。
+    """
     if len(vector) != dim:
         raise StoreError(
             f"{label} dimension mismatch: expected {dim}, got {len(vector)}",
@@ -71,12 +77,12 @@ class InMemoryVectorStore:
                 reason="length-mismatch",
             )
         for chunk, vector in zip(chunks, vectors):
-            _check_vector(vector, self._metadata.dim, label=f"chunk {chunk.chunk_id}")
+            check_vector(vector, self._metadata.dim, label=f"chunk {chunk.chunk_id}")
             self._chunks[chunk.chunk_id] = chunk
             self._vectors[chunk.chunk_id] = list(vector)
 
     def search(self, vector: Sequence[float], limit: int) -> list[ScoredChunk]:
-        _check_vector(vector, self._metadata.dim, label="query")
+        check_vector(vector, self._metadata.dim, label="query")
         if limit <= 0:
             return []
         scored = [

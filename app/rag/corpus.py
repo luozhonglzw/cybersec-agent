@@ -25,9 +25,24 @@ from pydantic import ValidationError
 from app.rag.errors import CorpusError
 from app.rag.types import CorpusManifest, KnowledgeDocument, sha256_hex
 
-#: 相对路径 —— 与生产 `DEFAULT_DATA_PATH` 同约定(以启动目录为基准)。
-#: 测试一律显式传绝对路径,不依赖 CWD。
-DEFAULT_KNOWLEDGE_DIR = Path("knowledge")
+#: 应用根目录 —— 由**本文件位置**推导,不依赖进程 CWD。
+#:
+#: `app/rag/corpus.py` → `parents[0]=app/rag`、`parents[1]=app`、`parents[2]=仓库根`。
+APPLICATION_ROOT = Path(__file__).resolve().parents[2]
+
+#: 内置示例语料目录。**应用相对**,不是进程相对。
+#:
+#: 为什么改(v0.5.0-S2-D):原值是 `Path("knowledge")`,即"以启动目录为基准"。
+#: 那让"语料在哪"取决于从哪个目录启动 pytest / uvicorn —— 从仓库根启动一切
+#: 正常,从别的目录启动就 `CorpusError: missing-corpus`,而错误信息里刻意
+#: 不含路径,于是故障现场只剩一句"语料不可用"。语料是**随应用分发**的输入,
+#: 它相对的是应用,不是调用者的工作目录。
+#:
+#: 注意与 `Settings.audit_db_path` / `checkpoint_db_path` 的区别:那两个是
+#: **运行时数据**,部署要把它们指到数据卷上,因此保持"以启动目录为基准"的
+#: 相对路径是有意设计。语料与索引是**只读输入 / 可重建派生物**,不该跟着
+#: CWD 漂移。
+DEFAULT_KNOWLEDGE_DIR = APPLICATION_ROOT / "knowledge"
 
 MANIFEST_FILENAME = "manifest.json"
 CORPUS_FILENAME = "corpus.jsonl"
