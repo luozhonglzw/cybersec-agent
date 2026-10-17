@@ -370,6 +370,27 @@ def test_openapi_documents_all_endpoints(client):
     assert set(paths) >= {"/chat", "/triage", "/resume"}
 
 
+def test_app_and_openapi_report_the_packaged_version(client):
+    """应用自报版本必须等于 pyproject.toml 的发布版本。
+
+    v0.4.0 之前 `FastAPI(version=...)` 是硬编码字面量,与包版本各自演化:
+    pyproject 升到 0.4.0 后 `/openapi.json` 的 info.version 仍静默报 0.3.0,
+    而没有任何测试钉住它。这条把"两处版本漂移"变成红灯。
+
+    期望值从 pyproject.toml 读取而不是写死 —— 升级版本只需改一处;
+    锚定仓库根沿用 tests 既有的 `parents[2]` 写法。
+    """
+    import tomllib
+
+    root = Path(__file__).resolve().parents[2]
+    expected = tomllib.loads(
+        (root / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+
+    assert create_app().version == expected
+    assert client.get("/openapi.json").json()["info"]["version"] == expected
+
+
 def test_every_triage_error_subclass_is_mapped_to_a_status():
     """新增 TriageError 子类必须显式归类。
 
