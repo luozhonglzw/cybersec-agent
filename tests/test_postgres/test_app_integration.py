@@ -280,6 +280,9 @@ def test_default_backend_is_sqlite_and_unchanged(tmp_path, monkeypatch, data_pat
     monkeypatch.setenv("LLM_MODEL", "m")
     monkeypatch.setenv("LLM_API_KEY", "k")
     monkeypatch.setenv("AUDIT_DB_PATH", str(tmp_path / "audit.db"))
+    # v0.4.0 S1:checkpoint 库的默认值也是相对路径,必须同样 pin 到 tmp_path,
+    # 否则 lifespan 会在仓库 `data/` 下落一个 checkpoints.db。
+    monkeypatch.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.db"))
     monkeypatch.delenv("AUDIT_BACKEND", raising=False)
     monkeypatch.delenv("AUDIT_POSTGRES_DSN", raising=False)
     monkeypatch.setattr(api_main, "LLMClient", lambda *a, **k: FakeLLMClient("ok"))
@@ -546,6 +549,7 @@ def test_unreachable_postgres_at_startup_still_does_not_fall_back(monkeypatch, t
     monkeypatch.setenv("LLM_MODEL", "m")
     monkeypatch.setenv("LLM_API_KEY", "k")
     monkeypatch.setenv("AUDIT_DB_PATH", str(sqlite_path))
+    monkeypatch.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.db"))
     monkeypatch.setenv("AUDIT_BACKEND", "postgres")
     monkeypatch.setenv("AUDIT_POSTGRES_DSN", UNREACHABLE_DSN)
     monkeypatch.setattr(api_main, "LLMClient", lambda *a, **k: FakeLLMClient("ok"))
@@ -922,13 +926,18 @@ def _wait_for_connection_count(conn, limit: int, timeout: float = 5.0) -> int:
 
 
 def test_repeated_lifespan_startup_shutdown_closes_the_pool(
-    monkeypatch, pg_app_dsn, pg_connection
+    monkeypatch, pg_app_dsn, pg_connection, tmp_path
 ):
     """L:反复启停不留连接;每次退出都关闭连接池。"""
     monkeypatch.setenv("LLM_MODEL", "m")
     monkeypatch.setenv("LLM_API_KEY", "k")
     monkeypatch.setenv("AUDIT_BACKEND", "postgres")
     monkeypatch.setenv("AUDIT_POSTGRES_DSN", pg_app_dsn)
+    # v0.4.0 S1:checkpoint 库的默认值也是**相对路径**,必须同样 pin 到
+    # tmp_path,否则 lifespan 会在仓库 `data/` 下落一个 checkpoints.db。
+    # 这里是与上面两处同因的**第三个** lifespan 站点(I1 漏掉的那一个)。
+    # 审计侧走 PostgreSQL,AUDIT_DB_PATH 不参与,无需 pin。
+    monkeypatch.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.db"))
     monkeypatch.setattr(api_main, "LLMClient", lambda *a, **k: FakeLLMClient("ok"))
     get_settings.cache_clear()
     try:

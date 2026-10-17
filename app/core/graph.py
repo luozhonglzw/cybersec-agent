@@ -66,12 +66,17 @@ Phase 8.3 在 ReAct 循环**之后**接上 HITL 安全层(仅在传入 HitlConfi
    审计写入自身失败时**只记日志**:审计是旁路,不能掩盖原始错误,
    更不能改变控制流。
 
-checkpoint 的现实约束(必须文档化):
-    本阶段只能用 InMemorySaver —— langgraph-checkpoint-sqlite **未安装**,
-    引入即新增依赖。因此 checkpoint 是**进程内运行时状态,重启丢失**;
-    持久事实在 audit_logs / incidents / action_requests 三张表里。
+checkpoint 的存储(Phase v0.4.0 S1 起改变,旧说明留在此处以免误导):
+    v0.4.0 S1 之前只有 InMemorySaver —— checkpoint 是**进程内运行时状态,
+    重启丢失**。S1 起组合根改用**落盘的 SQLite saver**
+    (`app/security/checkpoint.py`),于是暂停在 human_approval 的 run 可以被
+    **另一个进程**恢复。
+    但本模块**一行都不改**:checkpoint 的实现由组合根经
+    `HitlConfig.checkpointer` 注入,图与节点对"是内存还是文件"完全无感知 ——
+    这正是 Phase 8.4 约束 6/7 想要的性质。
     两者不互相替代:checkpoint 决定"能否继续跑",审计决定"发生过什么"。
-    解析路径:Phase 10 换 saver 实现,图与节点零改动。
+    本模块**不得** import 任何具体 saver 实现(那会把它绑到某一种存储上);
+    `tests/test_core/test_hitl_graph.py` 的 AST 护栏守着这条。
 """
 import json
 from dataclasses import dataclass

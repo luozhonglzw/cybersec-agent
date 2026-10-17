@@ -418,6 +418,10 @@ def env_llm(monkeypatch):
 
 def test_lifespan_composes_sqlite_by_default(env_llm, tmp_path: Path):
     env_llm.setenv("AUDIT_DB_PATH", str(tmp_path / "audit.db"))
+    # v0.4.0 S1:lifespan 现在还会建持久化 checkpoint 库。它的默认值同样是
+    # **相对路径**,因此不 pin 到 tmp_path 就会在仓库 `data/` 下落一个文件
+    # —— 与 AUDIT_DB_PATH 的隔离理由完全相同。
+    env_llm.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.db"))
     env_llm.delenv("AUDIT_BACKEND", raising=False)
     with TestClient(create_app()) as client:
         store = client.app.state.audit_store
@@ -430,6 +434,7 @@ def test_lifespan_composes_sqlite_by_default(env_llm, tmp_path: Path):
 def test_lifespan_composes_postgres_when_explicitly_selected(env_llm, tmp_path: Path):
     sqlite_path = tmp_path / "must_not_be_created.db"
     env_llm.setenv("AUDIT_DB_PATH", str(sqlite_path))
+    env_llm.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.db"))
     env_llm.setenv("AUDIT_BACKEND", "postgres")
     env_llm.setenv("AUDIT_POSTGRES_DSN", FAKE_DSN)
     with TestClient(create_app()) as client:
@@ -441,6 +446,7 @@ def test_lifespan_composes_postgres_when_explicitly_selected(env_llm, tmp_path: 
 
 def test_lifespan_closes_the_postgres_store_on_shutdown(env_llm, tmp_path: Path):
     env_llm.setenv("AUDIT_DB_PATH", str(tmp_path / "must_not_be_created.db"))
+    env_llm.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.db"))
     env_llm.setenv("AUDIT_BACKEND", "postgres")
     env_llm.setenv("AUDIT_POSTGRES_DSN", FAKE_DSN)
     with TestClient(create_app()) as client:
@@ -460,6 +466,7 @@ def test_lifespan_closes_the_store_when_partial_startup_fails(env_llm, tmp_path:
         return store
 
     env_llm.setenv("AUDIT_DB_PATH", str(tmp_path / "must_not_be_created.db"))
+    env_llm.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.db"))
     env_llm.setenv("AUDIT_BACKEND", "postgres")
     env_llm.setenv("AUDIT_POSTGRES_DSN", FAKE_DSN)
     env_llm.setattr(api_main, "build_audit_store", _record)

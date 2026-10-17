@@ -71,6 +71,20 @@ class Settings(BaseSettings):
     #   迁移与 DDL 由 migration-owner 角色在 Alembic 里做。
     audit_postgres_dsn: SecretStr | None = None
 
+    # ---- HITL checkpoint 存储(Phase v0.4.0 S1)----
+    # 持久化 checkpoint:让"暂停在 human_approval 的 run"能被**另一个进程**
+    # 恢复 —— 此前 InMemorySaver 只在进程存活期内有效。
+    # 与 audit_db_path 一样是**相对路径**,以进程启动目录为基准;部署由
+    # compose.yaml 把它指到已有的 /data 卷上。
+    #
+    # 刻意**不复用** audit_db_path:checkpoint 与审计是两套**独立**存储 ——
+    # 审计是"发生了什么"的权威,checkpoint 是"能否继续"的权威
+    # (PHASE v0.4.0-D4 §5.6)。落进同一个文件会让这条边界退化成模糊的
+    # 混合体,而且 checkpoint 写入用 `INSERT OR REPLACE`,与审计的
+    # append-only 触发器同库会削弱"审计不可改写"的论证。
+    # 下面的 validator 把"配成同一个文件"变成**启动期**错误。
+    checkpoint_db_path: Path = Path("data/checkpoints.db")
+
     # ---- 认证与角色(Phase v0.3.0-A3-1)----
     # 必填,**至少一条**。这是"认证始终开启"的落地方式:
     # 没有 `AUTH_ENABLED=false` 之类的开关 —— 想放开匿名访问的部署必须
@@ -102,6 +116,29 @@ class Settings(BaseSettings):
                     "audit_backend='postgres' 需要 AUDIT_POSTGRES_DSN;"
                     "未提供 DSN 时不会回退到 SQLite。"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _require_distinct_checkpoint_database(self) -> "Settings":
+        """checkpoint 库与审计库必须是**不同**的文件。
+
+        两者是独立存储(PHASE v0.4.0-D4 §5.6):审计是"发生了什么"的权威,
+        checkpoint 是"能否继续"的权威。共享一个文件会让这条边界退化成
+        模糊的混合体 —— 且 checkpoint 写入走 `INSERT OR REPLACE`,与审计的
+        append-only 触发器同库会削弱"审计不可改写"的论证。
+
+        与 `_require_dsn_when_postgres` 同一条论证:配置错就**拒绝启动**,
+        而不是等到运行期才发现两套存储其实是一个文件。
+
+        先 `resolve()` 归一化再比较:`data/./audit.db`、`data/audit.db` 与
+        同一文件的绝对路径是三种写法、一个文件,单纯字符串比较会漏掉它们。
+        错误信息只说明"必须不同",不回显任何路径内容。
+        """
+        if self.checkpoint_db_path.resolve() == self.audit_db_path.resolve():
+            raise ValueError(
+                "checkpoint_db_path 与 audit_db_path 必须指向不同文件:"
+                "checkpoint 与审计是两套独立存储。"
+            )
         return self
 
     @model_validator(mode="after")

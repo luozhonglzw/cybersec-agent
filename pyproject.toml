@@ -14,6 +14,15 @@ dependencies = [
     "uvicorn>=0.30,<1",
     "pytest-asyncio>=1.4.0",
     "langgraph>=1.0.1",
+    # v0.4.0 S1:持久化 HITL checkpoint 存储。组合根 `app/api/main.py` 在**运行时**
+    # import 它,所以必须是运行时依赖,不能只挂 dev 组(否则
+    # `uv sync --locked --no-dev` 装出的镜像一启动就 ImportError)。
+    # 上界 `<3.1` 是**刻意**的且已实测:`langgraph-checkpoint-sqlite 3.1.1` 要求
+    # `langgraph-checkpoint>=4.1.0`,与 `langgraph 1.0.1` 的 `<4.0.0` 约束
+    # **不可满足**(ResolutionImpossible)。该上界同时使 PYSEC-2026-3636 /
+    # GHSA-47pj-3jcm-6whg 保持存在 —— 受影响的是 Store 命名空间的 LIKE 读取路径,
+    # 本项目未使用;这是**缓解论据,不是移除**。见 PHASE v0.4.0-D4 §4.4 / §8.6。
+    "langgraph-checkpoint-sqlite>=3.0.3,<3.1",
     "mcp>=2.3.0",
     # PostgreSQL 审计后端(v0.2.0-M1b)。`app/security/store_postgres.py` 属于
     # `app` 包(见下方 hatch 配置),在**应用运行时** import psycopg 与

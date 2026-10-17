@@ -43,10 +43,10 @@ import time
 from typing import Literal
 import uuid
 
+import aiosqlite
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from langgraph.checkpoint.memory import InMemorySaver
 from psycopg.conninfo import conninfo_to_dict
 
 from app.api.schemas import (
@@ -78,6 +78,7 @@ from app.security.auth import (
     require_approver,
     require_principal,
 )
+from app.security.checkpoint import SafeAsyncSqliteSaver, build_checkpoint_serde
 from app.security.store import SqliteAuditStore
 from app.security.store_postgres import POSTGRES_STORE_ERRORS, PostgresAuditStore
 from app.security.store_protocol import AuditStore
@@ -333,9 +334,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     - 测试可以用 create_app(...) 覆盖,不走这里。
 
     checkpointer 必须**只在这里创建一次**(Phase 8.4 约束 6/7):
-    InMemorySaver 是进程内的 checkpoint 存储。创建两次 = 两套互不可见的
-    state,暂停在 A 上、去 B 里 resume 只会命中"未知 thread"。
-    它是一个**有状态单例**,不是可以随手 new 的配置对象。
+    它是一个**有状态单例**,不是可以随手 new 的配置对象。创建两次 = 两套
+    互不可见的 state,暂停在 A 上、去 B 里 resume 只会命中"未知 thread"。
+
+    Phase v0.4.0 S1 把 checkpoint 从进程内内存(`InMemorySaver`)换成**落盘的
+    SQLite saver** —— 那是跨进程恢复的**唯一**前提。单例约束因此更强:现在
+    "两套 state"指的是**同一个文件被两个连接同时写**,而不是两份内存。
+    连接由本函数持有,并在 `finally` 里关闭(不关会让进程退出时挂住)。
 
     资源归属(Phase v0.2.0-M1c):审计后端的连接池由**本函数**拥有,
     且**每个进程只建一个** —— 绝不在请求处理里建池。`finally` 覆盖
@@ -356,7 +361,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 同一实例既供写入路径(HITL 图 + TriageService),也供只读审计端点
     # (GET /audit/events)。端点只调用 list_audit,不会产生新的写入点。
     app.state.audit_store = store
+    checkpoint_conn: aiosqlite.Connection | None = None
     try:
+        # 持久化 checkpoint(Phase v0.4.0 S1)。连接必须**在运行中的事件循环里**
+        # 建立:`AsyncSqliteSaver.__init__` 会调用 `asyncio.get_running_loop()`,
+        # 并把同步接口 `run_coroutine_threadsafe` 到那个循环上。
+        #
+        # 刻意**不**用 `from_conn_string(...)`:那个入口不接受 `serde`,而我们必须
+        # 注入严格反序列化白名单(见 `app/security/checkpoint.py`)。
+        checkpoint_path = settings.checkpoint_db_path
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_conn = await aiosqlite.connect(str(checkpoint_path))
+        checkpointer = SafeAsyncSqliteSaver(
+            checkpoint_conn, serde=build_checkpoint_serde()
+        )
+        # 启动期建表(journal_mode=WAL + checkpoints/writes)。这里失败 → 进程
+        # **拒绝启动**:一个"看起来起来了、其实写不了 checkpoint"的进程会在
+        # 第一个 /triage 上失败,而那比启动失败难诊断得多。
+        await checkpointer.setup()
+
         # 一个 LLMClient 给两条链路共用:bind_tools 每次返回新的 runnable,
         # 不存在互相污染;少建一个 ChatOpenAI 实例。
         llm = LLMClient()
@@ -364,13 +387,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.triage_service = TriageService(
             create_agent_graph(
                 llm,
-                hitl=HitlConfig(checkpointer=InMemorySaver(), audit_store=store),
+                hitl=HitlConfig(checkpointer=checkpointer, audit_store=store),
             ),
             store,
         )
         yield
     finally:
-        # 幂等:SQLite 后端没有可关闭的资源,这里是 no-op。
+        # 两套存储互相独立,关闭顺序无所谓,但**两条**都必须关。
+        if checkpoint_conn is not None:
+            await checkpoint_conn.close()
+        # 幂等:SQLite 审计后端没有可关闭的资源,这里是 no-op。
         close_audit_store(store)
 
 

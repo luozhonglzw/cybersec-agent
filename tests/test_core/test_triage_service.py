@@ -25,17 +25,24 @@
 import ast
 import inspect
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+import textwrap
 from collections import Counter
 from contextlib import closing
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import NamedTuple
 
+import aiosqlite
 import pytest
+from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from app.api.main import create_app
 from app.core.graph import HitlConfig, create_agent_graph
 from app.core.llm import FakeLLMClient
 from app.core.triage import (
@@ -49,6 +56,10 @@ from app.core.triage import (
     _extract_answer,
 )
 from app.schemas.approval import TriageOutcome
+from app.security.checkpoint import (
+    SafeAsyncSqliteSaver,
+    build_checkpoint_serde,
+)
 from app.security.store import SqliteAuditStore
 
 # 与 test_hitl_graph.py 同一套夹具语义:
@@ -627,3 +638,200 @@ def test_triage_result_is_frozen():
 def test_no_repo_audit_db_created():
     """所有用例都走 tmp_path;仓库里不得出现 audit.db。"""
     assert not (_REPO_ROOT / "data" / "audit.db").exists()
+
+
+# =====================================================================
+# F. v0.4.0 S1:**真正的跨进程**持久化证据(§7.1)
+# =====================================================================
+#
+# 为什么不能用"同一个进程里换一个 saver 实例"充数:那只能证明**对象**被
+# 重建,证明不了**进程内内存**不是唯一的真相源。真正的持久化证据必须让
+# 第一个进程**彻底退出**(它持有的内存随进程消失),再由**第二个操作系统
+# 进程**从磁盘上的同一个文件恢复。
+#
+# 因此本用例启动一个真实子进程做暂停,子进程退出后再在父进程里恢复。
+# 断言里显式比较两个 PID,把"确实是两个进程"钉死 —— 否则哪天有人把子进程
+# 换成同进程调用,这条用例会静默退化成它本想避免的那种伪证据。
+
+_CHILD_SCRIPT = textwrap.dedent(
+    """
+    import asyncio, json, os, sys
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    import aiosqlite
+
+    from app.core.graph import HitlConfig, create_agent_graph
+    from app.core.llm import FakeLLMClient
+    from app.core.triage import TriageService
+    from app.schemas.ownership import ThreadOwnership
+    from app.security.checkpoint import SafeAsyncSqliteSaver, build_checkpoint_serde
+    from app.security.store import SqliteAuditStore
+
+
+    async def main() -> None:
+        logs, intel = Path(sys.argv[1]), Path(sys.argv[2])
+        audit_db, ckpt_db = Path(sys.argv[3]), Path(sys.argv[4])
+        indicator, owner, approver = sys.argv[5], sys.argv[6], sys.argv[7]
+
+        store = SqliteAuditStore(audit_db)
+        conn = await aiosqlite.connect(str(ckpt_db))
+        saver = SafeAsyncSqliteSaver(conn, serde=build_checkpoint_serde())
+        await saver.setup()
+        service = TriageService(
+            create_agent_graph(
+                FakeLLMClient("分析完成"),
+                hitl=HitlConfig(
+                    checkpointer=saver,
+                    audit_store=store,
+                    logs_path=logs,
+                    intel_path=intel,
+                ),
+            ),
+            store,
+        )
+        result = await service.triage(indicator=indicator)
+        thread_id = result.outcome.thread_id
+        # 复刻真实 /triage 的另一半:登记逐线程审批指派(授权事实落在
+        # **审计库**里,与 checkpoint 是两套独立存储)。
+        store.record_thread_ownership(ThreadOwnership(
+            thread_id=thread_id,
+            owner=owner,
+            approvers=(approver,),
+            created_at=datetime.now(timezone.utc),
+        ))
+        # 关连接 = 刷 WAL。之后本进程退出,内存里的一切随之消失。
+        await conn.close()
+        print(json.dumps({
+            "pid": os.getpid(),
+            "thread_id": thread_id,
+            "interrupt_id": result.interrupt_id,
+        }))
+
+
+    asyncio.run(main())
+    """
+)
+
+
+def _run_child_pause(tmp_path: Path, name: str, logs, intel, db_path, ckpt_db,
+                     owner: str, approver: str) -> dict:
+    """在**真实子进程**里暂停一次,返回子进程自报的 pid / thread_id。"""
+    script = tmp_path / name
+    script.write_text(_CHILD_SCRIPT, encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_REPO_ROOT)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"  # 不在仓库里留 __pycache__
+
+    child = subprocess.run(
+        [sys.executable, str(script), str(logs), str(intel),
+         str(db_path), str(ckpt_db), BRUTE_FORCE_IP, owner, approver],
+        capture_output=True, text=True, env=env, timeout=180,
+    )
+    assert child.returncode == 0, child.stderr
+    return json.loads(child.stdout.strip().splitlines()[-1])
+
+
+async def test_pause_survives_a_real_process_restart_and_can_be_resumed(
+    tmp_path: Path, data_paths, db_path
+):
+    """**两个真实 OS 进程**:进程 A 暂停并退出,进程 B 从磁盘恢复并跑完。
+
+    这是 v0.4.0 S1 的核心承诺:"HITL 状态在进程重启后仍然可恢复"。
+    在 S1 之前 checkpoint 是进程内内存,重启即丢 —— 恢复只能 409。
+    """
+    from tests.conftest import TEST_APPROVER_SUBJECT, TEST_OWNER_SUBJECT
+
+    logs, intel = data_paths
+    ckpt_db = tmp_path / "checkpoints.db"
+    payload = _run_child_pause(
+        tmp_path, "child_pause.py", logs, intel, db_path, ckpt_db,
+        TEST_OWNER_SUBJECT, TEST_APPROVER_SUBJECT,
+    )
+
+    # 断言"确实是另一个进程" —— 这条是整条用例的意义所在。
+    assert payload["pid"] != os.getpid(), "子进程必须是真的另一个 OS 进程"
+    thread_id = payload["thread_id"]
+    assert payload["interrupt_id"]
+
+    # ---- 父进程:全新的连接、全新的 saver,只从磁盘读 ------------------
+    store = SqliteAuditStore(db_path)
+    conn = await aiosqlite.connect(str(ckpt_db))
+    try:
+        service = _service(
+            store, logs, intel,
+            SafeAsyncSqliteSaver(conn, serde=build_checkpoint_serde()),
+        )
+        result = await service.resume(
+            thread_id, status="approved", operator="approver-1"
+        )
+    finally:
+        await conn.close()
+
+    assert result.outcome.status == "completed"
+    events = [r.event for r in store.list_audit(thread_id=thread_id)]
+    assert events.count("approval.decided") == 1
+    # 暂停与恢复各自恰好一次,没有因为重启而重放。
+    assert events.count("approval.requested") == 1
+    assert events.count("plan.created") == 1
+
+
+def test_restart_then_authorization_still_holds(tmp_path, data_paths, db_path,
+                                                monkeypatch):
+    """重启之后**对象级授权与禁止自审批仍然生效**(端到端,真 lifespan)。
+
+    走的是**真实** `create_app()` 的 lifespan(不注入 triage_service),
+    因此 app 在自己的事件循环里打开子进程留下的那个 checkpoint 文件 ——
+    这正是"重启后能不能恢复"的真实形态。
+
+    断言两件事:
+      1. 被指派的 approver 能恢复 → 200(持久化 checkpoint 确实可用);
+      2. 属主自己仍然被拒 → 403(禁止自审批没有被持久化绕过)。
+    """
+    from app.api import main as api_main
+    from app.core.config import get_settings
+    from tests.conftest import (
+        APPROVER_HEADERS,
+        OWNER_HEADERS,
+        TEST_APPROVER_SUBJECT,
+        TEST_OWNER_SUBJECT,
+    )
+
+    logs, intel = data_paths
+    ckpt_db = tmp_path / "checkpoints_restart.db"
+    payload = _run_child_pause(
+        tmp_path, "child_pause_auth.py", logs, intel, db_path, ckpt_db,
+        TEST_OWNER_SUBJECT, TEST_APPROVER_SUBJECT,
+    )
+    assert payload["pid"] != os.getpid()
+    thread_id = payload["thread_id"]
+
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(api_main, "LLMClient", lambda *a, **k: FakeLLMClient("ok"))
+    monkeypatch.setenv("AUDIT_DB_PATH", str(db_path))
+    monkeypatch.setenv("CHECKPOINT_DB_PATH", str(ckpt_db))
+    monkeypatch.delenv("AUDIT_BACKEND", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        # 1. 属主自审批 → 403(禁止自审批跨重启依然成立)
+        with TestClient(create_app(), headers=OWNER_HEADERS) as client:
+            denied = client.post("/resume", json={
+                "thread_id": thread_id, "status": "approved", "operator": "x",
+            })
+        assert denied.status_code == 403, denied.text
+
+        # 2. 被指派的 approver → 200(重启后 checkpoint 真的可用)
+        with TestClient(create_app(), headers=APPROVER_HEADERS) as client:
+            ok = client.post("/resume", json={
+                "thread_id": thread_id, "status": "approved", "operator": "x",
+            })
+        assert ok.status_code == 200, ok.text
+    finally:
+        get_settings.cache_clear()
+
+    events = [r.event for r in SqliteAuditStore(db_path).list_audit(thread_id=thread_id)]
+    assert events.count("approval.decided") == 1
+
+

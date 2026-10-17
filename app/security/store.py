@@ -30,7 +30,9 @@ append-only(四张表,缺一不可的 5 个前提):
     UPDATE / DELETE / INSERT OR REPLACE 字样)。
 
 同步 API 与连接策略(刻意的选择):
-    - sqlite3 是 stdlib,零新依赖(aiosqlite 未安装,引入即违反 Phase 8 约束);
+    - sqlite3 是 stdlib,本模块零新依赖。注意:v0.4.0 S1 起项目**确实**引入了
+      aiosqlite,但那是 **checkpoint 存储**的依赖(`app/security/checkpoint.py`),
+      与**审计**存储无关 —— 审计侧继续走同步 sqlite3,理由见下一条;
     - 写入频率极低(一次 triage 个位数行,且只在审批路径上,不在 ReAct 热循环),
       阻塞事件循环的时间可忽略。async 是**调用点**的问题:真变热了在调用点
       await asyncio.to_thread(store.append_audit, rec) 即可,本模块无需改;
@@ -83,6 +85,140 @@ _AUDIT_LOG_COLUMNS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# 决策身份的存储层唯一性(Phase v0.4.0 S1 / TASK 4)
+# ---------------------------------------------------------------------------
+#
+# 决策身份 = **事件 + 作用域**,且必须由**存储层**强制,不能只靠调用方自觉:
+# 恢复路径可能被并发触发,而"先查再写"之间天然存在竞态窗口 —— 只有数据库
+# 在提交点判定的唯一约束才能给出"恰好一个胜者"。
+#
+# 这是"结构性保证",不是"约定"。但它**不**等于端到端 exactly-once:
+# 审计行的落地与 checkpoint 的推进不在同一个事务里,两者的原子性本阶段
+# **未**实现(见 app/core/triage.py 的已知限制)。
+#
+# ⚠ 实测约束(勿凭直觉推断):`interrupt_id` 为 NULL 时,SQLite 与
+# PostgreSQL 都认为两行**互不相等**,因此 NULL 身份**不受**唯一索引保护。
+# 本项目的 `/resume` 由服务端注入 interrupt_id(D7),经 API 的决策恒为非
+# NULL;直接调用图的旁路不在本阶段承诺范围内(报告"已知限制"一节记录)。
+
+_DECIDED_EVENT = "approval.decided"
+_TIMEOUT_EVENT = "approval.timeout"
+
+#: 决策身份的**单一真相源**。SQLite 与 PostgreSQL 两侧都从这里取身份列,
+#: 各自拼各自的占位符 —— 身份定义只允许有一份,两份迟早分叉。
+_DECISION_IDENTITIES: dict[str, tuple[str, ...]] = {
+    _DECIDED_EVENT: ("thread_id", "interrupt_id"),
+    _TIMEOUT_EVENT: ("thread_id",),
+}
+
+
+class DecisionAlreadyRecordedError(RuntimeError):
+    """该决策身份已被持久记录过 —— 存储层强制 at-most-once。
+
+    刻意**不**继承底层驱动的完整性异常(SQLite 的 `sqlite3.IntegrityError`,
+    或 PostgreSQL 驱动对应的异常类型):
+    调用方必须能区分"决策重复(业务冲突 → 409)"与"别的完整性错误
+    (不得被解释成业务冲突)"。继承驱动异常会让这两者无法分辨。
+    """
+
+
+class AuditUniquenessPreflightError(RuntimeError):
+    """历史审计行里已存在重复的决策身份,唯一约束无法建立。
+
+    这是**启动期**失败,与 `DecisionAlreadyRecordedError`(运行期)分开:
+    处置方式完全不同 —— 前者要求人工核对历史数据,后者只是一个被正确
+    拒绝的重复请求。
+    """
+
+
+def _decision_identity_columns(event: str) -> tuple[str, ...] | None:
+    """该事件的身份列;非决策事件返回 None(它们天然可重复)。"""
+    return _DECISION_IDENTITIES.get(event)
+
+
+def _decision_identity_label(record: AuditRecord) -> str | None:
+    """把一条记录的决策身份渲染成可读文本;非决策事件返回 None。"""
+    columns = _decision_identity_columns(record.event)
+    if columns is None:
+        return None
+    fields = " / ".join(f"{c}={getattr(record, c)!r}" for c in columns)
+    return f"{record.event} / {fields}"
+
+
+#: 两条**部分**唯一索引。用部分索引而不是普通唯一索引:唯一性只对决策事件
+#: 成立,其余事件(plan.created / policy.evaluated / approval.requested ...)
+#: 天然可以重复出现。
+#:
+#: `IF NOT EXISTS` 是必需的,不是防御性写法:`SqliteAuditStore.__init__`
+#: 每次构造都会跑一遍 DDL(见下方 __init__),没有它第二次构造就会炸。
+_DECISION_UNIQUE_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "uq_audit_decided_per_interrupt",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_decided_per_interrupt"
+        " ON audit_logs (thread_id, interrupt_id)"
+        f" WHERE event = '{_DECIDED_EVENT}'",
+    ),
+    (
+        "uq_audit_timeout_per_thread",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_timeout_per_thread"
+        f" ON audit_logs (thread_id) WHERE event = '{_TIMEOUT_EVENT}'",
+    ),
+)
+
+#: 建唯一索引**之前**的重复预检。每条 = (索引名, 检测 SQL)。
+#:
+#: 为什么必须显式预检(实测,不是推断):SQLite 建唯一索引失败时给出的消息
+#: **只点名列、不点名索引** ——
+#: `UNIQUE constraint failed: audit_logs.thread_id, audit_logs.interrupt_id`。
+#: 运维无法从这句话判断是哪条不变量、该去查哪些行。预检把一句无从下手的
+#: 驱动报错换成一条能直接行动的诊断。
+def _duplicate_probe_sql(event: str) -> str:
+    """按身份列生成"同一身份出现多次"的检测 SQL。
+
+    预检口径必须与它守护的那条**部分唯一索引**完全一致:身份列里**任一列
+    为 NULL** 的行,索引都不会判为冲突(SQLite 与 PostgreSQL 都把 NULL 视作
+    互不相等 —— 实测)。因此这里也必须把这类行排除。否则 `GROUP BY` 会把
+    多行 NULL 归成同一组、`COUNT(*) > 1`,报出一个索引**本会接受**的假重复,
+    把一条本可正常建立的迁移挡在门外 —— 护栏比自己守护的约束更严,是缺陷。
+
+    排除之后,预检扫描的行集 = 索引覆盖的行集:真重复(非 NULL 身份完全相同)
+    仍然响亮失败。
+    """
+    columns = _DECISION_IDENTITIES[event]
+    joined = ", ".join(columns)
+    non_null = " AND ".join(f"{column} IS NOT NULL" for column in columns)
+    return (
+        f"SELECT {joined}, COUNT(*) AS n FROM audit_logs"
+        f" WHERE event = '{event}' AND {non_null}"
+        f" GROUP BY {joined} HAVING COUNT(*) > 1"
+    )
+
+
+_DECISION_DUPLICATE_PROBES: tuple[tuple[str, str], ...] = (
+    ("uq_audit_decided_per_interrupt", _duplicate_probe_sql(_DECIDED_EVENT)),
+    ("uq_audit_timeout_per_thread", _duplicate_probe_sql(_TIMEOUT_EVENT)),
+)
+
+
+def _preflight_decision_uniqueness(conn: sqlite3.Connection) -> None:
+    """建唯一索引**之前**检查历史重复行;**绝不**自动修复。
+
+    只读:本函数只 SELECT。审计表是 append-only 证据,"自动清理重复"就是
+    篡改证据,因此发现重复时唯一正确的动作是**响亮拒绝启动**,把它交给人
+    处置 —— 而不是删行、改行,或跳过这条约束。
+    """
+    for index_name, probe in _DECISION_DUPLICATE_PROBES:
+        offenders = conn.execute(probe).fetchall()
+        if offenders:
+            raise AuditUniquenessPreflightError(
+                f"历史审计行已存在重复的决策身份:共 {len(offenders)} 组重复,"
+                f"唯一索引 {index_name} 无法建立。"
+                " 本存储不会删除或改写历史审计行(append-only 证据),"
+                "请人工核对后处置。"
+            )
+
+
 def _append_only_triggers(table: str) -> tuple[str, str]:
     """生成一张表的禁改触发器(UPDATE / DELETE 各一条)。"""
     return (
@@ -95,8 +231,13 @@ def _append_only_triggers(table: str) -> tuple[str, str]:
     )
 
 
-def _schema_statements() -> list[str]:
-    """全部 DDL:四张表 + 索引 + 八条禁改触发器(幂等,可重复执行)。"""
+def _table_statements() -> list[str]:
+    """建表 + 普通索引 + 禁改触发器(幂等)。**不含**决策唯一索引。
+
+    与 `_decision_unique_index_statements()` 分开,是因为两者之间必须插一次
+    重复预检:唯一索引建在**有历史重复行**的库上会以一句只点名列、不点索引名
+    的驱动报错失败(实测),而那句报错无法指导运维。
+    """
     statements = [
         """
         CREATE TABLE IF NOT EXISTS incidents (
@@ -164,6 +305,21 @@ def _schema_statements() -> list[str]:
     for table in (*_TABLES, *_OWNERSHIP_TABLES):
         statements.extend(_append_only_triggers(table))
     return statements
+
+
+def _decision_unique_index_statements() -> list[str]:
+    """决策身份的两条部分唯一索引(v0.4.0 S1 / TASK 4)。"""
+    return [sql for _index_name, sql in _DECISION_UNIQUE_INDEXES]
+
+
+def _schema_statements() -> list[str]:
+    """全部 DDL(幂等,可重复执行)。
+
+    顺序有语义:先建表与触发器,再建决策唯一索引。直接一次性执行本列表
+    (例如迁移或审计脚本)会跳过中间那次重复预检,因此**应用装配路径不走
+    它** —— 装配走 `__init__` 里的三段式。
+    """
+    return [*_table_statements(), *_decision_unique_index_statements()]
 
 
 def _to_iso(value: datetime) -> str:
@@ -253,7 +409,12 @@ class SqliteAuditStore:
         # 换台机器 data/ 里只有 .gitignore,首次使用需要能自建父目录
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn, conn:
-            for statement in _schema_statements():
+            for statement in _table_statements():
+                conn.execute(statement)
+            # 预检必须夹在这里:表要先存在(否则查询无表可查),
+            # 唯一索引要先不存在(否则索引自己已经把重复挡住了,预检永远看不到)。
+            _preflight_decision_uniqueness(conn)
+            for statement in _decision_unique_index_statements():
                 conn.execute(statement)
 
     # ---------- 内部 ----------
@@ -333,25 +494,65 @@ class SqliteAuditStore:
     # ---------- 写:audit_logs ----------
 
     def append_audit(self, record: AuditRecord) -> None:
-        """追加一条审计记录(append-only)。"""
+        """追加一条审计记录(append-only)。
+
+        决策事件(`approval.decided` / `approval.timeout`)另外受**存储层
+        唯一性**约束:同一决策身份只能落地一次。重复写入抛
+        `DecisionAlreadyRecordedError` —— 这是 fail closed,既不是静默覆盖,
+        也不是 upsert。非决策事件的完整性错误原样抛出,不被解释成业务冲突。
+        """
         with closing(self._connect()) as conn, conn:
-            conn.execute(
-                f"INSERT INTO audit_logs ({_AUDIT_LOG_COLUMNS})"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    record.id,
-                    _to_iso(record.ts),
-                    record.actor,
-                    record.event,
-                    record.incident_id,
-                    record.thread_id,
-                    record.interrupt_id,
-                    record.outcome,
-                    record.reason,
-                    record.plan_digest,
-                    json.dumps(record.detail, ensure_ascii=False),
-                ),
-            )
+            try:
+                conn.execute(
+                    f"INSERT INTO audit_logs ({_AUDIT_LOG_COLUMNS})"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        record.id,
+                        _to_iso(record.ts),
+                        record.actor,
+                        record.event,
+                        record.incident_id,
+                        record.thread_id,
+                        record.interrupt_id,
+                        record.outcome,
+                        record.reason,
+                        record.plan_digest,
+                        json.dumps(record.detail, ensure_ascii=False),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise self._classify_integrity_error(conn, record, exc) from exc
+
+    def _classify_integrity_error(
+        self, conn: sqlite3.Connection, record: AuditRecord, exc: sqlite3.IntegrityError
+    ) -> BaseException:
+        """把"决策身份重复"从普通完整性错误里分出来;否则原样返回。
+
+        为什么**回查**而不是解析错误消息(实测,不是推断):
+        `PRIMARY KEY` 冲突与部分唯一索引冲突在 SQLite 里的消息形状**完全
+        一样**(都是 `UNIQUE constraint failed: <表>.<列>`),而且消息只点名
+        列、不点名索引。按消息措辞判断既脆弱又分不清主键。回查身份与措辞
+        解耦,且正好表达我们要的语义 —— "这个决策身份已经有行了"。
+
+        实测确认:失败的 INSERT 之后连接仍可 SELECT(语句级回滚,事务可用),
+        因此回查是安全的。
+        """
+        label = _decision_identity_label(record)
+        if label is None:
+            return exc
+        columns = _decision_identity_columns(record.event) or ()
+        where = " AND ".join(f"{column} IS ?" for column in columns)
+        row = conn.execute(
+            f"SELECT 1 FROM audit_logs WHERE event = ? AND {where} LIMIT 1",
+            (record.event, *(getattr(record, column) for column in columns)),
+        ).fetchone()
+        if row is None:
+            # 身份没重复 ⇒ 这个 IntegrityError 来自别处(例如主键撞了)。
+            # 不得把它说成"决策重复" —— 那是对世界的错误陈述。
+            return exc
+        return DecisionAlreadyRecordedError(
+            f"该决策身份已被持久记录,拒绝重复写入({label})"
+        )
 
     # ---------- 写:thread_owners(v0.3.0-A3-2) ----------
 

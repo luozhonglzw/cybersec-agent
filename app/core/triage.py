@@ -68,7 +68,7 @@ interrupt_id 由服务端从 checkpoint 恢复(D7),绝不采信客户端传的�
     删除 checkpoint 只发生在**终态**:failed(plan 节点抛错后残留的
     next=('plan',) 快照)与 timed_out。pending_approval **绝不删除** ——
     删掉就等于把待审批的请求凭空抹掉。completed / allowed 本轮**不清理**
-    (不是"必须保留",只是 9.1-A 不做),因此它们仍会占着内存。
+    (不是"必须保留",只是 9.1-A 不做),因此它们仍会占着 checkpoint 存储。
 
 已知限制(必须文档化,不得掩盖):
     1. **audit_logs.incident_id 为 NULL**。incident 在图跑完之后才创建
@@ -78,21 +78,39 @@ interrupt_id 由服务端从 checkpoint 恢复(D7),绝不采信客户端传的�
        或在 State 里放 incident_id,两者都超出 8.4 范围)。
        9.1-A **刻意不扩大**这个限制:approval.timeout 也不传 incident_id,
        与图节点保持一致。
-    2. **checkpoint 是进程内 InMemorySaver**(langgraph-checkpoint-sqlite
-       未安装,引入即新增依赖)。服务重启后,暂停中的 thread 无法恢复 ——
-       resume() 会命中 CheckpointLostError(409),而不是假装成功。
+    2. **checkpoint 的存储由组合根决定**(Phase v0.4.0 S1 起是落盘的 SQLite
+       saver;S1 之前是进程内内存)。本服务层**不感知**这一点 —— 它只通过
+       `HitlConfig.checkpointer` 拿到一个 saver 契约。
+       即便 checkpoint 落盘,**审计与 checkpoint 之间也没有原子性**:
+       "决定已记录"与"运行已完成"**不是**联合原子的,任何措辞都不得暗示
+       它们是(见 PHASE v0.4.0-D4 §5.6)。
        持久事实在 incidents / action_requests / audit_logs 三张表里。
     3. **超时只在有流量时被观测**。triage() 是全项目唯一的"全局"请求入口。
        若长时间没有新的判定请求,已过期的 pending thread 会继续显示为
-       pending、checkpoint 继续占内存,直到下一个 /triage 到达。
+       pending、checkpoint 继续占存储,直到下一个 /triage 到达。
        这是"无后台调度器"的必然结果,不是 bug。
     4. **超时状态只能从 audit_logs 观测**。TriageOutcome.status 刻意不新增
        timed_out(不改 schema),也没有"查询 thread 状态"的端点 ——
        所以超时在 API 响应里只以 409 的形式出现。
     5. **completed / allowed 的 checkpoint 本轮不清理**。9.1-A 的清理范围
        只有 failed 与 timed_out 两个终态,不是"必须保留"。
+    6. **决策唯一性是"存储层 at-most-once",不是端到端 exactly-once**
+       (v0.4.0 S1 / TASK 4)。存储层保证同一**决策身份**最多落库一次:
+       approval.decided 的身份是 (thread_id, interrupt_id),approval.timeout
+       是 thread_id,由两条部分唯一索引强制;并发恢复里因此恰好一个胜者
+       (实测:并发两次 resume,approval.decided 恰好一条)。
+       它**不**保证:
+         - 审计写入与 checkpoint 推进的原子性(见限制 2);
+         - 客户端一定收到响应 —— 胜者的响应可能在网络上丢失,客户端重试
+           会拿到 409。所以"重试安全"成立,"恰好一次交互"不成立;
+         - **interrupt_id 为 NULL 的身份**:SQLite 与 PostgreSQL 都认为
+           NULL 互不相等,因此 NULL 身份不受唯一索引保护(实测)。经 API 的
+           /resume 由服务端注入 interrupt_id(D7),所以经 API 的决策恒为非
+           NULL;这条只对"直接调用图"的旁路成立,本阶段不承诺该旁路。
 """
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -110,6 +128,19 @@ from app.core.graph import PlanFailedError
 from app.schemas.approval import ApprovalStatus, TriageOutcome, utc_now
 from app.schemas.incident import Incident
 from app.security.audit import build_audit_record
+
+# checkpoint 存储故障族(v0.4.0 S1 / TASK 5)。服务层必须把它翻译成**领域**
+# 错误,否则会以未归类异常的身份冒到 HTTP 边界 → 500;而它是**部署问题**,
+# 必须是 503(见下方 `_translate_checkpoint_outage`)。
+from app.security.checkpoint import CheckpointStorageError
+
+# 存储层的**决策重复**错误(v0.4.0 S1 / TASK 4)。这是本模块唯一一处引用
+# 具体存储模块(而非 `AuditStore` 契约)的地方,刻意为之:该错误类由
+# SQLite 与 PostgreSQL 两个后端**共同**抛出,定义在 `store.py` 里,而
+# `store_protocol.py` 不在本阶段的授权改动清单内 —— 契约层无法承载它。
+# 服务层必须把这个**存储层**条件翻译成**领域**错误(与 CheckpointLostError
+# 同一职责),否则它会被 HTTP 边界当成未归类异常 → 500,而不是 fail-closed 的 409。
+from app.security.store import DecisionAlreadyRecordedError
 from app.security.store_protocol import AuditStore
 
 logger = structlog.get_logger(__name__)
@@ -147,11 +178,11 @@ class NotAwaitingApprovalError(TriageError):
 
 
 class CheckpointLostError(NotAwaitingApprovalError):
-    """审计证明审批曾被请求,但 checkpoint 已丢失(进程重启)→ 409。
+    """审计证明审批曾被请求,但 checkpoint 已丢失 → 409。
 
     继承 NotAwaitingApprovalError:对客户端而言都是"现在没法恢复",
     状态码相同;分成两个类是为了让日志和测试能区分根因 ——
-    一个是"你来晚了",一个是"服务重启过"。
+    一个是"你来晚了",一个是"存储里已经没有这条运行状态"。
     """
 
 
@@ -242,6 +273,40 @@ def _interrupt_id_of(state: dict) -> str | None:
     return interrupts[0].id if interrupts else None
 
 
+@contextmanager
+def _translate_checkpoint_outage(
+    thread_id: str | None, request_id: str | None
+) -> Iterator[None]:
+    """checkpoint 存储故障 → `TriageDataUnavailableError`(→ 503)。
+
+    **为什么必须翻译,而不是让它自己冒出去**:HTTP 边界只把 `TriageError`
+    映射成状态码,其它异常一律 500。而 checkpoint 故障是**部署问题**,
+    不是客户端错误 —— 它必须是 503,且**绝不**能退化成:
+
+      - 404 "未知 thread" —— 数据还在,只是读不到,说"不存在"是错误陈述;
+      - 409 "checkpoint 丢失 / 审批已完成" —— 同样是对世界的错误陈述
+        (PHASE v0.4.0-D4 §5.2 / §5.4)。
+
+    覆盖两个子类,日志里用 `error_type` 区分,但状态码同为 503:
+
+      - `CheckpointBackendUnavailableError` —— 文件 / 连接 / 磁盘故障;
+      - `CheckpointPayloadRejectedError` —— 载荷损坏、被篡改,或不在白名单内。
+
+    只翻译 checkpoint 自己的错误族。审计存储的失败**不**经过这里,因此
+    v0.3.0 已文档化的"审计读 503 / 写 500"不对称保持不变(D4 §5.4 要求它不变)。
+    """
+    try:
+        yield
+    except CheckpointStorageError as exc:
+        logger.error(
+            "triage_checkpoint_unavailable",
+            request_id=request_id,
+            thread_id=thread_id,
+            error_type=type(exc).__name__,
+        )
+        raise TriageDataUnavailableError("checkpoint 存储不可用") from exc
+
+
 class TriageService:
     """HITL 判定的应用服务:triage() 发起,resume() 恢复。
 
@@ -323,15 +388,16 @@ class TriageService:
         config = {"configurable": {"thread_id": thread_id, "request_id": request_id}}
 
         try:
-            state = await self._graph.ainvoke(
-                {
-                    "messages": _initial_messages(indicator, event_type),
-                    "iteration_count": 0,
-                    "indicator": indicator,
-                    "event_type": event_type,
-                },
-                config,
-            )
+            with _translate_checkpoint_outage(thread_id, request_id):
+                state = await self._graph.ainvoke(
+                    {
+                        "messages": _initial_messages(indicator, event_type),
+                        "iteration_count": 0,
+                        "indicator": indicator,
+                        "event_type": event_type,
+                    },
+                    config,
+                )
         except PlanFailedError as exc:
             # plan 节点的失败契约:消息通用、不含路径(见 graph.PlanFailedError)。
             # 细节在 __cause__ 里,且已由 graph 层写进 plan.failed 审计与 error 日志。
@@ -446,17 +512,35 @@ class TriageService:
         因此采集证据的 I/O 不会再次发生。
         """
         config = {"configurable": {"thread_id": thread_id, "request_id": request_id}}
-        interrupt_id = await self._validate_resumable(thread_id, config)
-
-        state = await self._graph.ainvoke(
-            Command(resume={
-                "status": status,
-                "operator": operator,
-                "reason": reason,
-                "interrupt_id": interrupt_id,
-            }),
-            config,
-        )
+        try:
+            # `_validate_resumable` 内部会读 checkpoint(aget_state),
+            # 因此它也必须在同一条 503 翻译之下 —— checkpoint 后端不可用时
+            # 它不能表现为 404 / 409。
+            with _translate_checkpoint_outage(thread_id, request_id):
+                interrupt_id = await self._validate_resumable(thread_id, config)
+                state = await self._graph.ainvoke(
+                    Command(resume={
+                        "status": status,
+                        "operator": operator,
+                        "reason": reason,
+                        "interrupt_id": interrupt_id,
+                    }),
+                    config,
+                )
+        except DecisionAlreadyRecordedError as exc:
+            # **并发恢复的败者**走到这里。校验门对它不可见:两个请求都在对方
+            # 落库之前读到了 "停在 human_approval",于是都通过了
+            # `_validate_resumable`。真正拦住它的是存储层的唯一索引。
+            #
+            # 实测确认两件事:(1) 该异常**原样穿出** `ainvoke`,没有被框架
+            # 包装;(2) 并发场景下 approval.decided 恰好一条。
+            #
+            # 刻意转成与"顺序重复提交"**同一个**领域错误,而不是新开一个
+            # 分支:两者是同一个领域事实(这条 thread 已经有决定了),因此
+            # 应当收敛到同一个 fail-closed 的 409。
+            raise NotAwaitingApprovalError(
+                "该 thread 的审批已完成,不能重复提交"
+            ) from exc
 
         decision = state.get("approval_decision")
         logger.info(
@@ -495,7 +579,7 @@ class TriageService:
                                           "未知 thread" 当成恢复成功:
                 有未决 action_requests:
                     已过期              → 收成终态 → 409(超时)
-                    未过期              → checkpoint 丢了(服务重启)→ 409
+                    未过期              → checkpoint 丢了(存储不再持有该运行状态)→ 409
                 有 approval.timeout     → 已超时 → 409
                 有 approval.decided     → 审批已完成 → 409
                 有其它审计(如 plan.failed)→ 未产生待审批项 → 409
@@ -534,8 +618,9 @@ class TriageService:
         await self._reject_if_expired(thread_id, request_id)
         if self._store.pending_action_rows(thread_id=thread_id):
             raise CheckpointLostError(
-                "审计显示仍有未决审批,但 checkpoint 已丢失(服务重启);"
-                "本阶段 checkpoint 为进程内存储,无法恢复"
+                "审计显示仍有未决审批,但对应的 checkpoint 已丢失,无法恢复;"
+                "checkpoint 由持久化存储承载,该运行状态可能因存储被清空、"
+                "重置或指向了另一份存储而丢失"
             )
 
         audit = self._store.list_audit(thread_id=thread_id)
@@ -694,8 +779,9 @@ class TriageService:
         且实测 `is` 组合根传进 create_agent_graph 的同一个实例。本类因此
         仍然**不持有** checkpointer,不违背类 docstring 的约束。
 
-        InMemorySaver.adelete_thread 对未知 / 已删除的 thread 无异常(实测),
-        所以调用前不需要存在性预检。
+        `adelete_thread` 对未知 / 已删除的 thread 无异常(实测:v0.4.0 S1 之前
+        是 `InMemorySaver`,之后是落盘的 `AsyncSqliteSaver` —— 后者内部就是一条
+        plain DELETE,匹配不到行时同样静默),所以调用前不需要存在性预检。
         """
         await self._graph.checkpointer.adelete_thread(thread_id)
 

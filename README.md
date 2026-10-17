@@ -209,6 +209,7 @@ PostgreSQL is an **explicit opt-in**. It is selected in one place — the applic
 | `AUDIT_BACKEND` | `sqlite` (default) or `postgres`. A closed set: an empty value fails startup validation. |
 | `AUDIT_POSTGRES_DSN` | libpq connection string. Required when `AUDIT_BACKEND=postgres`. Read as a secret (`SecretStr`), so it never appears in a `repr`, a log line, or an error message. |
 | `AUDIT_DB_PATH` | Optional; SQLite backend only. Defaults to `data/audit.db`. |
+| `CHECKPOINT_DB_PATH` | Optional. Where the durable HITL checkpoints are stored. Defaults to `data/checkpoints.db`. Must **not** resolve to the same file as `AUDIT_DB_PATH` — the application refuses to start if it does, because the audit log and the checkpoint store are independent (see the persistence notes below). |
 
 **No automatic fallback, and no dual-write.** If `AUDIT_BACKEND=postgres` and the DSN is missing or blank, the application refuses to start — it never quietly writes to SQLite instead. There is exactly one audit store per process, and nothing is written to two places.
 
@@ -260,8 +261,8 @@ The offline suite does not collect these tests (`addopts = -m 'not postgres'` in
 
 ### Scope and limits
 
-- **Audit, incident, action-request and ownership data only.** The PostgreSQL backend stores the same four tables as the SQLite backend (`incidents`, `action_requests`, `audit_logs`, `thread_owners`). It does **not** store LangGraph checkpoints — checkpointing still uses `InMemorySaver`, which is in-process memory.
-- **HITL state does not survive a process restart.** Because checkpoints are in-process, a run paused at `human_approval` cannot be resumed by another process, and a restart loses the paused run. Moving audit data to PostgreSQL does not change this.
+- **Audit, incident, action-request and ownership data only.** The PostgreSQL backend stores the same four tables as the SQLite backend (`incidents`, `action_requests`, `audit_logs`, `thread_owners`). It does **not** store LangGraph checkpoints. Since v0.4.0 the checkpoints live in a separate local SQLite file (deliberately a different file from the audit database); that file is not part of this backend choice.
+- **HITL state is no longer tied to one process lifetime — but it is single-writer.** Since v0.4.0 the checkpoints are stored in a local SQLite file, so a run paused at `human_approval` is not lost when the process that paused it exits. This is **not** a distributed store: it is single-writer, and a SQLite file on a shared volume is not safe for multiple replicas. Moving audit data to PostgreSQL does not change any of this.
 - **Append-only is a database control, not tamper-proofing.** The triggers stop `UPDATE`, `DELETE`, and `TRUNCATE` issued through the application and through the runtime role. They do not stop a privileged administrator, a superuser, a table owner, or a forged `INSERT` of a plausible-looking record. The trail is append-only by construction, not notarised.
 - **Not production-ready.** No high-availability or backup story, no operational guarantees, no rate limiting, no JWT/OIDC and no signed audit. This is an opt-in persistence backend for a prototype.
 - **No performance or capacity claim.** The backend was exercised on one machine against one throwaway server. No throughput, latency, or scaling claim is made, and none should be inferred from it.
@@ -358,7 +359,11 @@ This is a research and engineering prototype. The limitations below are properti
 
 **Single-service, single-instance persistence.** The application is one API process. By default it is backed by a local SQLite file; a PostgreSQL audit backend can be enabled explicitly, but it is optional and the deployment remains a single instance with no cache and no coordination between replicas. Nothing here is claimed to scale horizontally, and the Compose topology is deliberately one service with one named volume.
 
-**Audit persistence is pluggable; checkpointing is not.** Choosing the PostgreSQL backend moves audit, incident, and action-request rows to PostgreSQL. It does **not** move LangGraph checkpoints: those still live in `InMemorySaver`, in process memory. A run paused at `human_approval` therefore cannot be resumed by another process, and a restart loses the paused run. This is unchanged by the backend choice.
+**Audit persistence is pluggable; checkpoint storage is a separate, local concern.** Choosing the PostgreSQL backend moves audit, incident, and action-request rows to PostgreSQL. It does **not** move LangGraph checkpoints: since v0.4.0 those live in a local SQLite file, deliberately a *different* file from the audit database (the application refuses to start if both point at the same path). A run paused at `human_approval` can therefore outlive the process that paused it, but this is a single-writer store, not a distributed one.
+
+**Checkpoint storage is trusted storage.** Checkpoints are deserialised through a narrow allow-list — a fixed set of project models, `datetime`, and the LangGraph `Interrupt` type — and anything else is rejected with an error rather than reconstructed. That closes the "construct an arbitrary object from a type identifier stored in the database" path. It does **not** make a writable checkpoint database safe: whoever can write that file can still replace or corrupt a paused run's state. Treat that file as you treat the audit database.
+
+**A recorded decision and a completed run are not atomic.** The audit store and the checkpoint store are independent and share no transaction, so a crash between "the decision was appended" and "the checkpoint advanced" is always possible. The decision is at most once by durable constraint; that is not the same claim as end-to-end exactly-once resume.
 
 **Append-only is enforced by the database, but it is not tamper-proofing.** The anti-mutation triggers stop `UPDATE`, `DELETE`, and `TRUNCATE` through the application and through the runtime role. They do not stop a privileged administrator, a superuser, a table owner, or a forged `INSERT` that looks plausible. Pending-approval state is derived rather than stored, which removes one class of silent rewrite, but the trail is append-only by construction — not notarised.
 

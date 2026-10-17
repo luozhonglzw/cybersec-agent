@@ -266,7 +266,7 @@ cybersec-agent/
 
 **尚未创建**：`app/graph/`（编排层实现为 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`docs/learning/`、`docs/interview/`。（`app/evaluation/` **不属于**"尚未创建"——它已存在并有两层评估实现，见上表与 §6。MCP **也不再**属于"尚未创建"：Phase 9.3-E 把它落在 `app/mcp/`，见 §8 Flow C。`docker/` **同样不再**属于"尚未创建"，但它不是"已创建"——Phase 9.3-G 的容器化刻意**不**建立 `docker/` 目录，实现是仓库根三个文件，见 §8 Flow E。）
 
-**data/ 的实际内容**：只有两个 seed 生成的 JSONL 文件，**没有** SQLite 或 Chroma 持久化文件。`audit.db` 由 `SqliteAuditStore` 在运行时按需创建（测试全部注入 `tmp_path`，仓库里不产生该文件）；checkpoint 走 `InMemorySaver`，**不落盘**。
+**data/ 的实际内容**：只有两个 seed 生成的 JSONL 文件，**没有** SQLite 或 Chroma 持久化文件。`audit.db` 与 `checkpoints.db` 都由运行时按需创建（测试全部注入 `tmp_path`，仓库里不产生这两个文件）。Phase v0.4.0 S1 起 checkpoint **落盘**（`app/security/checkpoint.py`），且刻意与审计库是**不同文件**。
 
 ## 8. 数据流设计
 
@@ -512,7 +512,7 @@ class AgentState(TypedDict, total=False):
 | security_events | ts, src_ip, dst_ip, username, action, status, user_agent, raw | **不是 SQLite 表**：实现为 JSONL 文件 `data/security_events.jsonl`（144 条），按需全量读入内存过滤 |
 | threat_intel | ioc_type, ioc_value, source, confidence, tags | **不是 SQLite 表**：实现为 JSONL 文件 `data/threat_intel.jsonl`（29 条 IOC） |
 | knowledge_docs | kind, key, title, text, metadata | **未实现**（RAG 顺延，见 §14 偏离说明） |
-| checkpoints | 框架自动管理 | 已实现，但用 `InMemorySaver` —— **进程内内存，不落盘**。`langgraph-checkpoint-sqlite` 未安装，所以"崩溃恢复"目前只在进程存活期内成立（跨进程恢复是 Phase 9/10 的事）。Phase v0.2.0 引入的 PostgreSQL 审计后端**不**承载 checkpoint，见 §11.6 |
+| checkpoints | 框架自动管理 | **已落盘**（Phase v0.4.0 S1）：`AsyncSqliteSaver` 写本地 SQLite 文件 `data/checkpoints.db`，与审计库是**不同文件**。反序列化走窄白名单（`app/security/checkpoint.py`），**不**使用 langgraph 的默认 ext 解码器。单写者，**不是**分布式存储。Phase v0.2.0 引入的 PostgreSQL 审计后端**不**承载 checkpoint，见 §11.6 |
 
 ChromaDB collections（`mitre_techniques` / `cve_entries` / `threat_reports`）：**未创建**（ChromaDB 未引入）。
 
@@ -572,7 +572,7 @@ AuditEvent = Literal[
 - **不自动回退**：`AUDIT_BACKEND=postgres` 而 DSN 缺失或为空 → 启动期 `ValidationError`，**绝不**悄悄退回 SQLite。`AuditBackend` 是封闭取值集，刻意不含 `auto` / `fallback` 之类的取值。
 - **不双写、不做数据迁移转换**：一个进程只有一个审计 store，不存在"两边都写"，也没有 SQLite ↔ PostgreSQL 的搬迁或自动转换。
 - **不做运行时 DDL**：运行期角色 `cybersec_app` 只有 `SELECT` / `INSERT`，没有 `UPDATE` / `DELETE` / `TRUNCATE`，也没有 `public` 上的 `CREATE`。建表与迁移只走 Alembic，且必须以 migration-owner 角色 `cybersec_migrator` 身份运行（基线迁移里有一条显式守卫拒绝以 `cybersec_app` 运行）。
-- **不是 checkpoint 存储**：PostgreSQL 只承载 `incidents` / `action_requests` / `audit_logs` / `thread_owners` 四张表。LangGraph checkpoint 仍是 `InMemorySaver`（进程内内存，**不落盘**），因此**跨进程恢复仍不可用**，停在 `human_approval` 的 run 在进程重启后无法恢复 —— 换审计后端**不改变**这一点。
+- **不是 checkpoint 存储**：PostgreSQL 只承载 `incidents` / `action_requests` / `audit_logs` / `thread_owners` 四张表。LangGraph checkpoint 自 Phase v0.4.0 S1 起落在**另一个本地 SQLite 文件**里（`data/checkpoints.db`），**不**进 PostgreSQL —— 换审计后端**不改变**这一点。
 - **不引入** PostgreSQL checkpointer、认证 / RBAC、Redis、RAG、多 Agent、后台调度器；默认拓扑 `compose.yaml` 不改动。
 
 #### append-only 的边界（必须一起说清楚）
@@ -662,6 +662,7 @@ PostgreSQL 侧与 SQLite 侧同样是**库层强制**的 append-only，且覆盖
 | 8 | 安全层 + HITL | **已完成（8.1-8.5）**：策略引擎 / 审批流 / append-only 审计 / SQLite 持久化 / triage 服务与 API |
 | 9 | 可观测 + 评估 | **部分完成**：蓝图的 **Trace / LLM-as-Judge 未实现**；但"评估"侧已交付**离线评估 harness**（`app/evaluation/`：runner / metrics / oracles / cases / golden）与**真实 provider 评估 harness**（`app/evaluation/llm/`：budget / runner / confinement / offline_guard / pilot），另有 9.1-A 的可靠性侧（审批超时生命周期 + 终态 checkpoint 清理 + `/chat` 依赖护栏对齐）。只读审计查询（9.3-F）与只读 MCP（9.3-E）也在 9.3 段落地，见 §8 Flow C / Flow D |
 | 10 | 工程化 | **部分推进**：Phase 9.3-G 已交付最小 Docker / Compose 容器化（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E）；Phase v0.2.0 交付了**可选**的 PostgreSQL 审计后端（Alembic 迁移 + 迁移/运行期角色分离 + 组合根装配 + 集成测试 + 独立 CI job + 文档，见 §11.6），SQLite 仍是默认。蓝图同格里的 Redis 等**未引入**，且**不是**既定必做项 —— 由需求驱动，而非"下一步就必须做" |
+| v0.4.0 S1 | **不在蓝图表内**：持久化 HITL checkpoint | Checkpoint / Saver 生命周期 / 跨进程恢复的**边界**（它是"能否继续"，不是"发生了什么"） | "进程重启后还能恢复暂停的审批吗；它和审计是同一件事吗" | **待提交** —— I1 实现阶段未获授权 commit；是否纳入版本由 Controller 决定 |
 
 > 说明：§12 蓝图表把"工程化"写成 `Docker/PG/Retry/CI/文档` 一组交付物，那是**蓝图的分组**，不是"这几项都要做"的承诺。实际状态见上表：CI 与容器化已交付；PostgreSQL 已作为**可选**审计后端引入（默认仍是 SQLite，见 §11.6），Redis 仍未引入，当前默认架构（单进程 + SQLite）也不依赖它们。是否引入由真实需求决定。
 
@@ -938,13 +939,14 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
  ↓
 持久化：SQLite（**默认**：业务表 + 审计，append-only，8 条禁改触发器）
         或 PostgreSQL（**可选**审计后端，见 §11.6：同样 append-only，12 条禁改触发器）
-        checkpoint = InMemorySaver（进程内内存，**不落盘**）—— 换审计后端不影响它
+        checkpoint = 本地 SQLite 文件 data/checkpoints.db（Phase v0.4.0 S1；与审计库**不同文件**，单写者）
  ↓
 容器化运行边界（Phase 9.3-G，可选部署路径，见 §8 Flow E）
    Dockerfile       单阶段镜像：uv 官方 base + 锁定运行时依赖 + app/ + 构建期生成演示数据
    compose.yaml     1 个服务 api（端口 8000:8000）+ 1 个命名卷 audit-data
    /app/data        镜像烘焙的确定性演示输入（security_events.jsonl / threat_intel.jsonl）
    /data/audit.db   命名卷承载的可变审计状态（卷只挂 /data，不遮蔽 /app/data）
+   /data/checkpoints.db 同一卷上的 HITL checkpoint（与审计库**不同文件**；单写者，非分布式）
    运行时配置       由 .env / 宿主环境提供；镜像内无凭据
    MCP              不在 Compose 内，仍是本地 stdio（见 §8 Flow C）
 ```
@@ -953,7 +955,7 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
 - 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided` / `approval.timeout` —— 6 个全部有生产写入路径（`approval.timeout` 由 Phase 9.1-A 的惰性超时补齐）
 - **部署面（Phase 9.3-G）**：容器化只增加部署文件（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`），**不改变**上面任何一条运行时语义 —— 图结构、工具集、审计写入路径、HITL 行为全部不变。当前是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）。
-- 测试基线：默认离线运行 **1,737 passed / 366 deselected**（`pytest -q`）。被取消收集的 366 例是 `postgres` 标记的集成用例，需要真实 PostgreSQL，由独立的 CI job 显式运行（`pytest -m postgres`）。离线计数与 hermetic 性质来自**本地实测**。**远端 CI 已执行**：最新一次经验证的观测是 run `37737872748`（提交 `4334b14d`），其中 `test` = **1,517 passed / 311 deselected / 2 warnings**、`test-postgres` = **311 passed / 1,517 deselected / 7 warnings**，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`（GitHub-hosted Ubuntu 24.04，见 §14）。以上均为**某一次特定 run 的记录**，不是对当前 HEAD 的长期保证 —— 最新结果以 Actions 页为准。
+- 测试基线（**发布前本地实测**，Phase v0.4.0 GATE-2，未提交工作树）：默认离线运行 **1,838 passed / 373 deselected**（`pytest -q`）。被取消收集的 373 例是 `postgres` 标记的集成用例，需要真实 PostgreSQL，由独立的 CI job 显式运行（`pytest -m postgres`），本地实测 **373 passed / 1,838 deselected**。全量收集 **2,211** 例（= 1,838 + 373）。以上是**本地验证值**，不是对当前 HEAD 的长期保证，也不表示远端 CI 已运行过这个工作树。**远端 CI 已执行**：最新一次经验证的观测是 run `37737872748`（提交 `4334b14d`），其中 `test` = **1,517 passed / 311 deselected / 2 warnings**、`test-postgres` = **311 passed / 1,517 deselected / 7 warnings**，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`（GitHub-hosted Ubuntu 24.04，见 §14）。以上均为**某一次特定 run 的记录**，不是对当前 HEAD 的长期保证 —— 最新结果以 Actions 页为准。
 
 ## 尚未实现（按 §12 Roadmap）
 
@@ -961,8 +963,8 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - LLM 风险复核层——Phase 8 只做了规则侧；LLM 复核未实现
 - 超时的**主动**触发——9.1-A 只做惰性判定（挂在请求入口），没有后台调度器；长时间无请求时过期 pending 不会被及时收掉
 - 超时的**观测面**——`TriageOutcome.status` 不新增 `timed_out`，也没有"查询 thread 状态"的端点，所以超时在 API 响应里只以 409 的形式出现，终态事实只能从 `audit_logs` 读
-- 跨进程 checkpoint 恢复——当前 `InMemorySaver` 只在进程存活期内有效（`langgraph-checkpoint-sqlite` 未安装）
-- `completed` / `allowed` 的 checkpoint 清理——9.1-A 的清理范围只有 `failed` 与 `timed_out`，这两个终态仍留在内存里
+- 多副本 / 分布式 checkpoint——Phase v0.4.0 S1 已让 checkpoint 落盘（本地文件，单写者），但**没有**分布式或多副本 checkpoint 存储
+- `completed` / `allowed` 的 checkpoint 清理——9.1-A 的清理范围只有 `failed` 与 `timed_out`，这两个终态仍留在 checkpoint 存储里（Phase v0.4.0 S1 起是本地 SQLite 文件，**不再**占用进程内存）。清理缺口本身未变：这两个终态不会被删。
 - **不可否认性**——认证（静态 API Key，A3-1）与可信 `actor`（取自已认证主体，A3-3）已落地；仍**没有**签名、也**没有**把"客户端自述身份"与"已验证身份"分别记录（A6 计划补 `verified_subject` + 签名）。JWT/OIDC、限流、审计导出 / 聚合、游标分页均未引入
 - 审计读接口的**导出 / 聚合 / 游标分页**——只读查询端点 `GET /audit/events` 已于 Phase 9.3-F 落地（见 §8 Flow D）
 - Observability / Evaluation——Phase 9
@@ -1010,15 +1012,15 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 | `tests/test_evaluation_llm/` | 真实 provider 评估 harness：budget / confinement / offline_guard / runner / pilot 等（全部离线，不触网） |
 | `tests/test_postgres/` | 真实 PostgreSQL 集成：连接 / schema / 迁移 / 角色与触发器 / 排序 / 存储契约（双后端参数化）/ 并发 / 应用集成（**默认不收集**，需要真实实例） |
 
-当前基线：默认运行 **1,737 passed / 366 deselected**（`pytest -q`，本地实测）；366 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行。最新远端 CI 观测是 run `37737872748`（提交 `4334b14d`）：`test` = 1,517 passed / 311 deselected、`test-postgres` = 311 passed / 1,517 deselected，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测（Phase 9.3-G 文档提交 `b4f9d4e4` 的 1,463 passed）见 §14。
+当前基线（**发布前本地实测**，Phase v0.4.0 GATE-2，未提交工作树）：默认运行 **1,838 passed / 373 deselected**（`pytest -q`）；373 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行，本地实测 373 passed / 1,838 deselected；全量收集 2,211 例。最新远端 CI 观测是 run `37737872748`（提交 `4334b14d`）：`test` = 1,517 passed / 311 deselected、`test-postgres` = 311 passed / 1,517 deselected，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测（Phase 9.3-G 文档提交 `b4f9d4e4` 的 1,463 passed）见 §14。
 
 ### 6. hermetic 约束（Phase 8.5 收口）
 
-**全部 78 个测试模块（`tests/` 下所有 `test_*.py`，其中 9 个是需要真实 PostgreSQL 的集成模块）都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
+**全部 86 个测试模块（`tests/` 下所有 `test_*.py`，其中 10 个是需要真实 PostgreSQL 的集成模块）都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
 
 ```bash
 cd <任意不含 data/ 的目录>
-<python> -m pytest <repo>/tests -q              # 期望:1,737 passed, 366 deselected
+<python> -m pytest <repo>/tests -q              # 期望:1,838 passed, 373 deselected
 <python> -m pytest <repo>/tests -m postgres -q  # 需真实 PostgreSQL;同样不读仓库 data/
 ```
 

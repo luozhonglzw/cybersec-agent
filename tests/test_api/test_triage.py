@@ -27,7 +27,12 @@ from app.api.main import create_app
 from app.core.agent import SecurityAgent
 from app.core.graph import HitlConfig, create_agent_graph
 from app.core.llm import FakeLLMClient
-from app.core.triage import TriageService
+from app.core.triage import TriageDataUnavailableError, TriageService
+from app.security.audit import build_audit_record
+from app.security.checkpoint import (
+    CheckpointBackendUnavailableError,
+    CheckpointPayloadRejectedError,
+)
 from app.security.store import SqliteAuditStore
 from tests.conftest import APPROVER_HEADERS, TEST_APPROVER_SUBJECT
 
@@ -385,3 +390,255 @@ def test_every_triage_error_subclass_is_mapped_to_a_status():
     assert len(subclasses) >= 4  # Unknown / NotAwaiting / CheckpointLost / DataUnavailable
     for cls in subclasses:
         assert _triage_status_for(cls("x")) != 500, cls.__name__
+
+
+# =====================================================================
+# D. v0.4.0 S1 恢复护栏:checkpoint 故障必须**准确归因**
+# =====================================================================
+#
+# 被锁定的性质(PHASE v0.4.0-D4 §5.2 / §5.4):
+#
+#   checkpoint 后端不可用 / 载荷损坏 → **503**,
+#   且**绝不**退化成 404("未知 thread")或 409("checkpoint 丢失")。
+#
+# 为什么这条重要:404 与 409 都是对世界的**错误陈述** —— 数据还在,只是
+# 读不到 / 解不开。把它们说成"不存在"或"已完成",会让运维按错误的剧本
+# 处置(去查 thread_id 拼写、去让用户重新审批),而不是去查磁盘。
+#
+# 反同义反复的配对控制:`test_generic_checkpointer_failure_still_returns_500`
+# 注入一个**非** checkpoint 族的异常,断言它仍然是 500。没有这一条,
+# "503" 可能只是某个过宽的 except 把一切都吞了。
+
+
+class _ArmableSaver(InMemorySaver):
+    """可切换故障的 checkpoint 后端 —— 装备之前行为与 `InMemorySaver` 完全一致。
+
+    必须"先正常、后故障":/resume 的前置步骤(读审计做对象授权、写线程归属)
+    都走**审计**存储,与 checkpoint 无关;但要先有一次成功的 /triage 才能
+    产生可恢复的 thread。一个从始至终都失败的 saver 只会让 /triage 失败,
+    根本走不到 /resume 的那条路径。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed: BaseException | None = None
+
+    async def aget_tuple(self, config):  # type: ignore[override]
+        if self.armed is not None:
+            raise self.armed
+        return await super().aget_tuple(config)
+
+
+def _flaky_client(data_paths, store, saver) -> TestClient:
+    logs, intel = data_paths
+    return TestClient(
+        create_app(
+            triage_service=_service(store, logs, intel, saver), audit_store=store
+        )
+    )
+
+
+def test_resume_checkpoint_backend_outage_returns_503(data_paths, store):
+    """checkpoint 后端不可用 → 503(不是 404,也不是 409)。"""
+    logs, intel = data_paths
+    saver = _ArmableSaver()
+    owner = _flaky_client(data_paths, store, saver)
+    paused = _pause(owner)
+
+    saver.armed = CheckpointBackendUnavailableError("backend down")
+
+    approver = TestClient(
+        create_app(
+            triage_service=_service(store, logs, intel, saver), audit_store=store
+        ),
+        headers=APPROVER_HEADERS,
+    )
+    resp = approver.post("/resume", json={
+        "thread_id": paused["thread_id"], "status": "approved", "operator": "a",
+    })
+
+    assert resp.status_code == 503, resp.text
+    assert resp.status_code not in (404, 409)
+
+
+def test_triage_checkpoint_backend_outage_returns_503(data_paths, store):
+    """发起判定时 checkpoint 后端就不可用 → 503(而不是 500 / 404)。"""
+    saver = _ArmableSaver()
+    saver.armed = CheckpointBackendUnavailableError("backend down")
+    client = _flaky_client(data_paths, store, saver)
+
+    resp = client.post(
+        "/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS}
+    )
+
+    assert resp.status_code == 503, resp.text
+
+
+def test_resume_corrupted_checkpoint_payload_returns_503(data_paths, store):
+    """**孤儿 / 损坏 checkpoint** → 503,绝不能被说成"审批已完成"(409)。
+
+    这是 D4 §5.2 的直接检验:载荷解不开时,上层若把它当成"状态为空",
+    就会一路走到"没有待审批项"→ 409,那是对世界的错误陈述。
+    """
+    logs, intel = data_paths
+    saver = _ArmableSaver()
+    owner = _flaky_client(data_paths, store, saver)
+    paused = _pause(owner)
+
+    saver.armed = CheckpointPayloadRejectedError("payload rejected")
+
+    approver = TestClient(
+        create_app(
+            triage_service=_service(store, logs, intel, saver), audit_store=store
+        ),
+        headers=APPROVER_HEADERS,
+    )
+    resp = approver.post("/resume", json={
+        "thread_id": paused["thread_id"], "status": "approved", "operator": "a",
+    })
+
+    assert resp.status_code == 503, resp.text
+    assert resp.status_code != 409
+
+
+def test_generic_checkpointer_failure_still_returns_500(data_paths, store):
+    """**配对控制**:非 checkpoint 族的异常仍然是 500。
+
+    证明上一条的 503 来自**针对 checkpoint 错误族**的翻译,而不是某个
+    过宽的 except 把一切都吞成 503。
+    """
+    logs, intel = data_paths
+    saver = _ArmableSaver()
+    owner = _flaky_client(data_paths, store, saver)
+    paused = _pause(owner)
+
+    saver.armed = RuntimeError("some unrelated programming defect")
+
+    approver = TestClient(
+        create_app(
+            triage_service=_service(store, logs, intel, saver), audit_store=store
+        ),
+        headers=APPROVER_HEADERS,
+        raise_server_exceptions=False,
+    )
+    resp = approver.post("/resume", json={
+        "thread_id": paused["thread_id"], "status": "approved", "operator": "a",
+    })
+
+    assert resp.status_code == 500, resp.text
+
+
+def test_checkpoint_outage_detail_leaks_no_path(data_paths, store):
+    """503 的 detail 不得回显路径 / 内部结构(与既有 503 口径一致)。"""
+    logs, intel = data_paths
+    saver = _ArmableSaver()
+    saver.armed = CheckpointBackendUnavailableError("C:/secret/path/db")
+    client = _flaky_client(data_paths, store, saver)
+
+    resp = client.post(
+        "/triage", json={"indicator": BRUTE_FORCE_IP, "approvers": APPROVERS}
+    )
+
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert "secret" not in detail
+    assert "/" not in detail and "\\" not in detail
+
+
+# =====================================================================
+# E. v0.4.0 S1 崩溃窗口:审计已写、checkpoint 未推进 ⇒ fail closed
+# =====================================================================
+#
+# D4 §5.6 明确:审计追加与 checkpoint 推进**不可能**在同一事务里完成,
+# 因此这一窗口无法消除。S1 的契约是"**可检测且 fail closed**",不是
+# "已消除"。本用例就是那条契约的检验。
+
+
+def test_audit_decided_without_checkpoint_advance_is_fail_closed(
+    client, approver_client, store
+):
+    """崩溃窗口的直接模拟:审计已有 approval.decided,但 checkpoint 仍停在暂停点。
+
+    现实成因:进程在 `append_audit` 返回之后、checkpoint 落盘之前被杀死。
+    此时 /resume 必须**拒绝**(409),而不是:
+      - 200 再跑一遍(会产生第二个决定 —— 唯一索引会拦,但那是兜底);
+      - 或静默返回陈旧决定。
+
+    这条同时验证了 TASK 4 的唯一性约束在**崩溃恢复**路径上也在起作用。
+    """
+    paused = _pause(client)
+    thread_id = paused["thread_id"]
+    # 必须用**真实**的 interrupt_id:决策身份是 (thread_id, interrupt_id),
+    # 用一个编造的 id 只会造出**另一个**身份,唯一索引当然不会拦 —— 那样
+    # 测的就不是崩溃窗口,而是"两个不同暂停各批一次"(那是合法行为)。
+    real_interrupt_id = paused["interrupt_id"]
+    assert real_interrupt_id, "暂停响应必须给出本次的 interrupt_id"
+
+    # 模拟"审计已写、checkpoint 未推进":补一条**同一身份**的决定审计行,
+    # 但**不**碰 checkpoint —— 图仍然停在 human_approval。
+    store.append_audit(build_audit_record(
+        "approval.decided",
+        actor="alice",
+        thread_id=thread_id,
+        interrupt_id=real_interrupt_id,
+        outcome="approved",
+    ))
+
+    resp = approver_client.post("/resume", json={
+        "thread_id": thread_id, "status": "approved", "operator": "a",
+    })
+
+    assert resp.status_code == 409, resp.text
+    decided = [
+        r for r in store.list_audit(thread_id=thread_id)
+        if r.event == "approval.decided"
+    ]
+    assert len(decided) == 1, "崩溃窗口不得产生第二个决定"
+
+
+async def test_corrupted_durable_checkpoint_is_a_503_domain_error(
+    tmp_path, data_paths
+):
+    """**不用注入**:真实落盘 saver + 真实损坏的 checkpoint 行。
+
+    上面前三条用的是注入式 saver(为了拿到 HTTP 状态码)。这条把整条真实
+    路径走一遍:真实 `SafeAsyncSqliteSaver` 暂停 → 把 `checkpoints` 表里的
+    载荷改成非法 msgpack → 恢复时严格反序列化器拒绝 → 服务层翻译成
+    `TriageDataUnavailableError`(→503),而不是让它变成 500 / 409。
+    """
+    import sqlite3
+
+    import aiosqlite
+
+    from app.security.checkpoint import SafeAsyncSqliteSaver, build_checkpoint_serde
+
+    logs, intel = data_paths
+    store = SqliteAuditStore(tmp_path / "audit.db")
+    ckpt_db = tmp_path / "checkpoints.db"
+
+    conn = await aiosqlite.connect(str(ckpt_db))
+    saver = SafeAsyncSqliteSaver(conn, serde=build_checkpoint_serde())
+    await saver.setup()
+    service = _service(store, logs, intel, saver)
+
+    try:
+        result = await service.triage(indicator=BRUTE_FORCE_IP)
+        thread_id = result.outcome.thread_id
+        assert result.interrupt_id is not None
+
+        # 真实损坏:把载荷换成非法 msgpack,并保持标签是合法的 'msgpack'。
+        raw = sqlite3.connect(ckpt_db)
+        try:
+            raw.execute(
+                "UPDATE checkpoints SET checkpoint = ? WHERE thread_id = ?",
+                (b"\xc1", thread_id),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        with pytest.raises(TriageDataUnavailableError):
+            await service.resume(thread_id, status="approved", operator="alice")
+    finally:
+        await conn.close()
+

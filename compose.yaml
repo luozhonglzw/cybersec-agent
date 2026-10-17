@@ -2,7 +2,7 @@
 #
 # Exactly one service and one named volume:
 #   - api          : the HTTP/FastAPI container
-#   - audit-data   : mutable SQLite audit state, mounted at /data
+#   - audit-data   : mutable SQLite state (audit + HITL checkpoints), at /data
 #
 # The baked synthetic demo data lives at /app/data (inside the image) and is
 # deliberately NOT on the volume, so it is never shadowed by the mount.
@@ -18,6 +18,12 @@ services:
         required: false
     environment:
       AUDIT_DB_PATH: /data/audit.db
+      # v0.4.0 S1 — durable HITL checkpoints. Deliberately a DIFFERENT file from
+      # the audit database: the two are independent stores (the audit log is
+      # authoritative for what happened, the checkpoint store for whether a run
+      # can continue), and Settings refuses at startup if both point at one path.
+      # They share the volume because both must survive a container restart.
+      CHECKPOINT_DB_PATH: /data/checkpoints.db
     volumes:
       - audit-data:/data
 

@@ -95,6 +95,9 @@ from app.schemas.response import ResponseAction, ResponsePlan
 # 必须响亮失败"这两条是承重性质,两侧各写一份迟早会分叉。
 # 只 import 这几个纯函数,不 import 那个类,也不触碰 store.py 的任何内容。
 from app.security.store import (
+    DecisionAlreadyRecordedError,
+    _decision_identity_columns,
+    _decision_identity_label,
     _deserialize_approvers,
     _from_iso,
     _serialize_approvers,
@@ -317,25 +320,68 @@ class PostgresAuditStore:
     # ---------- 写:audit_logs ----------
 
     def append_audit(self, record: AuditRecord) -> None:
-        """追加一条审计记录(append-only)。"""
+        """追加一条审计记录(append-only)。
+
+        决策事件(`approval.decided` / `approval.timeout`)另外受**存储层
+        唯一性**约束 —— 由迁移 0003 的两条部分唯一索引强制(本类不做运行时
+        schema 变更,运行时角色也没有 DDL 权限)。重复写入抛
+        `DecisionAlreadyRecordedError` —— fail closed,既不是静默覆盖,也不是
+        upsert。非决策事件的完整性错误原样抛出,不被解释成业务冲突。
+        """
         with self._connection() as conn:
-            conn.execute(
-                f"INSERT INTO audit_logs ({_AUDIT_LOG_COLUMNS})"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    record.id,
-                    _to_iso(record.ts),
-                    record.actor,
-                    record.event,
-                    record.incident_id,
-                    record.thread_id,
-                    record.interrupt_id,
-                    record.outcome,
-                    record.reason,
-                    record.plan_digest,
-                    json.dumps(record.detail, ensure_ascii=False),
-                ),
-            )
+            try:
+                conn.execute(
+                    f"INSERT INTO audit_logs ({_AUDIT_LOG_COLUMNS})"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        record.id,
+                        _to_iso(record.ts),
+                        record.actor,
+                        record.event,
+                        record.incident_id,
+                        record.thread_id,
+                        record.interrupt_id,
+                        record.outcome,
+                        record.reason,
+                        record.plan_digest,
+                        json.dumps(record.detail, ensure_ascii=False),
+                    ),
+                )
+            except psycopg.IntegrityError as exc:
+                raise self._classify_integrity_error(conn, record, exc) from exc
+
+    def _classify_integrity_error(
+        self, conn, record: AuditRecord, exc: psycopg.IntegrityError
+    ) -> BaseException:
+        """与 SQLite 版**同语义**:按**身份回查**判定,不解析驱动消息。
+
+        刻意与 SQLite 版保持一致而不是改用 `exc.diag.constraint_name`:
+        后者本机**无法实测**(PostgreSQL 不可达),而"两侧行为同构"是本阶段
+        的承重性质 —— 宁可少用一个未经实测的便利属性,也不要让两个后端在
+        同一不变量上产生不同判定。身份定义本身取自 `store.py` 的
+        `_DECISION_IDENTITIES`,是单一真相源。
+
+        回查可以安全执行:连接池是 autocommit 的,失败的 INSERT 不会留下
+        aborted 事务(SQLite 侧则是语句级回滚)。
+        """
+        label = _decision_identity_label(record)
+        if label is None:
+            return exc
+        columns = _decision_identity_columns(record.event) or ()
+        # `IS NOT DISTINCT FROM` 是 PostgreSQL 的 NULL 安全等值比较
+        # (SQLite 的 `IS` 在 PG 里不是同一个东西)。
+        where = " AND ".join(
+            f"{column} IS NOT DISTINCT FROM %s" for column in columns
+        )
+        row = conn.execute(
+            f"SELECT 1 FROM audit_logs WHERE event = %s AND {where} LIMIT 1",
+            (record.event, *(getattr(record, column) for column in columns)),
+        ).fetchone()
+        if row is None:
+            return exc
+        return DecisionAlreadyRecordedError(
+            f"该决策身份已被持久记录,拒绝重复写入({label})"
+        )
 
     # ---------- 写:thread_owners(v0.3.0-A3-2) ----------
 

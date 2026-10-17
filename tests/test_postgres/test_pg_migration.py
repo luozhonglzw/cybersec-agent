@@ -39,7 +39,13 @@ _MIGRATION_0002_PATH = (
 )
 
 BASELINE_REVISION = "0001_baseline_audit_schema"
-HEAD_REVISION = "0002_thread_ownership"
+#: 0002 自身的 revision —— 它与 head 是**两个**概念,别再混用同一个常量。
+#: (v0.4.0 S1 引入 0003 之后,`HEAD_REVISION` 不再等于 0002 的 revision;
+#: 下面 `test_migration_0002_declares_the_0001_baseline_as_its_predecessor`
+#: 断言的是 **0002 模块自己的** revision,所以必须用这个常量。)
+REVISION_0002 = "0002_thread_ownership"
+#: v0.4.0 S1 / TASK 4:决策身份的存储层唯一性(两条部分唯一索引)。
+HEAD_REVISION = "0003_decision_uniqueness"
 _EXPECTED_TABLES = {"incidents", "action_requests", "audit_logs"}
 #: A3-2-FIX2 起归属是**单行**表(旧设计里的 `thread_approvers` 已移除)。
 _OWNERSHIP_TABLES = {"thread_owners"}
@@ -227,7 +233,7 @@ def test_migration_creates_nine_append_only_triggers() -> None:
 def test_migration_0002_declares_the_0001_baseline_as_its_predecessor() -> None:
     """0002 必须**前向**挂在 0001 上 —— 绝不重写 0001,也不分叉。"""
     module = _load_migration_0002_module()
-    assert module.revision == HEAD_REVISION
+    assert module.revision == REVISION_0002
     assert module.down_revision == BASELINE_REVISION
 
 
