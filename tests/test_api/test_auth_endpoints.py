@@ -79,8 +79,8 @@ VIEWER = _auth(RAW_VIEWER)
 #: 冻结设计 D-3:这四条文档路由保持公开。
 PUBLIC_ROUTE_PATHS = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 
-#: 四条业务路由(全部要求认证)。
-BUSINESS_ROUTES = ("/chat", "/triage", "/resume", "/audit/events")
+#: 业务路由(全部要求认证)。v0.5.0-S2-C 起加入 `/ask`。
+BUSINESS_ROUTES = ("/chat", "/triage", "/resume", "/audit/events", "/ask")
 
 
 # =====================================================================

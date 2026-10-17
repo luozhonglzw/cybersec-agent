@@ -19,11 +19,15 @@ core 层只声明依赖(构造函数参数),不自己去找依赖。
 `build_audit_store`。图节点、TriageService 与端点里没有任何
 "是 sqlite 还是 postgres" 的分支;它们只依赖 `AuditStore` 契约。
 
-认证与端点准入(Phase v0.3.0-A3-1)同样在本模块装配:4 条业务路由各挂
+认证与端点准入(Phase v0.3.0-A3-1)同样在本模块装配:5 条业务路由各挂
 一条**显式 FastAPI 依赖**(`require_analyst` / `require_approver` /
 `require_principal`),认证密钥环在 `lifespan` 里构建一次并挂到
 `app.state.auth_keyring`。文档路由(`/openapi.json` / `/docs` /
 `/docs/oauth2-redirect` / `/redoc`)按冻结设计保持公开。
+
+`/ask`(v0.5.0-S2-C)是第五条业务路由:准入与 `/chat` 相同(analyst /
+approver),但走**独立的**图与工具集(只有一个只读检索工具)。它的装配
+见 `build_rag_ask_service`,编排与 groundedness 见 `app/core/rag_ask.py`。
 
 **对象级授权与可信 actor(Phase v0.3.0-A3-3)也在这里** —— 因为它们是
 **HTTP 边界的判定**(状态码是 HTTP 概念),而且需要同时看到已认证主体与
@@ -50,9 +54,13 @@ from fastapi.responses import JSONResponse
 from psycopg.conninfo import conninfo_to_dict
 
 from app.api.schemas import (
+    AskRequest,
+    AskResponse,
     ChatRequest,
     ChatResponse,
+    Citation,
     ResumeRequest,
+    RetrievalInfo,
     TriageRequest,
     TriageResponse,
 )
@@ -60,6 +68,7 @@ from app.core.agent import SecurityAgent
 from app.core.config import Settings, get_settings
 from app.core.graph import HitlConfig, create_agent_graph
 from app.core.llm import LLMClient, LLMClientError
+from app.core.rag_ask import AskOutcome, GroundedAskService
 from app.core.triage import (
     NotAwaitingApprovalError,
     TriageDataUnavailableError,
@@ -67,6 +76,13 @@ from app.core.triage import (
     TriageResult,
     TriageService,
     UnknownThreadError,
+)
+from app.rag import (
+    DEFAULT_KNOWLEDGE_DIR,
+    HashingEmbedder,
+    RagError,
+    build_in_memory_retriever,
+    load_corpus,
 )
 from app.schemas.approval import utc_now
 from app.schemas.audit import AuditEvent, AuditRecord
@@ -82,6 +98,7 @@ from app.security.checkpoint import SafeAsyncSqliteSaver, build_checkpoint_serde
 from app.security.store import SqliteAuditStore
 from app.security.store_postgres import POSTGRES_STORE_ERRORS, PostgresAuditStore
 from app.security.store_protocol import AuditStore
+from app.tools.search_knowledge import build_search_knowledge_tool
 
 logger = structlog.get_logger(__name__)
 
@@ -380,10 +397,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # 第一个 /triage 上失败,而那比启动失败难诊断得多。
         await checkpointer.setup()
 
-        # 一个 LLMClient 给两条链路共用:bind_tools 每次返回新的 runnable,
+        # 一个 LLMClient 给三条链路共用:bind_tools 每次返回新的 runnable,
         # 不存在互相污染;少建一个 ChatOpenAI 实例。
         llm = LLMClient()
         app.state.agent = SecurityAgent(llm)
+        # /ask 的装配是**独立的**:它自己建图、自己绑工具(只有一个只读检索
+        # 工具)。知识库不可用时这里返回 None → /ask 503,其余端点照常。
+        app.state.rag_ask = build_rag_ask_service(llm)
         app.state.triage_service = TriageService(
             create_agent_graph(
                 llm,
@@ -480,6 +500,23 @@ def _require_store(request: Request) -> AuditStore:
     return store
 
 
+def _require_rag_ask(request: Request) -> GroundedAskService:
+    """取出进程级 `GroundedAskService`(与 _require_agent 同构)。
+
+    缺失有**两种**来源,给同一个 503:
+
+    1. 部署没有可用知识库(启动期装配失败 → `None`);
+    2. 测试只注入了其它依赖,没注入本服务。
+
+    两者对客户端是同一个事实:"这条能力当前不可用"。区分它们只会把
+    部署内部状态暴露出去,对调用方没有任何用处。
+    """
+    service = getattr(request.app.state, "rag_ask", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="rag service unavailable")
+    return service
+
+
 def _to_response(result: TriageResult) -> TriageResponse:
     """TriageResult → HTTP 响应模型(纯协议转换,无业务判断)。"""
     return TriageResponse(
@@ -488,10 +525,73 @@ def _to_response(result: TriageResult) -> TriageResponse:
     )
 
 
+def _to_ask_response(outcome: AskOutcome) -> AskResponse:
+    """AskOutcome → HTTP 响应模型(纯协议转换,无业务判断)。
+
+    这里**只**搬运 S1 冻结的五个字段。服务端内部还有两样东西刻意不出现:
+
+    - `unverified_citations` / `malformed_markers` —— 它们**参与** groundedness
+      判定(N-4),但 N-5 要求保持 S1 冻结的响应体,所以只留在服务端日志里;
+    - `messages` / 工具原始输出 —— 含 system prompt 与未截断的工具结果,
+      交出去等于把"模型看到了什么"变成对外契约。
+    """
+    return AskResponse(
+        answer=outcome.answer,
+        grounded=outcome.grounded,
+        citations=[
+            Citation(
+                citation_id=citation.citation_id,
+                source_id=citation.source_id,
+                source_type=citation.source_type,
+                title=citation.title,
+                url=citation.url,
+                score=citation.score,
+            )
+            for citation in outcome.citations
+        ],
+        invalid_citations=list(outcome.invalid_citations),
+        retrieval=RetrievalInfo(
+            status=outcome.status,
+            hit_count=outcome.hit_count,
+            top_k=outcome.top_k,
+        ),
+    )
+
+
+def build_rag_ask_service(llm_client: LLMClient) -> GroundedAskService | None:
+    """装配 `/ask` 专用链路:一个只读检索工具 + 一个独立对话图。
+
+    **显式 opt-in(N-7)**:`SecurityAgent(llm, tools=[tool])` 传入的是**非空**
+    列表,而 `SecurityAgent.__init__` 只在 `tools` 为假值时才回退到
+    `DEFAULT_TOOLS` —— 因此这条链路里 `query_security_logs_tool` /
+    `query_threat_intel_tool` / `analyze_risk_tool` / `plan_response_tool`
+    一个都不在。它不是"默认工具集减去几个",而是"只有一个"。
+
+    为什么不复用 `/chat` 的 agent:`/chat` 用的是四个默认工具(含
+    `plan_response_tool` 这类会产出处置计划的工具)。`/ask` 的语义是
+    "依据知识库回答并给出引用",把处置类工具挂进来既扩大能力面,也让
+    "回答里的引用"可能来自与知识库无关的工具输出。
+
+    装配失败(语料缺失 / 清单不符 / 索引不匹配)→ 返回 `None`,
+    `/ask` 给出固定的 **503**;`/chat`、`/triage` 与 `/audit/events`
+    完全不受影响。这是刻意的降级方向:知识库坏掉不该让整个进程起不来。
+    """
+    try:
+        corpus = load_corpus(DEFAULT_KNOWLEDGE_DIR)
+        retriever = build_in_memory_retriever(corpus, HashingEmbedder())
+    except RagError as exc:
+        # 只记原因码:路径、集合名、语料内容都不进日志。
+        logger.warning("rag_ask_unavailable", reason=exc.reason)
+        return None
+    tool = build_search_knowledge_tool(retriever)
+    return GroundedAskService(SecurityAgent(llm_client, tools=[tool]))
+
+
 def create_app(
     agent: SecurityAgent | None = None,
     triage_service: TriageService | None = None,
     audit_store: AuditStore | None = None,
+    rag_ask: GroundedAskService | None = None,
 ) -> FastAPI:
     """构建 FastAPI 应用。
 
@@ -500,18 +600,24 @@ def create_app(
         triage_service: 已组装好的 TriageService(测试注入 Fake graph 用);
         audit_store: 已组装好的**任意** AuditStore 实现(测试注入只读审计
                      端点用)。类型是契约而不是 `SqliteAuditStore` ——
-                     PostgreSQL 后端同样可以被注入。
+                     PostgreSQL 后端同样可以被注入;
+        rag_ask: 已组装好的 `/ask` 服务(测试注入脚本化 LLM 与固定检索夹具用)。
 
     注入**任意一个**即视为"调用方接管了装配",lifespan 不再运行 ——
     否则它会去构造真实 LLMClient(需要 .env),测试根本跑不起来。
     代价是只注入 agent 时 /triage 与 /audit/events 不可用(503),以此类推;
-    生产路径 create_app() 不带参数,三者都会装配好(后端由
+    生产路径 create_app() 不带参数,四者都会装配好(后端由
     Settings.audit_backend 决定)。
 
     注意:注入式装配**不**接管资源释放 —— 若注入的是 PostgresAuditStore,
     由注入方自己负责 `close()`(lifespan 没运行,不会替你关池)。
     """
-    use_lifespan = agent is None and triage_service is None and audit_store is None
+    use_lifespan = (
+        agent is None
+        and triage_service is None
+        and audit_store is None
+        and rag_ask is None
+    )
     app = FastAPI(
         title="CyberSec Agent",
         version="0.4.0",
@@ -523,6 +629,8 @@ def create_app(
         app.state.triage_service = triage_service
     if audit_store is not None:
         app.state.audit_store = audit_store
+    if rag_ask is not None:
+        app.state.rag_ask = rag_ask
 
     @app.middleware("http")
     async def correlation_middleware(request: Request, call_next):
@@ -634,6 +742,51 @@ def create_app(
             payload.message, request_id=_request_id_of(request)
         )
         return ChatResponse(response=reply)
+
+    @app.post(
+        "/ask",
+        response_model=AskResponse,
+        # 与 /chat 同一准入:analyst / approver。viewer 只持只读审计权限。
+        dependencies=[Depends(require_analyst)],
+    )
+    async def ask(payload: AskRequest, request: Request) -> AskResponse:
+        """带引用的知识库问答:检索 → 回答 → 引用校验 → 结构化 groundedness。
+
+        **这条端点回答什么、不回答什么**:
+
+        - 回答"依据知识库检索到的内容,这个问题能得出什么",并在
+          `citations` 里给出可点击的来源;
+        - **不**回答"这个回答是否正确"。`grounded=true` 只是**结构性**判定:
+          本次检索成功、至少一条引用、且没有任何编造 / 存疑 / 写错的标记。
+          一条引用可以完全合法却与问题无关 —— 哈希检索对无关问题也会给出
+          非零分数,因此"检索有命中"既不是"有答案"的证据,也不是 grounded 的
+          理由。
+
+        **准入**:analyst / approver(401 / 403)。本端点**不**经过 HITL 图、
+        不做策略判定、不写审计、不要求审批 —— 它与 `/chat` 一样是只读对话
+        路径,只是多了检索与引用校验。不得把它描述成"经过人工把关"。
+
+        **失败语义(S1 冻结矩阵)**:
+
+            RAG 未装配 / 知识库不可用   → 503 {"detail":"rag service unavailable"}
+            索引陈旧 / 证据自相矛盾     → 200, grounded=false, status=unavailable
+            检索无命中                  → 200, grounded=false, status=empty
+            模型未调用检索工具          → 200, grounded=false, status=not_used
+            回答里有编造 / 写错的引用   → 200, grounded=false
+            模型 / provider 失败        → 502 {"detail":"LLM service unavailable"}
+
+        外部知识源不可用时**不**返回 5xx:那是"服务坏了"的信号,而"这次没有
+        依据"是一个正常的业务结论。只有 LLM 本身不可用才是 502。
+
+        **响应里刻意没有的东西**:`messages`、工具原始输出、索引路径、
+        `unverified_citations` / `malformed_markers`(它们参与 groundedness
+        判定,但不进 S1 冻结的响应体)、任何 traceback。
+        """
+        service = _require_rag_ask(request)
+        outcome = await service.ask(
+            payload.question, request_id=_request_id_of(request)
+        )
+        return _to_ask_response(outcome)
 
     @app.post("/triage", response_model=TriageResponse)
     async def triage(

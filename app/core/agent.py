@@ -8,11 +8,26 @@
 
 Phase 3 的手写 ReAct for loop 已删除,由 graph 的
 agent / tools / should_continue 三个节点替代。
+
+v0.5.0-S2-C 增加 `run()`(内部接缝)
+----------------------------------
+`/ask` 需要把"回答里的引用标记"对齐到"本次真实工具结果",而 `chat()` 只
+返回一段文本 —— 消息流被丢弃,`ToolMessage` 无从取得。于是把"跑图 + 提取
+回答"抽成 `run()`,同时返回 `messages`。
+
+两条纪律:
+
+- `chat()` 的公开签名、返回值、异常与日志事件**完全不变**,它只是
+  `run()` 的薄封装;`graph.py` 一行未改。
+- `AgentRun.messages` 是**服务端内部**产物(含 system prompt、工具原始输出、
+  中间推理),只供引用校验使用,**绝不得**出现在任何 HTTP 响应里。
 """
+from dataclasses import dataclass
+
 import structlog
 from typing import List, Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 
 from app.core.graph import create_agent_graph
@@ -43,6 +58,29 @@ SECURITY_ANALYST_SYSTEM_PROMPT = (
 )
 
 MAX_ITERATIONS_REPLY = "当前分析达到最大工具调用次数,无法在限定步骤内完成分析。"
+
+
+@dataclass(frozen=True)
+class AgentRun:
+    """一次图执行的结果。
+
+    字段刻意只有三个,且**不含** `AgentState` 本身:
+
+    - `answer` —— 与 `chat()` 返回的字符串逐字节相同;
+    - `messages` —— 本次运行的完整消息流(含 system prompt、`ToolMessage`、
+      中间 `AIMessage`)。引用校验需要它来区分"真实工具结果"与"模型自述"。
+      **内部产物**:含工具原始输出,不得进入 HTTP 响应或日志;
+    - `iterations` —— 业务层迭代次数,仅为保持既有 `agent_chat_completed`
+      日志字段不变而暴露。
+
+    不暴露 `AgentState` 是刻意的:`policy_decision` / `approval_request` 之类
+    的字段属于 HITL 路径,`/ask` 的图根本不产生它们;把整个 state 交出去
+    会让"某天顺手读一个安全字段"变成可预见的演化方向。
+    """
+
+    answer: str
+    messages: tuple[BaseMessage, ...]
+    iterations: int
 
 
 class SecurityAgent:
@@ -79,6 +117,10 @@ class SecurityAgent:
         它**不是** agent 推理状态,因此经 graph 的 `configurable` 传入,
         不放进 AgentState。`/chat` 路径没有 thread_id(图未编译 checkpointer),
         所以这里只带 request_id。
+
+        自 v0.5.0-S2-C 起本方法是 `run()` 的薄封装:**签名、返回值、异常与
+        两条日志事件全部不变**,只是把消息流丢弃在外。既有调用方(API 端点、
+        测试)无需任何改动。
         """
         logger.info(
             "agent_chat_started",
@@ -87,10 +129,40 @@ class SecurityAgent:
             max_iterations=self._max_iterations,
         )
 
+        result = await self.run(message, request_id=request_id)
+
+        logger.info(
+            "agent_chat_completed",
+            request_id=request_id,
+            iterations=result.iterations,
+        )
+        return result.answer
+
+    async def run(
+        self,
+        message: str,
+        *,
+        request_id: str | None = None,
+        system_prompt: str = SECURITY_ANALYST_SYSTEM_PROMPT,
+    ) -> AgentRun:
+        """跑一次图,返回回答与**本次运行的消息流**。
+
+        这是 `chat()` 与 `/ask` 共用的执行接缝,本身**不写日志**:两个入口的
+        事件名与字段不同(`agent_chat_*` vs `rag_ask_*`),把日志留在各自入口
+        比在这里加一个"事件名参数"更清楚。
+
+        `system_prompt` 默认是既有的分析助手提示词,因此 `chat()` 的行为与
+        改造前逐字节一致;`/ask` 传入自己的提示词(要求带 `[src:...]` 标记)。
+        换提示词**不**改变图的拓扑、工具集或任何安全判定 —— 它只是消息数组
+        的第一条。
+
+        异常语义不变:`LLMClientError` 原样抛出(由 API 层转 502),工具异常
+        已在 `tools_node` 内被转为 `ToolMessage`。
+        """
         final_state = await self._graph.ainvoke(
             {
                 "messages": [
-                    SystemMessage(content=SECURITY_ANALYST_SYSTEM_PROMPT),
+                    SystemMessage(content=system_prompt),
                     HumanMessage(content=message),
                 ],
                 "iteration_count": 0,
@@ -98,13 +170,12 @@ class SecurityAgent:
             {"configurable": {"request_id": request_id}},
         )
 
-        answer = self._extract_final_answer(final_state["messages"])
-        logger.info(
-            "agent_chat_completed",
-            request_id=request_id,
+        messages = final_state["messages"]
+        return AgentRun(
+            answer=self._extract_final_answer(messages),
+            messages=tuple(messages),
             iterations=final_state.get("iteration_count", 0),
         )
-        return answer
 
     @staticmethod
     def _extract_final_answer(messages: list) -> str:

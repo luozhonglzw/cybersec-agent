@@ -21,6 +21,8 @@ from pydantic import BaseModel
 from app.api import schemas as api_schemas
 from app.api.schemas import (
     ApprovalDecisionRequest,
+    AskRequest,
+    AskResponse,
     ChatRequest,
     ChatResponse,
     ResumeRequest,
@@ -34,9 +36,12 @@ REQUEST_DTOS = (
     TriageRequest,
     ApprovalDecisionRequest,
     ResumeRequest,
+    # v0.5.0-S2-C: `POST /ask` 的请求体只有 question,
+    # 不接受 top_k / path / url / collection / corpus_version。
+    AskRequest,
 )
 
-RESPONSE_DTOS = (ChatResponse, TriageResponse)
+RESPONSE_DTOS = (ChatResponse, TriageResponse, AskResponse)
 
 _SCHEMAS_SOURCE = Path(api_schemas.__file__)
 

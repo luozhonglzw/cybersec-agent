@@ -15,6 +15,8 @@ Phase 8.4 增加了 triage / resume 的契约。两条**刻意缺席**的字段:
         服务端从 checkpoint 恢复它(D7)。客户端能指定 interrupt_id
         就等于能伪造"审批的是哪一次暂停"。
 """
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.approval import ApprovalStatus, TriageOutcome
@@ -128,3 +130,96 @@ class TriageResponse(TriageOutcome):
     interrupt_id: str | None = Field(
         default=None, description="暂停时的 interrupt id;已跑完时为 None"
     )
+
+
+# =====================================================================
+# POST /ask —— 带引用的知识库问答(S1 §2.2 冻结契约)
+# =====================================================================
+
+#: 问题长度上限。超限 → 422(不是静默截断):截断会悄悄改变语义,而"问题
+#: 太长"是客户端可以自行修正的错误。与工具层的 `MAX_QUERY_CHARS`(500)不是
+#: 同一个量:模型会用问题派生出更短的检索词,两者不应互相绑定。
+MAX_QUESTION_CHARS = 2000
+
+
+class AskRequest(BaseModel):
+    """POST /ask 的请求体 —— **只有** `question`。
+
+    刻意缺席的字段(每一条都是授权边界):
+
+    - 没有 `top_k`:检索深度由服务端决定,客户端不参与;
+    - 没有 `path` / `url` / `collection` / `index`:能指定"从哪读"就等于
+      能读任意文件或访问任意地址(backlog R-1 记录的既有攻击面);
+    - 没有 `corpus_version`:语料版本由部署决定,客户端指定它就能让回答
+      引用一个并不存在的索引版本。
+    """
+
+    model_config = _REQUEST_EXTRA
+
+    question: str = Field(
+        min_length=1,
+        max_length=MAX_QUESTION_CHARS,
+        description="用户问题;服务端据此检索知识库并给出带引用的回答",
+    )
+
+
+class Citation(BaseModel):
+    """回答里的一条有效引用(S1 冻结的六个字段)。
+
+    `citation_id` 就是文档 id(`kb-cve-…` / `kb-attack-…`),因此**不再**单独
+    回传 `doc_id` —— 重复字段只会让客户端困惑该以哪个为准。
+
+    `score` 是**检索相似度**,不是"这条引用支持该结论"的置信度:它只描述
+    向量空间里的接近程度,与事实正确性无关。
+    """
+
+    citation_id: str = Field(description="引用 id(等于文档 id),来自本次检索结果")
+    source_id: str = Field(description="官方标识,如 CVE-2021-44228 / T1190")
+    source_type: str = Field(description="来源类别:cve / attack-technique / advisory")
+    title: str = Field(description="文档标题")
+    url: str = Field(description="来源链接;仅用于展示,服务端从不请求它")
+    score: float = Field(description="检索相似度(不表示事实正确性)")
+
+
+class RetrievalInfo(BaseModel):
+    """本次检索的结构化状态。
+
+    `status` 的四值来自 S1 冻结矩阵,含义严格区分:
+
+    - `ok` —— 至少一条可信命中;
+    - `empty` —— 检索成功但没有相关命中;
+    - `unavailable` —— 索引/语料不可用,或证据自相矛盾(fail closed);
+    - `not_used` —— 本次回答没有使用检索工具。
+
+    只有 `ok` 才可能 `grounded=true`,但 `ok` **不**意味着"问题有答案"。
+    """
+
+    status: Literal["ok", "empty", "unavailable", "not_used"] = Field(
+        description="检索状态"
+    )
+    hit_count: int = Field(ge=0, description="本次可用的可信文档数")
+    top_k: int = Field(ge=1, description="本端点配置的检索深度(客户端不可影响)")
+
+
+class AskResponse(BaseModel):
+    """POST /ask 的响应体。
+
+    `grounded` 是**结构性**判定,不是"回答正确"的证明:
+
+    - `true` 仅表示:本次检索成功、至少一条引用、且没有任何编造 / 存疑 /
+      写错的标记;
+    - 它**不**表示每条断言都被来源支持,也**不**表示检索到的文档与问题相关。
+
+    证据不足、索引不可用、工具未被使用时,服务端**不**返回 5xx —— 那是
+    "服务坏了"的信号;这里返回 200 + `grounded=false` + 明确的 `status`。
+    """
+
+    answer: str = Field(description="Agent 的回答文本")
+    grounded: bool = Field(description="结构性 groundedness(不代表事实正确)")
+    citations: list[Citation] = Field(
+        default_factory=list, description="有效引用,按 score 降序、同分按 id 升序"
+    )
+    invalid_citations: list[str] = Field(
+        default_factory=list, description="回答里出现、但本次从未检索到的引用 id"
+    )
+    retrieval: RetrievalInfo = Field(description="本次检索的状态")
