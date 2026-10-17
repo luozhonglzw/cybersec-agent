@@ -26,6 +26,14 @@ from app.security.auth import AuthKeyEntry, AuthKeyring
 #: 而调用方以为写进了 PostgreSQL。宁可响亮失败。
 AuditBackend = Literal["sqlite", "postgres"]
 
+#: RAG 检索后端取值集(Phase v0.5.0-S2-E)。
+#:
+#: - `memory`        —— **默认**,与 S2-C 行为完全一致(内存索引);
+#: - `qdrant-local`  —— 显式 opt-in;由组合根装配 Qdrant Local 后端。
+#:
+#: 刻意**不提供** `auto` / `fallback` 之类的取值。
+RagBackend = Literal["memory", "qdrant-local"]
+
 
 class Settings(BaseSettings):
     """全局配置。
@@ -70,6 +78,12 @@ class Settings(BaseSettings):
     # - 运行期连接必须用受限角色(cybersec_app:只有 SELECT / INSERT),
     #   迁移与 DDL 由 migration-owner 角色在 Alembic 里做。
     audit_postgres_dsn: SecretStr | None = None
+
+    # ---- RAG 后端选择(Phase v0.5.0-S2-E)----
+    # 默认 memory ⇒ 不设任何环境变量的部署与 S2-C 行为一致。
+    # qdrant-local 需要显式构建索引(见 scripts/build_qdrant_index.py)。
+    rag_backend: RagBackend = "memory"
+    rag_qdrant_path: Path = Path("data/knowledge_index")
 
     # ---- HITL checkpoint 存储(Phase v0.4.0 S1)----
     # 持久化 checkpoint:让"暂停在 human_approval 的 run"能被**另一个进程**

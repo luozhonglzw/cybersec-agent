@@ -61,3 +61,12 @@ python -c "import hashlib,pathlib;print(hashlib.sha256(pathlib.Path('knowledge/c
 `eval/queries.jsonl` 的 `gold_doc_ids` 只写**确实能回答该问题**的文档。4 条
 `answerable: false` 的查询用于检验"语料没有支撑时不应编造引用"。这些标注是
 单人标注,因此由此算出的指标是 **descriptive**,不构成质量保证。
+
+```bash
+# 离线评估检索质量(Recall@5 / MRR@5 / empty_rate,不调用 LLM)
+python scripts/eval_rag.py --qdrant-index-dir data/knowledge_index
+```
+
+可用确定性指标只覆盖**检索**层:黄金文档是否出现在 top-5、排在第几位。
+"回答是否正确""引用是否恰当""不可答时是否说了不知道"这类**答案层**指标需要
+模型参与判定,当前阶段**不评估** —— 没有把它换成哈希检索代理指标。

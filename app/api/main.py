@@ -80,6 +80,7 @@ from app.core.triage import (
 from app.rag import (
     DEFAULT_KNOWLEDGE_DIR,
     HashingEmbedder,
+    IndexUnavailable,
     RagError,
     build_in_memory_retriever,
     load_corpus,
@@ -98,7 +99,8 @@ from app.security.checkpoint import SafeAsyncSqliteSaver, build_checkpoint_serde
 from app.security.store import SqliteAuditStore
 from app.security.store_postgres import POSTGRES_STORE_ERRORS, PostgresAuditStore
 from app.security.store_protocol import AuditStore
-from app.tools.search_knowledge import build_search_knowledge_tool
+from app.tools.search_knowledge import build_search_knowledge_tool, build_stub_knowledge_tool
+from app.vectorstore import build_qdrant_retriever
 
 logger = structlog.get_logger(__name__)
 
@@ -403,7 +405,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.agent = SecurityAgent(llm)
         # /ask 的装配是**独立的**:它自己建图、自己绑工具(只有一个只读检索
         # 工具)。知识库不可用时这里返回 None → /ask 503,其余端点照常。
-        app.state.rag_ask = build_rag_ask_service(llm)
+        app.state.rag_ask = build_rag_ask_service(llm, settings)
         app.state.triage_service = TriageService(
             create_agent_graph(
                 llm,
@@ -418,6 +420,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await checkpoint_conn.close()
         # 幂等:SQLite 审计后端没有可关闭的资源,这里是 no-op。
         close_audit_store(store)
+        # 释放 Qdrant Local 存储目录锁(如果装配了该后端)。
+        rag_ask_service = getattr(app.state, "rag_ask", None)
+        if rag_ask_service is not None:
+            rag_ask_service.close()
 
 
 def _triage_status_for(exc: TriageError) -> int:
@@ -558,7 +564,10 @@ def _to_ask_response(outcome: AskOutcome) -> AskResponse:
     )
 
 
-def build_rag_ask_service(llm_client: LLMClient) -> GroundedAskService | None:
+def build_rag_ask_service(
+    llm_client: LLMClient,
+    settings: Settings | None = None,
+) -> GroundedAskService | None:
     """装配 `/ask` 专用链路:一个只读检索工具 + 一个独立对话图。
 
     **显式 opt-in(N-7)**:`SecurityAgent(llm, tools=[tool])` 传入的是**非空**
@@ -575,16 +584,39 @@ def build_rag_ask_service(llm_client: LLMClient) -> GroundedAskService | None:
     装配失败(语料缺失 / 清单不符 / 索引不匹配)→ 返回 `None`,
     `/ask` 给出固定的 **503**;`/chat`、`/triage` 与 `/audit/events`
     完全不受影响。这是刻意的降级方向:知识库坏掉不该让整个进程起不来。
+
+    qdrant-local 索引不可用时**不**返回 None:捕获 ``IndexUnavailable``,
+    注入一个总是返回 ``rag_error`` 的 stub 工具,让查询时得到
+    ``status="unavailable"`` 与 ``grounded=false``(S1 冻结语义)。
     """
     try:
         corpus = load_corpus(DEFAULT_KNOWLEDGE_DIR)
-        retriever = build_in_memory_retriever(corpus, HashingEmbedder())
+        if settings is not None and settings.rag_backend == "qdrant-local":
+            retriever = build_qdrant_retriever(
+                corpus, HashingEmbedder(), settings.rag_qdrant_path
+            )
+        else:
+            retriever = build_in_memory_retriever(corpus, HashingEmbedder())
+    except IndexUnavailable as exc:
+        # qdrant-local 索引损坏/缺失:用 stub 工具让查询时返回 unavailable,
+        # 而不是在装配期直接 503。
+        logger.warning(
+            "rag_ask_unavailable", reason=exc.reason, backend="qdrant-local"
+        )
+        stub_tool = build_stub_knowledge_tool(exc.reason)
+        return GroundedAskService(
+            SecurityAgent(llm_client, tools=[stub_tool]),
+        )
     except RagError as exc:
         # 只记原因码:路径、集合名、语料内容都不进日志。
         logger.warning("rag_ask_unavailable", reason=exc.reason)
         return None
     tool = build_search_knowledge_tool(retriever)
-    return GroundedAskService(SecurityAgent(llm_client, tools=[tool]))
+    store = getattr(retriever, "store", None)
+    return GroundedAskService(
+        SecurityAgent(llm_client, tools=[tool]),
+        store=store,
+    )
 
 
 def create_app(

@@ -1,4 +1,6 @@
 """Settings 的单元测试:不依赖 .env,不依赖真实 API Key。"""
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr, ValidationError
 
@@ -52,3 +54,16 @@ def test_settings_from_env(monkeypatch):
     assert s.llm_model == "env-model"
     assert s.llm_api_key.get_secret_value() == "env-key"
     assert s.llm_base_url is None  # 未设置的环境变量 → 用默认值
+
+
+def test_default_rag_backend_is_memory():
+    """不设任何环境变量时 RAG 后端是 memory —— 与 S2-C 行为一致。"""
+    s = Settings(llm_model="m", llm_api_key="k")
+    assert s.rag_backend == "memory"
+    assert s.rag_qdrant_path == Path("data/knowledge_index")
+
+
+def test_invalid_rag_backend_is_rejected():
+    """RAG 后端取值集封闭:没有 auto / fallback / elastic 之类的别名。"""
+    with pytest.raises(ValidationError):
+        Settings(llm_model="m", llm_api_key="k", rag_backend="elastic")

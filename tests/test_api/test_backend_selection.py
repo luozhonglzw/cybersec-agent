@@ -16,6 +16,10 @@
    全项目只有组合根读 `audit_backend`;图节点与 triage 服务里没有任何
    backend 分支;`lifespan` 拥有 store 的创建与关闭(含部分启动失败路径)。
 
+Phase v0.5.0-S2-E 起,同一文件也守护**检索后端**(`rag_backend` /
+`rag_qdrant_path`)的"只在组合根选择"不变量 —— 见
+`test_only_the_composition_root_reads_the_rag_backend_setting`。
+
 真实 PostgreSQL 上的 API 行为由 `tests/test_postgres/test_app_integration.py`
 覆盖(默认套件不收集)。
 """
@@ -288,6 +292,23 @@ def test_only_the_composition_root_reads_the_backend_setting():
         for path in _python_files()
         if "audit_backend" in path.read_text(encoding="utf-8")
         or "audit_postgres_dsn" in path.read_text(encoding="utf-8")
+    }
+    assert hits == BACKEND_CONFIG_FILES, hits
+
+
+def test_only_the_composition_root_reads_the_rag_backend_setting():
+    """同样的护栏延伸到 RAG 检索后端(Phase v0.5.0-S2-E)。
+
+    `rag_backend` 是**第二个**"只在组合根做选择"的配置。它一旦出现在
+    某个工具、图节点或端点里,就会出现"某个模块自己决定用哪份检索数据"
+    的分支 —— 那既让"检索用的是哪份数据"变成运行时猜测,也绕开了
+    `build_rag_ask_service` 里唯一的 `IndexUnavailable` 收敛点。
+    """
+    hits = {
+        path.relative_to(APP_ROOT).as_posix()
+        for path in _python_files()
+        if "rag_backend" in path.read_text(encoding="utf-8")
+        or "rag_qdrant_path" in path.read_text(encoding="utf-8")
     }
     assert hits == BACKEND_CONFIG_FILES, hits
 

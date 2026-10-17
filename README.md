@@ -16,9 +16,9 @@ This is a research and engineering prototype. It is not production-ready and not
                     HTTP client (curl / Swagger UI)
                                  │
                      FastAPI — app/api/main.py
-          POST /chat     POST /triage     POST /resume     GET /audit/events
+       POST /chat    POST /ask    POST /triage    POST /resume    GET /audit/events
                                  │
-              Authorization: Bearer <key> on all four; docs routes stay public
+              Authorization: Bearer <key> on all five; docs routes stay public
                                  │
             ┌────────────────────┴────────────────────┐
             │                                         │
@@ -26,6 +26,11 @@ This is a research and engineering prototype. It is not production-ready and not
       SecurityAgent                            TriageService
       └─ ReAct graph                           └─ HITL graph, server-issued
          (agent ⇄ tools)                          thread handle, resume gate
+
+        /ask path
+        GroundedAskService
+        └─ ReAct graph with exactly one read-only tool
+           (search_knowledge_tool) + citation validator
 
   LangGraph StateGraph — app/core/graph.py
     agent ── LLM.bind_tools().ainvoke() ──►  ⚠ untrusted model output
@@ -123,6 +128,7 @@ must be 64 lowercase hex characters.
 | Route | viewer | analyst | approver | Notes |
 | --- | --- | --- | --- | --- |
 | `POST /chat` | 403 | 200 | 200 | Plain LLM conversation. **Not** HITL / policy gated. |
+| `POST /ask` | 403 | 200 | 200 | Knowledge-base Q&A with citations. **Not** HITL / policy gated. |
 | `POST /triage` | 403 | 200 | 200 | Starts an HITL run; owner = authenticated subject. |
 | `POST /resume` | 403 | 403 | 200 if assigned | Role admission **and** per-thread object authorization. |
 | `GET /audit/events` | 200 (all) | 200 (own threads) | 200 (owned or assigned) | Scope rules below. |
@@ -293,6 +299,82 @@ Three read-only tools are published:
 
 Client-visible MCP schemas do not expose `data_path`, `logs_path`, or `intel_path`; the server binds repository-controlled data locations before delegating to the existing read-only domain functions. This is a property of the published interface as tested, not a general claim about filesystem access.
 
+## Knowledge-base Q&A (`/ask`)
+
+`POST /ask` is a fifth business route: it answers a natural-language question from the repository's version-controlled threat-intelligence corpus and returns **structural** groundedness plus validated citations. It is a read-only conversation path, like `/chat`, but with retrieval and a citation validator between the model and the client.
+
+```bash
+curl -X POST http://127.0.0.1:8000/ask \
+  -H "Authorization: Bearer $ANALYST_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Log4j 的 JNDI 查找为什么能被用来执行代码?"}'
+```
+
+### The retrieval backend is explicit, and never silently falls back
+
+Two backends exist and are selected in the composition root only:
+
+| `RAG_BACKEND` | Behaviour |
+| --- | --- |
+| `memory` (**default**) | Builds the in-memory index from the corpus at startup. Identical to the S2-C behaviour. |
+| `qdrant-local` | Opens the Qdrant Local index at `RAG_QDRANT_PATH` (default `data/knowledge_index`). |
+
+There is no `auto` and no fallback. If `qdrant-local` is selected and the index is missing, stale, corrupt, or locked, the endpoint still returns **HTTP 200** with `retrieval.status = "unavailable"`, `grounded = false`, and `citations: []` — "no evidence this time" is a business result, not a server fault. Only a failed **model call** returns 502. Startup with a broken corpus (as opposed to a broken index) degrades `/ask` to the fixed 503 `{"detail":"rag service unavailable"}` and leaves `/chat`, `/triage`, `/resume`, and `/audit/events` unaffected.
+
+The index is an operational artifact, built by an explicit command — never at application startup:
+
+```bash
+python scripts/build_knowledge_index.py                  # build / rebuild
+python scripts/build_knowledge_index.py --check          # verify against the corpus
+```
+
+### What the response does and does not claim
+
+`grounded = true` is a **structural** statement: retrieval succeeded, at least one citation was produced, and no fabricated, unverifiable, or malformed citation appears. It is **not** a statement that the answer is factually correct, and it is **not** a statement that the retrieved documents are relevant — hash-based retrieval returns non-zero scores even for unrelated questions. Evidence is collected only from `type == "tool"` messages, so a model that writes a citation into its prose without calling the tool is reported as `invalid_citations`.
+
+### Offline retrieval evaluation
+
+The repository ships a 20-query labelled set (16 answerable / 4 unanswerable) at `knowledge/eval/queries.jsonl` and a deterministic evaluator that calls **no LLM**:
+
+```bash
+python scripts/eval_rag.py --qdrant-index-dir data/knowledge_index
+```
+
+It reports `Recall@5`, `MRR@5`, and `empty_rate` per backend. On the current corpus the two backends return identical results by construction — the Qdrant Local adapter reuses the same `Retriever`, the same deterministic top-k, and the same citation ids.
+
+The full backend selection, failure semantics, and Qdrant Local's reconstruction constraints are documented in [docs/qdrant-local.md](docs/qdrant-local.md); the corpus provenance rules are in [knowledge/README.md](knowledge/README.md).
+
+### Reproducible demo
+
+```bash
+# 1. build the Qdrant Local index (offline; no server, no Docker)
+uv sync
+uv run --no-sync python scripts/build_knowledge_index.py
+
+# 2. start the API with the qdrant-local backend
+RAG_BACKEND=qdrant-local uv run --no-sync uvicorn app.api.main:app --port 8000
+
+# 3. ask an answerable question — expect 200, grounded=true, valid citations
+curl -sS -X POST http://127.0.0.1:8000/ask \
+  -H "Authorization: Bearer $ANALYST_KEY" -H "Content-Type: application/json" \
+  -d '{"question": "Log4j 的 JNDI 查找为什么能被用来执行代码?"}' | python -m json.tool
+
+# 4. point the backend at a nonexistent index and ask again —
+#    expect 200, grounded=false, citations=[], retrieval.status="unavailable"
+#    (no silent fallback to the memory backend)
+
+# 5. ask an unanswerable question — the corpus has no support for it
+#    (e.g. 蓝牙配对密钥协商缺陷); the endpoint reports no usable citation
+#    rather than inventing one
+
+# 6. offline retrieval evaluation over the frozen 20-query set
+uv run --no-sync python scripts/eval_rag.py --qdrant-index-dir data/knowledge_index
+```
+
+`/ask` binds exactly one tool, `search_knowledge_tool`, and it takes no resource
+locating parameter — no `path`, `url`, `collection`, or `index_path`. The model
+chooses what to ask, not where to read.
+
 ## Key Features
 
 - **LangGraph orchestration** — a five-node state graph (`agent`, `tools`, `plan`, `policy_gate`, `human_approval`) with a conditional ReAct loop and a business-level iteration cap separate from the framework's recursion limit.
@@ -307,11 +389,13 @@ Client-visible MCP schemas do not expose `data_path`, `logs_path`, or `intel_pat
 - **Offline evaluation harness** — three baselines, five separately reported metric classes, an independent evidence oracle, metamorphic relations, and no composite score.
 - **Real-provider evaluation harness** — a budget governor, a network-egress guard built on interpreter audit hooks, per-cell raw-record persistence with fsync, and frozen failure taxonomy.
 - **Read-only MCP interface** — three read-only tools (security-log query, threat-intel lookup, deterministic risk analysis) published over a local stdio MCP server, reusing the existing tool functions as an alternate read-only surface. Response planning is not published, and no remote transport or authentication server is implemented.
+- **Knowledge-base Q&A with validated citations** — `POST /ask` answers questions from a version-controlled, self-authored corpus through a single read-only retrieval tool, and returns a structural (not factual) groundedness verdict plus citations checked against the actual retrieved documents. The retrieval backend (`memory` or `qdrant-local`) is explicit configuration selected in the composition root, with no silent fallback: a missing or corrupt index returns 200 + `unavailable`, not a degraded answer.
+- **Fully offline retrieval evaluation** — a 20-query labelled set with `Recall@5` / `MRR@5` / `empty_rate` computed deterministically over both backends, with no LLM call and no network access.
 - **Read-only audit query API** — `GET /audit/events` exposes the existing append-only audit trail as a bounded, deterministically ordered read surface (`thread_id` / `event` / `limit` / `order`). It is a read path only: no audit writes, no policy / approval / HITL / checkpoint mutation, and no client control over the audit database path. Reads are scope-filtered by role (viewer: all threads; analyst: owned threads; approver: owned or explicitly assigned threads), enforced before any content is fetched.
 - **Optional PostgreSQL audit backend** — an explicit opt-in persistence backend behind the same `AuditStore` contract, with a separated migration-owner role and a runtime role limited to `SELECT` / `INSERT`. SQLite stays the default, there is no automatic fallback and no dual-write, and the PostgreSQL backend stores audit / incident / action-request data only — not LangGraph checkpoints.
 - **Static API-key authentication** — every business route requires `Authorization: Bearer <key>`. Configuration stores only SHA-256 digests; authentication is always on and fail-closed (a missing or invalid key configuration stops the process at startup). Role admission (`viewer` / `analyst` / `approver`) is enforced per route as a FastAPI dependency.
 - **Per-thread object authorization** — `POST /triage` records a single immutable ownership row (owner + full approver set) before the graph runs; `POST /resume` and `GET /audit/events` resolve the authenticated principal against that row before touching any graph, checkpointer, or audit content. Self-approval is rejected, and the audit `actor` is the authenticated principal, not a client-supplied string.
-- **Fully offline test suite** — 1,737 tests that require no network access and no API key, plus a PostgreSQL integration suite (366 cases) that the default run deselects and a separate CI job runs against a throwaway server.
+- **Fully offline test suite** — 2,215 tests that require no network access and no API key, plus a PostgreSQL integration suite (373 cases) that the default run deselects and a separate CI job runs against a throwaway server.
 
 ## Security Design
 
@@ -374,6 +458,8 @@ This is a research and engineering prototype. The limitations below are properti
 **The MCP interface is local only.** It is a local stdio server with no remote transport and no authentication server; the identity boundary is the host process that spawns it.
 
 **The agent path requires a provider.** `/chat`, `/triage`, and `/resume` run through the model, and there is no offline mode for that path. The deterministic and read-only parts of the system — tools, policy, audit, MCP — can be exercised without a provider; the agent cannot.
+
+**`/ask` groundedness is structural, not factual.** `grounded = true` means the citations in the answer all point at documents actually retrieved in this request and no fabricated or malformed citation was found. It does not mean the answer is correct, and it does not mean the retrieved documents were relevant. The offline evaluator measures the retrieval layer only (`Recall@5` / `MRR@5` on a 20-query set against the hash-embedding baseline); answer-layer quality is not evaluated in this phase and must not be inferred from the retrieval numbers.
 
 **Evaluation scope is narrow.** The real-provider pilot is 108 runs over 8 tasks, one provider and endpoint configuration, one requested model, one execution window, and a single matched injection task with a denominator of 6. It is a bounded observation, not a general result.
 

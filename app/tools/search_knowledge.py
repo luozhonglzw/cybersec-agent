@@ -189,4 +189,25 @@ def build_search_knowledge_tool(retriever: Retriever) -> BaseTool:
     return search_knowledge_tool
 
 
-__all__ = ["MAX_QUERY_CHARS", "SCORE_DECIMALS", "build_search_knowledge_tool"]
+def build_stub_knowledge_tool(reason: str) -> BaseTool:
+    """返回一个总是报 ``IndexUnavailable`` 的占位工具。
+
+    用于 Qdrant Local 索引损坏/缺失时:装配期捕获 ``IndexUnavailable``,
+    用本工具替换真实检索工具,让 `/ask` 在查询时返回
+    ``status="unavailable"`` 而不是 503。
+    """
+
+    @tool
+    async def search_knowledge_tool(query: str, top_k: int = DEFAULT_TOP_K) -> str:
+        """知识检索工具(当前不可用)。参数被忽略,始终返回索引不可用。"""
+        return _error_envelope(reason, "knowledge index unavailable", "IndexUnavailable")
+
+    return search_knowledge_tool
+
+
+__all__ = [
+    "MAX_QUERY_CHARS",
+    "SCORE_DECIMALS",
+    "build_search_knowledge_tool",
+    "build_stub_knowledge_tool",
+]

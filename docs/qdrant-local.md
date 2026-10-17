@@ -95,6 +95,26 @@ python scripts/build_knowledge_index.py --json
 
 `data/` 下的一切都是运行时生成物,可随时删除重建;索引由上面的命令一键复原。
 
+### `/ask` 的运行时配置(S2-E)
+
+| 变量 | 取值 | 说明 |
+|---|---|---|
+| `RAG_BACKEND` | `memory`(默认)/ `qdrant-local` | 检索后端。取值集封闭,没有 `auto` / `fallback` |
+| `RAG_QDRANT_PATH` | `data/knowledge_index` | 仅 `qdrant-local` 时使用的索引目录 |
+
+两条硬约束:
+
+- **选错就在启动期失败。** 设置了未知的后端名会在 `Settings` 构造期
+  抛 `ValidationError`(进程拒绝启动),不会带着一个隐含默认往下跑;
+- **没有静默回退。** 选了 `qdrant-local` 而索引不可用时,`/ask` 返回
+  `200` + `retrieval.status = "unavailable"` + `grounded = false`。
+  这是"这次没有依据"的业务结论,不是服务故障。
+
+排他锁的推论适用于进程生命周期:组合根在 `lifespan` 的 `finally` 里调用
+`GroundedAskService.close()`,因此一次正常退出会释放目录锁。被 `SIGKILL`
+时锁残留属预期 —— 下一个进程会得到 `index-locked`,处理方式是确认没有
+残留进程后重开,而不是绕过它。
+
 ### 重建语义
 
 - 默认行为是**重建**(`replace=True`):让索引等于当前语料,可幂等重跑;
@@ -139,9 +159,12 @@ finally:
 在本语料上,两个后端的检索结果**顺序与分数完全一致**(实测,见
 `test_ranking_matches_the_in_memory_backend`)。
 
-> **`/ask` 的运行时装配仍走内存后端。** 本阶段交付的是适配器 + 构建脚本 +
-> 工厂函数,没有切换端点装配 —— 切换会让"未构建索引的部署"从 200 变成 503,
-> 属于可观测行为变化,需单独授权。
+> **`/ask` 的后端由 `RAG_BACKEND` 显式选择(S2-E)。** 默认仍是内存索引,与
+> v0.5.0-S2-C 行为一致;选 `qdrant-local` 时组合根在启动期打开
+> `RAG_QDRANT_PATH` 指向的索引,并在进程退出时释放排他锁。
+> **没有** `auto` / `fallback` 取值:索引打不开就是打不开 —— 端点返回
+> 200 + `status="unavailable"`,不会悄悄退回内存索引(那会让"这次用的是哪份
+> 数据"变成运行时猜测)。详见 README 的 "Knowledge-base Q&A (`/ask`)" 一节。
 
 ---
 
@@ -187,6 +210,9 @@ finally:
 # 只跑构建脚本
 ./.venv/Scripts/python.exe -m pytest tests/test_vectorstore/test_index_build.py -q
 
+# 后端装配:/ask 的 qdrant-local 选择 + stub 工具降级
+./.venv/Scripts/python.exe -m pytest tests/test_api/test_ask.py tests/test_api/test_backend_selection.py -q
+
 # 未绑定工具的提权回归
 ./.venv/Scripts/python.exe -m pytest tests/test_api/test_unbound_tool.py -q
 ```
@@ -196,6 +222,36 @@ finally:
 
 `tests/test_rag/**` 仍然只测**内存**后端(`InMemoryVectorStore`),与本目录
 的集成测试相互独立。
+
+---
+
+## 7.5 检索质量评估(S2-E)
+
+```bash
+# 评估内存后端
+python scripts/eval_rag.py
+
+# 同时评估 qdrant-local(需要已构建索引)
+python scripts/eval_rag.py --qdrant-index-dir data/knowledge_index
+
+# 机器可读输出
+python scripts/eval_rag.py --json
+```
+
+语料是 `knowledge/eval/queries.jsonl` 里的 20 条标注查询(16 可答 / 4 不可答),
+`gold_doc_ids` 是单人标注。脚本**不调用任何 LLM**,只跑确定性检索并计算:
+
+| 指标 | 含义 |
+|---|---|
+| `Recall@5` | 可答查询中,至少一个黄金文档出现在 top-5 的比例 |
+| `MRR@5` | 可答查询中,首个命中黄金文档的排名的倒数(无命中为 0) |
+| `empty_rate` | 全部查询中检索返回零命中的比例 |
+
+在 `HashingEmbedder` 基线下,两个后端的结果**逐位相同** —— 这是设计:
+适配器复用同一个 `Retriever`、同一套确定性 top-k 与同一套引用 id,换后端
+不该改变可观测行为。
+
+这些数字**只描述哈希基线**,不得表述为"RAG 的语义检索效果"(见下一节)。
 
 ---
 

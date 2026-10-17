@@ -808,3 +808,98 @@ def test_two_identical_requests_produce_identical_bodies(retriever):
         return _ask(_client(_service(retriever, llm))).json()
 
     assert one_run() == one_run()
+
+
+# =====================================================================
+# 7. Qdrant Local 后端装配
+# =====================================================================
+
+
+def test_qdrant_local_with_missing_index_returns_stub_service(tmp_path: Path, monkeypatch):
+    """qdrant-local 索引缺失时:装配返回 stub 服务,查询时 unavailable(不是 503)。"""
+    monkeypatch.setattr(
+        api_main,
+        "DEFAULT_KNOWLEDGE_DIR",
+        _write_corpus(tmp_path, _documents()),
+    )
+    from app.core.config import Settings
+    settings = Settings(
+        llm_model="m",
+        llm_api_key="k",
+        _env_file=None,
+        rag_backend="qdrant-local",
+        rag_qdrant_path=tmp_path / "missing_index",
+    )
+    llm = ScriptedLLM(answer="x")
+    service = build_rag_ask_service(llm, settings)
+    assert service is not None
+    assert [tool.name for tool in llm.bound_tools] == ["search_knowledge_tool"]
+
+
+def test_qdrant_local_stub_service_query_returns_unavailable(tmp_path: Path, monkeypatch):
+    """stub 工具被调用时,端点返回 200 + status=\"unavailable\" + grounded=false。"""
+    monkeypatch.setattr(
+        api_main,
+        "DEFAULT_KNOWLEDGE_DIR",
+        _write_corpus(tmp_path, _documents()),
+    )
+    from app.core.config import Settings
+    settings = Settings(
+        llm_model="m",
+        llm_api_key="k",
+        _env_file=None,
+        rag_backend="qdrant-local",
+        rag_qdrant_path=tmp_path / "missing_index",
+    )
+    llm = ScriptedLLM(
+        answer="依据知识库,该问题没有足够依据回答。",
+        tool_call_batches=(_one_batch(),),
+    )
+    service = build_rag_ask_service(llm, settings)
+    client = _client(service)
+    resp = _ask(client)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["retrieval"]["status"] == "unavailable"
+    assert body["grounded"] is False
+    assert body["citations"] == []
+
+
+def test_qdrant_local_with_valid_index_uses_qdrant_backend(tmp_path: Path, monkeypatch):
+    """qdrant-local 索引存在且有效时:装配真实检索器,查询正常命中。"""
+    monkeypatch.setattr(
+        api_main,
+        "DEFAULT_KNOWLEDGE_DIR",
+        _write_corpus(tmp_path, _documents()),
+    )
+    from app.core.config import Settings
+    from app.vectorstore import build_qdrant_index
+    corpus = load_corpus(api_main.DEFAULT_KNOWLEDGE_DIR)
+    index_dir = tmp_path / "qdrant_index"
+    build_qdrant_index(corpus, HashingEmbedder(), index_dir)
+    settings = Settings(
+        llm_model="m",
+        llm_api_key="k",
+        _env_file=None,
+        rag_backend="qdrant-local",
+        rag_qdrant_path=index_dir,
+    )
+    llm = ScriptedLLM(answer="x", tool_call_batches=(_one_batch(),))
+    service = build_rag_ask_service(llm, settings)
+    assert service is not None
+    assert [tool.name for tool in llm.bound_tools] == ["search_knowledge_tool"]
+
+
+def test_grounded_ask_service_close_calls_store_close():
+    """``GroundedAskService.close()`` 会在持有 store 时调用其 ``close()``。"""
+    class _SpyStore:
+        def __init__(self):
+            self.closed = False
+        def close(self):
+            self.closed = True
+
+    store = _SpyStore()
+    service = GroundedAskService(SecurityAgent(ScriptedLLM(answer="x")), store=store)
+    service.close()
+    assert store.closed
+    service.close()  # 幂等

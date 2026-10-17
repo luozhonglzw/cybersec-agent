@@ -36,6 +36,7 @@ groundedness 是**结构性**的
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 
@@ -124,9 +125,22 @@ class AskOutcome:
 class GroundedAskService:
     """`/ask` 的服务层:跑图 → 校验引用 → 给出结构化结论。"""
 
-    def __init__(self, agent: SecurityAgent, *, top_k: int = DEFAULT_TOP_K) -> None:
+    def __init__(
+        self,
+        agent: SecurityAgent,
+        *,
+        top_k: int = DEFAULT_TOP_K,
+        store: Any | None = None,
+    ) -> None:
         self._agent = agent
         self._top_k = top_k
+        self._store = store
+
+    def close(self) -> None:
+        """释放持有的向量存储资源(幂等)。仅 Qdrant Local 后端需要。"""
+        store = self._store
+        if store is not None and hasattr(store, "close"):
+            store.close()
 
     @property
     def top_k(self) -> int:
