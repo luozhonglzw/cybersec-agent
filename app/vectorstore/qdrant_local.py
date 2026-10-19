@@ -231,11 +231,24 @@ class QdrantLocalVectorStore:
         *,
         replace: bool = False,
     ) -> "QdrantLocalVectorStore":
-        """新建(或按 `replace` 重建)一个空集合,并把索引身份写进集合配置。
+        """新建(或按 `replace` 重建)一个空集合,身份元数据**暂不提交**。
 
-        身份写进**集合配置**而不是旁边的 JSON 文件:配置与集合是同一份
-        存储的原子组成部分,不存在"元数据说 N 块、实际只有 M 块"的文件级
-        竞争。`open()` 再叠加一次 `count()` 核对,把"写了一半"也挡住。
+        为什么不在这一步写身份(S2-G1 修正)
+        ------------------------------------
+        集合配置里先放**故意不合法**的哨兵(`index_format` 一项,缺全部身份
+        字段),等调用方把点写完、`count` 自检通过之后再调 `commit()` 写入
+        真正的身份。于是"元数据已更新、点还是旧的"这个窗口**不存在**:
+
+        - 崩溃在 `commit()` 之前 ⇒ 配置里只有哨兵 ⇒ 下一次 `open()` 被
+          既有 `_metadata_from_payload` 以 `index-metadata-invalid` 拒绝;
+        - 崩溃在 `commit()` 之后 ⇒ 点已全部落盘且已核对,索引完整。
+
+        修正前的顺序(先写身份、再清点、再写入)会让"只改正文、doc_id 不变"
+        的重建在窗口内崩溃时留下**看起来完全合法**的索引:六项身份校验全过,
+        而向量还是上一版语料的 —— 检索会把它当作有效证据返回。
+
+        身份仍写进**集合配置**而不是旁边的 JSON 文件:配置与集合是同一份
+        存储的组成部分,不存在"元数据说 N 块、实际只有 M 块"的文件级竞争。
 
         `replace=False` 时若集合已存在 → `IndexUnavailable`。**不**默认覆盖:
         覆盖是破坏性动作,必须由调用方(构建脚本)显式要求。
@@ -257,13 +270,29 @@ class QdrantLocalVectorStore:
                 vectors_config=VectorParams(
                     size=metadata.dim, distance=Distance.COSINE
                 ),
-                metadata=_metadata_payload(metadata),
+                metadata={_METADATA_FORMAT_KEY: INDEX_FORMAT},
             )
             cls._reset_points(client)
         except Exception:
             client.close()
             raise
         return cls(client, metadata, index_dir=directory)
+
+    def commit(self) -> None:
+        """把索引身份写进集合配置 —— 重建的**提交点**。
+
+        只在"点已全部写入且 `count` 自检通过"之后调用。之前配置里只有
+        哨兵,所以任何在此之前的崩溃都会让下一次 `open()` fail closed,
+        而不会留下一份"身份说新语料、内容还是旧语料"的索引。
+
+        `update_collection(metadata=...)` 在 Qdrant Local 实测可用,且是
+        **整字典替换**(哨兵里的 `index_format` 会随新字典一起写回)。
+        这不是事务提交:它只保证"身份最后可见",不保证"点与身份同时生效"。
+        """
+        self._client.update_collection(
+            collection_name=COLLECTION_NAME,
+            metadata=_metadata_payload(self._metadata),
+        )
 
     @staticmethod
     def _reset_points(client: QdrantClient) -> None:
@@ -530,9 +559,16 @@ def build_qdrant_index(
     """把语料切块、嵌入并写入一个新的 Qdrant Local 索引,返回索引身份。
 
     为什么先把全部向量算完再动存储:嵌入是唯一可能"跑很久后失败"的步骤。
-    先算完,失败时旧索引**原封不动**;随后才进入"删集合 → 建集合 → 写入"
-    这段快速窗口。窗口内失败会留下不可用索引(下次 `open()` fail closed),
-    但不会留下"看起来有效的半份索引"。
+    先算完,失败时旧索引**原封不动**;随后才进入"删集合 → 建集合 → 写入 →
+    提交身份"这段快速窗口。
+
+    窗口内的顺序是 S2-G1 的**核心不变量**:
+    `create(哨兵身份)` → `_reset_points` → `upsert` → `count` 自检 →
+    `commit(真实身份)`。身份最后写,因此窗口内任何一步失败都留下一个
+    **哨兵索引**,下一次 `open()` 被既有校验以 `index-metadata-invalid`
+    拒绝 —— 包括"只改正文、doc_id 不变"这种否则会静默陈旧的场景。
+
+    这不宣称事务原子性:点与身份仍是两次写入,只是**身份最后可见**。
     """
     chunks = chunk_corpus(corpus.documents)
     vectors = embedder.embed_documents([chunk.text for chunk in chunks])
@@ -548,6 +584,8 @@ def build_qdrant_index(
                 "knowledge index write is incomplete",
                 reason="index-incomplete",
             )
+        # 提交点:至此点已全部落盘且数量核对通过,才让身份对外可见。
+        store.commit()
     return metadata
 
 
