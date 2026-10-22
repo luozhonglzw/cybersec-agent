@@ -82,6 +82,7 @@ from app.rag import (
     HashingEmbedder,
     IndexUnavailable,
     RagError,
+    build_bm25_retriever,
     build_in_memory_retriever,
     load_corpus,
 )
@@ -588,20 +589,30 @@ def build_rag_ask_service(
     qdrant-local 索引不可用时**不**返回 None:捕获 ``IndexUnavailable``,
     注入一个总是返回 ``rag_error`` 的 stub 工具,让查询时得到
     ``status="unavailable"`` 与 ``grounded=false``(S1 冻结语义)。
+
+    ``bm25``(S2-G3)是**词法**候选:它在装配期由 ``load_corpus`` 已校验的
+    当前语料即时切块建索引,没有持久化索引,因此不存在"索引比语料旧"的
+    窗口,也就**没有** ``verify()``,更不伪造向量索引的六项身份校验。
+    它的构建失败与"语料坏掉"同类 ⇒ 走下面的 ``RagError`` 分支返回 None
+    ⇒ ``/ask`` 固定 503。**不静默回退 memory**:选了 bm25 却拿到 memory 的
+    结果,会让"这个回答来自哪种检索"在日志里无从区分。
     """
+    backend = settings.rag_backend if settings is not None else "memory"
     try:
         corpus = load_corpus(DEFAULT_KNOWLEDGE_DIR)
         if settings is not None and settings.rag_backend == "qdrant-local":
             retriever = build_qdrant_retriever(
                 corpus, HashingEmbedder(), settings.rag_qdrant_path
             )
+        elif settings is not None and settings.rag_backend == "bm25":
+            retriever = build_bm25_retriever(corpus)
         else:
             retriever = build_in_memory_retriever(corpus, HashingEmbedder())
     except IndexUnavailable as exc:
         # qdrant-local 索引损坏/缺失:用 stub 工具让查询时返回 unavailable,
         # 而不是在装配期直接 503。
         logger.warning(
-            "rag_ask_unavailable", reason=exc.reason, backend="qdrant-local"
+            "rag_ask_unavailable", reason=exc.reason, backend=backend
         )
         stub_tool = build_stub_knowledge_tool(exc.reason)
         return GroundedAskService(

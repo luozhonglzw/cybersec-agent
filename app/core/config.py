@@ -26,13 +26,16 @@ from app.security.auth import AuthKeyEntry, AuthKeyring
 #: 而调用方以为写进了 PostgreSQL。宁可响亮失败。
 AuditBackend = Literal["sqlite", "postgres"]
 
-#: RAG 检索后端取值集(Phase v0.5.0-S2-E)。
+#: RAG 检索后端取值集(Phase v0.5.0-S2-E,`bm25` 于 S2-G3 加入)。
 #:
-#: - `memory`        —— **默认**,与 S2-C 行为完全一致(内存索引);
-#: - `qdrant-local`  —— 显式 opt-in;由组合根装配 Qdrant Local 后端。
+#: - `memory`        —— **默认**,与 S2-C 行为完全一致(哈希嵌入 + 内存索引);
+#: - `qdrant-local`  —— 显式 opt-in;由组合根装配 Qdrant Local 后端;
+#: - `bm25`          —— 显式 opt-in;**词法**检索(字符 3-gram BM25),由组合根
+#:                      在装配期用已校验的当前语料即时构建,不落盘。
 #:
-#: 刻意**不提供** `auto` / `fallback` 之类的取值。
-RagBackend = Literal["memory", "qdrant-local"]
+#: 刻意**不提供** `auto` / `fallback` 之类的取值:选了 `bm25` 却在失败时
+#: 悄悄用 `memory` 作答,会让"这个回答来自哪种检索"在日志里无从区分。
+RagBackend = Literal["memory", "qdrant-local", "bm25"]
 
 
 class Settings(BaseSettings):

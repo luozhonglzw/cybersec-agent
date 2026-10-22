@@ -312,14 +312,32 @@ curl -X POST http://127.0.0.1:8000/ask \
 
 ### The retrieval backend is explicit, and never silently falls back
 
-Two backends exist and are selected in the composition root only:
+Three backends exist and are selected in the composition root only:
 
 | `RAG_BACKEND` | Behaviour |
 | --- | --- |
-| `memory` (**default**) | Builds the in-memory index from the corpus at startup. Identical to the S2-C behaviour. |
+| `memory` (**default**) | Builds the in-memory hash-embedding index from the corpus at startup. Identical to the S2-C behaviour. |
 | `qdrant-local` | Opens the Qdrant Local index at `RAG_QDRANT_PATH` (default `data/knowledge_index`). |
+| `bm25` | Builds a **lexical** character 3-gram BM25 index from the validated corpus at startup. Nothing is persisted. |
 
-There is no `auto` and no fallback. If `qdrant-local` is selected and the index is missing, stale, corrupt, or locked, the endpoint still returns **HTTP 200** with `retrieval.status = "unavailable"`, `grounded = false`, and `citations: []` — "no evidence this time" is a business result, not a server fault. Only a failed **model call** returns 502. Startup with a broken corpus (as opposed to a broken index) degrades `/ask` to the fixed 503 `{"detail":"rag service unavailable"}` and leaves `/chat`, `/triage`, `/resume`, and `/audit/events` unaffected.
+`bm25` is a lexical ranker, **not** an embedding model. It scores documents by
+character 3-gram overlap with IDF weighting (`k1 = 1.5`, `b = 0.75`); it has no
+notion of synonymy or entailment. A question phrased with different words than
+the corpus will not match, even if the answer is present — that is a property of
+the method, not a bug to be tuned away. Because the index is built from the same
+corpus snapshot that `load_corpus()` has already verified (manifest hash and
+document count), there is no "index is older than the corpus" window and
+therefore no six-field index identity to check. `bm25` deliberately has **no**
+`verify()`: fabricating a check that can only pass would make "verified" a
+meaningless word in the logs.
+
+`retrieval.status = "empty"` means **this query shared no character 3-gram with
+any document** — it does not mean the knowledge base has no answer. Under the
+`memory` backend, `empty` is instead produced by the score threshold. In both
+cases, only `invalid_citations` (not `empty`) is evidence that the corpus could
+not support the answer.
+
+There is no `auto` and no fallback. If `qdrant-local` is selected and the index is missing, stale, corrupt, or locked, the endpoint still returns **HTTP 200** with `retrieval.status = "unavailable"`, `grounded = false`, and `citations: []` — "no evidence this time" is a business result, not a server fault. Only a failed **model call** returns 502. Startup with a broken corpus (as opposed to a broken index) degrades `/ask` to the fixed 503 `{"detail":"rag service unavailable"}` and leaves `/chat`, `/triage`, `/resume`, and `/audit/events` unaffected. A `bm25` build failure is a corpus-level failure, so it takes the same 503 path; it never silently answers from the `memory` backend.
 
 The index is an operational artifact, built by an explicit command — never at application startup:
 
@@ -334,13 +352,29 @@ python scripts/build_knowledge_index.py --check          # verify against the co
 
 ### Offline retrieval evaluation
 
-The repository ships a 20-query labelled set (16 answerable / 4 unanswerable) at `knowledge/eval/queries.jsonl` and a deterministic evaluator that calls **no LLM**:
+The repository ships two labelled sets and a deterministic evaluator that calls **no LLM**:
+
+| Set | Queries | Answerable | Role |
+| --- | --- | --- | --- |
+| `knowledge/eval/queries.jsonl` | 20 | 16 | **Frozen baseline** (S2). Never edited afterwards. Four gold documents share **zero** character 3-grams with their question. |
+| `knowledge/eval/queries-s2f2-independent.jsonl` | 13 | 11 | **Supplementary validation set.** Labels were written before any ranking was inspected, but the set was created *after* the BM25 diagnosis and used to validate it — so it is **not** a fully blind test. Targets documents the first set never covers. |
 
 ```bash
-python scripts/eval_rag.py --qdrant-index-dir data/knowledge_index
+python scripts/eval_rag.py --include-bm25
+python scripts/eval_rag.py --include-bm25 \
+    --queries knowledge/eval/queries-s2f2-independent.jsonl
 ```
 
-It reports `Recall@5`, `MRR@5`, and `empty_rate` per backend. On the current corpus the two backends return identical results by construction — the Qdrant Local adapter reuses the same `Retriever`, the same deterministic top-k, and the same citation ids.
+It reports `Recall@5`, `MRR@5`, and `empty_rate` per backend. `memory` and `qdrant-local` return identical results by construction — the Qdrant Local adapter reuses the same `Retriever`, the same deterministic top-k, and the same citation ids.
+
+Current numbers (descriptive, not a target to tune against):
+
+| Set | `memory` (hash baseline) | `bm25` |
+| --- | --- | --- |
+| 20-query | 0.6562 / 0.6771 | 0.8125 / 0.9375 |
+| independent 13 | 0.6818 / 0.7273 | 0.9545 / 0.9545 |
+
+**The two sets must be reported separately and never merged or averaged.** The independent set has a median query↔document character-3-gram overlap of 0.500 against 0.278 for the 20-query set, and zero zero-overlap pairs against four — it is simply **easier**, so it can validate the *direction* of the lexical gain but not its magnitude, and it supports **no** generalisation claim. Neither number describes answer quality: `Recall@5` and `MRR@5` measure retrieval only, and the four zero-overlap gold documents are missed by **both** rankers because the lexical signal is absent. BM25 is a lexical ranker: it cannot recover a paraphrase that shares no character 3-gram with the corpus, so it does not solve semantic rewriting.
 
 The full backend selection, failure semantics, and Qdrant Local's reconstruction constraints are documented in [docs/qdrant-local.md](docs/qdrant-local.md); the corpus provenance rules are in [knowledge/README.md](knowledge/README.md).
 
@@ -371,6 +405,31 @@ curl -sS -X POST http://127.0.0.1:8000/ask \
 uv run --no-sync python scripts/eval_rag.py --qdrant-index-dir data/knowledge_index
 ```
 
+The lexical backend needs no build step and no index directory:
+
+```bash
+# same API, different retriever — nothing is written to disk
+RAG_BACKEND=bm25 uv run --no-sync uvicorn app.api.main:app --port 8000
+
+curl -sS -X POST http://127.0.0.1:8000/ask \
+  -H "Authorization: Bearer $ANALYST_KEY" -H "Content-Type: application/json" \
+  -d '{"question": "日志组件为什么会在记录字符串时发起对外连接?"}' | python -m json.tool
+# → 200, grounded=true when the model cites a real hit
+
+curl -sS -X POST http://127.0.0.1:8000/ask \
+  -H "Authorization: Bearer $ANALYST_KEY" -H "Content-Type: application/json" \
+  -d '{"question": "zzzzz qqqqq"}' | python -m json.tool
+# → 200, retrieval.status="empty", grounded=false, citations=[]
+#   (no shared character 3-gram; this is not "the corpus has no answer")
+
+# swap the backend on the running deployment only by restarting with another
+# RAG_BACKEND value — there is no runtime switch and no auto-detection
+```
+
+Neither demo needs a real LLM provider key to exercise retrieval: the `/ask`
+tests drive the same graph with a scripted model (`tests/test_api/test_ask.py`),
+and `scripts/eval_rag.py` calls no model at all.
+
 `/ask` binds exactly one tool, `search_knowledge_tool`, and it takes no resource
 locating parameter — no `path`, `url`, `collection`, or `index_path`. The model
 chooses what to ask, not where to read.
@@ -389,7 +448,7 @@ chooses what to ask, not where to read.
 - **Offline evaluation harness** — three baselines, five separately reported metric classes, an independent evidence oracle, metamorphic relations, and no composite score.
 - **Real-provider evaluation harness** — a budget governor, a network-egress guard built on interpreter audit hooks, per-cell raw-record persistence with fsync, and frozen failure taxonomy.
 - **Read-only MCP interface** — three read-only tools (security-log query, threat-intel lookup, deterministic risk analysis) published over a local stdio MCP server, reusing the existing tool functions as an alternate read-only surface. Response planning is not published, and no remote transport or authentication server is implemented.
-- **Knowledge-base Q&A with validated citations** — `POST /ask` answers questions from a version-controlled, self-authored corpus through a single read-only retrieval tool, and returns a structural (not factual) groundedness verdict plus citations checked against the actual retrieved documents. The retrieval backend (`memory` or `qdrant-local`) is explicit configuration selected in the composition root, with no silent fallback: a missing or corrupt index returns 200 + `unavailable`, not a degraded answer.
+- **Knowledge-base Q&A with validated citations** — `POST /ask` answers questions from a version-controlled, self-authored corpus through a single read-only retrieval tool, and returns a structural (not factual) groundedness verdict plus citations checked against the actual retrieved documents. The retrieval backend (`memory`, `qdrant-local`, or `bm25`) is explicit configuration selected in the composition root, with no silent fallback: a missing or corrupt index returns 200 + `unavailable`, a broken corpus or a failed `bm25` build returns 503, and neither ever degrades into an answer from a different retriever.
 - **Fully offline retrieval evaluation** — a 20-query labelled set with `Recall@5` / `MRR@5` / `empty_rate` computed deterministically over both backends, with no LLM call and no network access.
 - **Read-only audit query API** — `GET /audit/events` exposes the existing append-only audit trail as a bounded, deterministically ordered read surface (`thread_id` / `event` / `limit` / `order`). It is a read path only: no audit writes, no policy / approval / HITL / checkpoint mutation, and no client control over the audit database path. Reads are scope-filtered by role (viewer: all threads; analyst: owned threads; approver: owned or explicitly assigned threads), enforced before any content is fetched.
 - **Optional PostgreSQL audit backend** — an explicit opt-in persistence backend behind the same `AuditStore` contract, with a separated migration-owner role and a runtime role limited to `SELECT` / `INSERT`. SQLite stays the default, there is no automatic fallback and no dual-write, and the PostgreSQL backend stores audit / incident / action-request data only — not LangGraph checkpoints.
@@ -459,7 +518,7 @@ This is a research and engineering prototype. The limitations below are properti
 
 **The agent path requires a provider.** `/chat`, `/triage`, and `/resume` run through the model, and there is no offline mode for that path. The deterministic and read-only parts of the system — tools, policy, audit, MCP — can be exercised without a provider; the agent cannot.
 
-**`/ask` groundedness is structural, not factual.** `grounded = true` means the citations in the answer all point at documents actually retrieved in this request and no fabricated or malformed citation was found. It does not mean the answer is correct, and it does not mean the retrieved documents were relevant. The offline evaluator measures the retrieval layer only (`Recall@5` / `MRR@5` on a 20-query set against the hash-embedding baseline); answer-layer quality is not evaluated in this phase and must not be inferred from the retrieval numbers.
+**`/ask` groundedness is structural, not factual.** `grounded = true` means the citations in the answer all point at documents actually retrieved in this request and no fabricated or malformed citation was found. It does not mean the answer is correct, and it does not mean the retrieved documents were relevant. The offline evaluator measures the retrieval layer only (`Recall@5` / `MRR@5` against the hash-embedding and BM25 baselines, on two separate labelled sets that must not be merged); answer-layer quality is not evaluated in this phase and must not be inferred from the retrieval numbers.
 
 **Evaluation scope is narrow.** The real-provider pilot is 108 runs over 8 tasks, one provider and endpoint configuration, one requested model, one execution window, and a single matched injection task with a denominator of 6. It is a bounded observation, not a general result.
 

@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import Protocol, runtime_checkable
 
 from app.rag.chunking import CHUNKER_VERSION, chunk_corpus
 from app.rag.corpus import LoadedCorpus
@@ -59,6 +60,20 @@ SNIPPET_MAX_CHARS = 400
 MIN_HIT_SCORE = 0.0
 
 
+@runtime_checkable
+class SupportsRetrieve(Protocol):
+    """工具层真正依赖的契约:**只有** `retrieve(query, top_k=)`。
+
+    向量检索器与 BM25 检索器都满足它。把它写成协议而不是要求继承
+    `Retriever`,是因为 BM25 没有向量存储与索引身份 —— 强行继承会逼出
+    一个恒真的 `verify()`,而"校验恒过"比"没有校验"更糟:它会让日志里
+    的"已校验"变成一句空话。
+    """
+
+    def retrieve(self, query: str, *, top_k: int | None = None) -> RetrievalResult:
+        ...
+
+
 def verify_index(
     manifest: CorpusManifest,
     metadata: IndexMetadata,
@@ -83,6 +98,61 @@ def verify_index(
                 f"knowledge index is unavailable ({reason})",
                 reason=f"index-{reason}",
             )
+
+
+def hit_from_scored(
+    item: ScoredChunk, documents: Mapping[str, KnowledgeDocument]
+) -> RetrievalHit:
+    """把"块 + 分数"转成文档级命中。**引用构造的唯一实现。**
+
+    公开而非私有(S2-G2):BM25 候选要复用同一套引用语义 —— `citation_id
+    == doc_id`、片段截断、以及"索引引用了语料里不存在的文档"时的 fail
+    closed。若 BM25 另写一份,两条检索路径的引用就会各自漂移,而引用正是
+    答案校验的输入。
+    """
+    chunk = item.chunk
+    document = documents.get(chunk.doc_id)
+    if document is None:
+        raise IndexUnavailable(
+            "knowledge index references an unknown document",
+            reason="index-unknown-document",
+        )
+    return RetrievalHit(
+        citation_id=document.doc_id,
+        doc_id=document.doc_id,
+        chunk_id=chunk.chunk_id,
+        source_id=document.source_id,
+        source_type=document.source_type,
+        title=document.title,
+        url=document.source_url,
+        score=item.score,
+        snippet=snippet_of(chunk.text, SNIPPET_MAX_CHARS),
+    )
+
+
+def hits_from_candidates(
+    candidates: Sequence[ScoredChunk],
+    documents: Mapping[str, KnowledgeDocument],
+    *,
+    depth: int,
+    min_score: float = MIN_HIT_SCORE,
+) -> list[RetrievalHit]:
+    """候选块 → 文档级 top-k。三条排序规则只在这里实现一次。
+
+    1. 先按 `(-score, chunk_id)` 重排,同分顺序不依赖后端;
+    2. `score <= min_score` 的候选丢弃(零分不是命中);
+    3. 按 `doc_id` 去重取最高分块,再按 `(-score, citation_id)` 截断。
+    """
+    ordered = sorted(candidates, key=lambda item: (-item.score, item.chunk.chunk_id))
+    best_per_document: dict[str, ScoredChunk] = {}
+    for item in ordered:
+        if item.score <= min_score:
+            continue
+        # ordered 已按分数降序,首次出现的即为该文档的最高分块。
+        best_per_document.setdefault(item.chunk.doc_id, item)
+
+    hits = [hit_from_scored(item, documents) for item in best_per_document.values()]
+    return sorted_by_score(hits)[:depth]
 
 
 class Retriever:
@@ -173,37 +243,11 @@ class Retriever:
     # ---- 内部 ----
 
     def _to_hits(self, candidates: Sequence[ScoredChunk], depth: int) -> list[RetrievalHit]:
-        ordered = sorted(
-            candidates, key=lambda item: (-item.score, item.chunk.chunk_id)
-        )
-        best_per_document: dict[str, ScoredChunk] = {}
-        for item in ordered:
-            if item.score <= self._min_score:
-                continue
-            # ordered 已按分数降序,首次出现的即为该文档的最高分块。
-            best_per_document.setdefault(item.chunk.doc_id, item)
-
-        hits = [self._hit(item) for item in best_per_document.values()]
-        return sorted_by_score(hits)[:depth]
-
-    def _hit(self, item: ScoredChunk) -> RetrievalHit:
-        chunk = item.chunk
-        document = self._documents.get(chunk.doc_id)
-        if document is None:
-            raise IndexUnavailable(
-                "knowledge index references an unknown document",
-                reason="index-unknown-document",
-            )
-        return RetrievalHit(
-            citation_id=document.doc_id,
-            doc_id=document.doc_id,
-            chunk_id=chunk.chunk_id,
-            source_id=document.source_id,
-            source_type=document.source_type,
-            title=document.title,
-            url=document.source_url,
-            score=item.score,
-            snippet=snippet_of(chunk.text, SNIPPET_MAX_CHARS),
+        return hits_from_candidates(
+            candidates,
+            self._documents,
+            depth=depth,
+            min_score=self._min_score,
         )
 
 

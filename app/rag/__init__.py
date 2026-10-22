@@ -18,10 +18,20 @@
 | `store` | 向量存储契约 + 内存实现 | 无 |
 | `corpus` | 语料与清单加载 | **只读本地文件** |
 | `retriever` | 完整性校验 + 确定性 top-k | 无 |
+| `bm25` | 词法检索候选(字符 3-gram BM25) | 无 |
 
 `HashingEmbedder` 是可复现的**基线**,不是语义模型;它产出的质量数字
-只描述该基线。
+只描述该基线。`bm25` 同样只是**词法**候选:它不消除"零共享 3-gram"
+这一类未命中,也**不是** `/ask` 的默认后端。
 """
+from app.rag.bm25 import (
+    BM25_B,
+    BM25_K1,
+    BM25_NGRAM,
+    BM25Index,
+    BM25Retriever,
+    build_bm25_retriever,
+)
 from app.rag.chunking import (
     CHUNKER_VERSION,
     CHUNK_MAX_CHARS,
@@ -60,8 +70,11 @@ from app.rag.retriever import (
     MIN_HIT_SCORE,
     SNIPPET_MAX_CHARS,
     Retriever,
+    SupportsRetrieve,
     build_in_memory_retriever,
     build_index_metadata,
+    hit_from_scored,
+    hits_from_candidates,
     verify_index,
 )
 from app.rag.store import InMemoryVectorStore, VectorStore, check_vector
@@ -86,6 +99,11 @@ from app.rag.types import (
 
 __all__ = [
     "APPLICATION_ROOT",
+    "BM25_B",
+    "BM25_K1",
+    "BM25_NGRAM",
+    "BM25Index",
+    "BM25Retriever",
     "CANDIDATE_MULTIPLIER",
     "CHUNKER_VERSION",
     "CHUNK_MAX_CHARS",
@@ -118,7 +136,9 @@ __all__ = [
     "ScoredChunk",
     "SourceProvenance",
     "StoreError",
+    "SupportsRetrieve",
     "VectorStore",
+    "build_bm25_retriever",
     "build_in_memory_retriever",
     "build_index_metadata",
     "check_vector",
@@ -128,6 +148,8 @@ __all__ = [
     "corpus_sha256",
     "cosine_similarity",
     "derive_doc_id",
+    "hit_from_scored",
+    "hits_from_candidates",
     "load_corpus",
     "normalize_query",
     "parse_documents",

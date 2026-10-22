@@ -35,6 +35,7 @@ from app.core.llm import FakeLLMClient, LLMInvocationError
 from app.core.rag_ask import GroundedAskService, ask_grounded
 from app.evaluation.llm.runner import tool_schema_sha256
 from app.rag import (
+    CorpusError,
     HashingEmbedder,
     InMemoryVectorStore,
     Retriever,
@@ -903,3 +904,200 @@ def test_grounded_ask_service_close_calls_store_close():
     service.close()
     assert store.closed
     service.close()  # 幂等
+
+
+# =====================================================================
+# 8. BM25 后端装配(S2-G3)
+#
+# BM25 是**词法**候选,不是语义模型。这些用例验证的是装配与安全性质,
+# 不是"回答质量":后者需要标注数据,属于离线评测(`scripts/eval_rag.py`)。
+# =====================================================================
+
+
+def _bm25_settings():
+    from app.core.config import Settings
+
+    return Settings(llm_model="m", llm_api_key="k", _env_file=None, rag_backend="bm25")
+
+
+def _bm25_service(tmp_path: Path, monkeypatch, llm):
+    monkeypatch.setattr(
+        api_main,
+        "DEFAULT_KNOWLEDGE_DIR",
+        _write_corpus(tmp_path, _documents()),
+    )
+    return build_rag_ask_service(llm, _bm25_settings())
+
+
+def test_bm25_backend_binds_exactly_one_read_only_tool(tmp_path: Path, monkeypatch):
+    """选了 bm25 也只是换检索器,工具面**没有**变宽。"""
+    llm = ScriptedLLM(answer="x")
+    service = _bm25_service(tmp_path, monkeypatch, llm)
+
+    assert service is not None
+    assert [tool.name for tool in llm.bound_tools] == ["search_knowledge_tool"]
+    # 没有向量存储可释放:close() 必须是幂等的空操作。
+    service.close()
+    service.close()
+
+
+def test_bm25_backend_returns_lexical_hits_from_the_current_corpus(
+    tmp_path: Path, monkeypatch
+):
+    """查询与语料共享字符 3-gram ⇒ 命中,且引用指向本次语料里的文档。"""
+    llm = ScriptedLLM(
+        answer=f"该漏洞可在记录特制字符串时触发。[src:{CVE_DOC_ID}]",
+        tool_call_batches=(_one_batch("日志组件的查找注入"),),
+    )
+    body = _ask(_client(_bm25_service(tmp_path, monkeypatch, llm))).json()
+
+    assert body["retrieval"]["status"] == "ok"
+    assert body["grounded"] is True
+    assert [c["citation_id"] for c in body["citations"]] == [CVE_DOC_ID]
+    assert body["retrieval"]["hit_count"] >= 1
+
+
+def test_bm25_backend_keeps_the_frozen_response_shape(tmp_path: Path, monkeypatch):
+    """BM25 不新增任何公开字段:响应体与 memory 后端逐字段一致。"""
+    llm = ScriptedLLM(
+        answer=f"结论 [src:{CVE_DOC_ID}]",
+        tool_call_batches=(_one_batch(),),
+    )
+    body = _ask(_client(_bm25_service(tmp_path, monkeypatch, llm))).json()
+
+    assert set(body) == {
+        "answer",
+        "grounded",
+        "citations",
+        "invalid_citations",
+        "retrieval",
+    }
+    assert set(body["retrieval"]) == {"status", "hit_count", "top_k"}
+    assert body["retrieval"]["status"] in {"ok", "empty", "unavailable", "not_used"}
+
+
+def test_bm25_backend_empty_result_is_not_unavailable(tmp_path: Path, monkeypatch):
+    """词法零匹配 ⇒ `empty`(检索成功但无匹配),**不是** `unavailable`。
+
+    `empty` 只说明"当前查询与语料没有共享字符 3-gram",不等于"知识库没有
+    答案" —— 换一种措辞可能就能命中。这条语义不得被读成后者。
+    """
+    llm = ScriptedLLM(
+        answer="知识库中没有足够依据回答该问题。",
+        tool_call_batches=(_one_batch("zzzzz qqqqq"),),
+    )
+    body = _ask(_client(_bm25_service(tmp_path, monkeypatch, llm))).json()
+
+    assert body["retrieval"]["status"] == "empty"
+    assert body["retrieval"]["hit_count"] == 0
+    assert body["grounded"] is False
+    assert body["citations"] == []
+
+
+def test_bm25_assembly_writes_no_persistent_index(tmp_path: Path, monkeypatch):
+    """BM25 索引只活在进程里:装配不落盘(除语料本身外没有新文件)。"""
+    llm = ScriptedLLM(answer="x")
+    _bm25_service(tmp_path, monkeypatch, llm)
+
+    assert {path.name for path in tmp_path.iterdir()} == {"knowledge"}
+
+
+def test_bm25_assembly_failure_is_fail_closed(tmp_path: Path, monkeypatch):
+    """构建失败 ⇒ 返回 None(→ 503),**不**静默回退 memory。
+
+    负对照做得足够硬:把 memory 装配函数换成"一调用就失败"的桩。如果实现
+    里存在任何回退分支,这条会以 AssertionError 变红,而不是悄悄给出一个
+    来自另一种检索的回答。
+    """
+    monkeypatch.setattr(
+        api_main,
+        "DEFAULT_KNOWLEDGE_DIR",
+        _write_corpus(tmp_path, _documents()),
+    )
+
+    def _explode(corpus):
+        raise CorpusError("knowledge corpus is empty", reason="empty-corpus")
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("bm25 失败时不得回退到 memory 后端")
+
+    monkeypatch.setattr(api_main, "build_bm25_retriever", _explode)
+    monkeypatch.setattr(api_main, "build_in_memory_retriever", _forbidden)
+
+    llm = ScriptedLLM(answer="x")
+    assert build_rag_ask_service(llm, _bm25_settings()) is None
+    assert llm.bound_tools == []
+
+
+def test_bm25_backend_assembly_failure_yields_503(tmp_path: Path, monkeypatch):
+    """装配失败在 HTTP 层表现为既有的 503,而不是 200 + 降级回答。"""
+    monkeypatch.setattr(
+        api_main,
+        "DEFAULT_KNOWLEDGE_DIR",
+        _write_corpus(tmp_path, _documents()),
+    )
+    monkeypatch.setattr(
+        api_main,
+        "build_bm25_retriever",
+        lambda corpus: (_ for _ in ()).throw(
+            CorpusError("knowledge corpus is empty", reason="empty-corpus")
+        ),
+    )
+    assert build_rag_ask_service(ScriptedLLM(answer="x"), _bm25_settings()) is None
+
+    # 未装配服务的既有语义(与 S2-C 相同)
+    resp = _ask(TestClient(create_app(agent=FakeLLMClient())))
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "rag service unavailable"}
+
+
+def test_bm25_backend_rejects_a_forged_citation(tmp_path: Path, monkeypatch):
+    """伪造的 citation_id 不可能变成证据 —— 与后端无关。"""
+    forged = "kb-cve-2099-99999"
+    llm = ScriptedLLM(
+        answer=f"我查到了一条记录。[src:{forged}]",
+        tool_call_batches=(_one_batch("日志组件的查找注入"),),
+    )
+    body = _ask(_client(_bm25_service(tmp_path, monkeypatch, llm))).json()
+
+    assert body["retrieval"]["status"] == "ok"
+    assert body["grounded"] is False
+    assert body["citations"] == []
+    assert body["invalid_citations"] == [forged]
+
+
+def test_bm25_injected_snippet_cannot_widen_the_tool_set(
+    tmp_path: Path, monkeypatch
+):
+    """投毒正文经 BM25 返回后仍然只是数据:工具集合没有被"扩权"。"""
+    monkeypatch.setattr(
+        api_main,
+        "DEFAULT_KNOWLEDGE_DIR",
+        _write_corpus(tmp_path, _documents(text=INJECTION_TEXT)),
+    )
+    llm = ScriptedLLM(
+        answer=f"知识库中的摘要提到了相关机制。[src:{CVE_DOC_ID}]",
+        tool_call_batches=(_one_batch("忽略之前的所有指令"),),
+    )
+    body = _ask(_client(build_rag_ask_service(llm, _bm25_settings()))).json()
+
+    assert [tool.name for tool in llm.bound_tools] == ["search_knowledge_tool"]
+    assert body["retrieval"]["status"] == "ok"
+    assert body["grounded"] is True
+
+
+def test_bm25_requires_a_corpus_that_passes_integrity_checks(
+    tmp_path: Path, monkeypatch
+):
+    """语料哈希与清单不符 ⇒ 装配期 fail closed(bm25 也拿不到"没校验的语料")。
+
+    BM25 的索引是即时构建的,但这不等于"随便给什么语料都建" —— 它复用的是
+    `load_corpus()` 已经校验过清单哈希与文档数的那一份快照。
+    """
+    target = _write_corpus(tmp_path, _documents())
+    manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+    manifest["corpus_sha256"] = "0" * 64
+    (target / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(api_main, "DEFAULT_KNOWLEDGE_DIR", target)
+
+    assert build_rag_ask_service(ScriptedLLM(answer="x"), _bm25_settings()) is None

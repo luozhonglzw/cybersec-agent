@@ -18,7 +18,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.rag import HashingEmbedder, InMemoryVectorStore, Retriever, load_corpus
+from app.rag import (
+    BM25Retriever,
+    HashingEmbedder,
+    InMemoryVectorStore,
+    Retriever,
+    load_corpus,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAG_ROOT = REPO_ROOT / "app" / "rag"
@@ -206,6 +212,7 @@ def test_public_entry_points_expose_no_path_or_url():
         InMemoryVectorStore.search,
         InMemoryVectorStore.upsert,
         InMemoryVectorStore.metadata,
+        BM25Retriever.retrieve,
     ]
     for entry in entry_points:
         parameters = inspect.signature(entry).parameters

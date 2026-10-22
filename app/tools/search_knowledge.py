@@ -51,7 +51,7 @@ from app.rag.errors import (
     RetrievalError,
     StoreError,
 )
-from app.rag.retriever import Retriever
+from app.rag.retriever import SupportsRetrieve
 from app.rag.types import DEFAULT_TOP_K, RetrievalResult, clamp_top_k, normalize_query
 
 #: 查询长度上限。查询会被规范化后嵌入,超长输入既没有检索价值,又会
@@ -111,7 +111,7 @@ def _hits_envelope(result: RetrievalResult) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _search(retriever: Retriever, text: str, depth: int) -> str:
+def _search(retriever: SupportsRetrieve, text: str, depth: int) -> str:
     """同步检索并翻译成信封。异常在这里被**分类**,而不是冒到图里。
 
     图里的 `tools_node` 会兜住任何异常,但兜住后的内容是
@@ -139,7 +139,7 @@ def _search(retriever: Retriever, text: str, depth: int) -> str:
     return _hits_envelope(result)
 
 
-def build_search_knowledge_tool(retriever: Retriever) -> BaseTool:
+def build_search_knowledge_tool(retriever: SupportsRetrieve) -> BaseTool:
     """把检索器包成只读工具 `search_knowledge_tool`。
 
     参数签名被刻意压到两个:`query` 与 `top_k`。两者都不是资源定位符 ——

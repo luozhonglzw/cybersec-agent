@@ -13,12 +13,23 @@
     # 机器可读输出
     python scripts/eval_rag.py --json
 
+    # 同时评估词法候选 bm25(S2-G3;不落盘,无需构建索引)
+    python scripts/eval_rag.py --include-bm25
+
+    # 换一份评测集(例如 S2-F2 的独立 13 条)
+    python scripts/eval_rag.py --include-bm25 \
+        --queries knowledge/eval/queries-s2f2-independent.jsonl
+
 指标
 ----
 
 - **Recall@5**: answerable 查询中,黄金文档出现在 top-5 检索结果中的比例。
 - **MRR@5**: answerable 查询中,首个命中黄金文档的排名的倒数(无命中则为 0)。
 - **empty_rate**: 所有查询中检索返回零命中的比例(探测索引覆盖漏洞)。
+
+两套标注集**不可合并**:`queries.jsonl`(20 条)与
+`queries-s2f2-independent.jsonl`(13 条)难度不同(词面重合中位数 0.278 vs
+0.500,零重合 4 vs 0),分数只能分别看,不能平均。
 
 本脚本**不调用任何 LLM**, purely deterministic。
 """
@@ -37,6 +48,7 @@ from app.rag.corpus import DEFAULT_KNOWLEDGE_DIR, load_corpus  # noqa: E402
 from app.rag.embedding import HashingEmbedder  # noqa: E402
 from app.rag.errors import IndexUnavailable  # noqa: E402
 from app.rag.retriever import build_in_memory_retriever  # noqa: E402
+from app.rag.bm25 import build_bm25_retriever  # noqa: E402
 from app.rag.types import normalize_query  # noqa: E402
 from app.vectorstore import build_qdrant_retriever  # noqa: E402
 
@@ -66,6 +78,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         dest="as_json",
         action="store_true",
         help="以 JSON 输出结果",
+    )
+    parser.add_argument(
+        "--include-bm25",
+        action="store_true",
+        help="同时评估词法候选 bm25(字符 3-gram;不落盘,无需构建索引)",
+    )
+    parser.add_argument(
+        "--queries",
+        type=Path,
+        default=EVAL_PATH,
+        help=f"评测集路径,默认 {EVAL_PATH}",
     )
     return parser.parse_args(argv)
 
@@ -123,11 +146,11 @@ def _evaluate(retriever, queries: list[dict]) -> dict:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    if not EVAL_PATH.exists():
-        print(f"error: eval set not found at {EVAL_PATH}", file=sys.stderr)
+    if not args.queries.exists():
+        print(f"error: eval set not found at {args.queries}", file=sys.stderr)
         return 2
 
-    queries = _load_queries(EVAL_PATH)
+    queries = _load_queries(args.queries)
     corpus = load_corpus(args.knowledge_dir)
     embedder = HashingEmbedder()
 
@@ -136,6 +159,11 @@ def main(argv: list[str] | None = None) -> int:
     memory_result["backend"] = "memory"
 
     results = [memory_result]
+
+    if args.include_bm25:
+        bm25_result = _evaluate(build_bm25_retriever(corpus), queries)
+        bm25_result["backend"] = "bm25"
+        results.append(bm25_result)
 
     if args.qdrant_index_dir is not None:
         try:

@@ -67,3 +67,19 @@ def test_invalid_rag_backend_is_rejected():
     """RAG 后端取值集封闭:没有 auto / fallback / elastic 之类的别名。"""
     with pytest.raises(ValidationError):
         Settings(llm_model="m", llm_api_key="k", rag_backend="elastic")
+
+
+@pytest.mark.parametrize("backend", ["memory", "qdrant-local", "bm25"])
+def test_rag_backend_accepts_exactly_three_values(backend):
+    """取值集恰好三个(S2-G3 加入 bm25);多一个少一个都应被发现。"""
+    s = Settings(llm_model="m", llm_api_key="k", rag_backend=backend)
+    assert s.rag_backend == backend
+
+
+def test_rag_backend_literal_carries_no_extra_values():
+    """字面量本身也钉住:加后端必须改这条测试,不能顺手加。"""
+    from typing import get_args
+
+    from app.core.config import RagBackend
+
+    assert get_args(RagBackend) == ("memory", "qdrant-local", "bm25")
