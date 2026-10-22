@@ -1,6 +1,6 @@
 [project]
 name = "cybersec-agent"
-version = "0.4.0"
+version = "0.5.0"
 description = "A LangGraph-based security operations agent with deterministic policy, human approval, and auditable tool use."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -74,3 +74,12 @@ markers = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+# v0.5.0-S4:语料是**运行时输入**,必须随 wheel 分发。
+#
+# `app/rag/corpus.py` 的 `APPLICATION_ROOT = Path(__file__).resolve().parents[2]`:
+# 在源码树里它是仓库根,装进 wheel 之后它是 `site-packages`。因此 wheel 必须
+# 在**顶层**带上 `knowledge/`,否则 `DEFAULT_KNOWLEDGE_DIR` 指向一个不存在的
+# `site-packages/knowledge`,`load_corpus()` 抛 `CorpusError`,`/ask` 恒 503 ——
+# 与容器缺语料是同一个故障。`force-include` 是字节级拷贝,`corpus.jsonl` 的
+# sha256 因此保持不变(清单钉的是字节)。
+force-include = { "knowledge" = "knowledge" }

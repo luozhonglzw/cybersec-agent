@@ -84,7 +84,7 @@ class Settings(BaseSettings):
 
     # ---- RAG 后端选择(Phase v0.5.0-S2-E)----
     # 默认 memory ⇒ 不设任何环境变量的部署与 S2-C 行为一致。
-    # qdrant-local 需要显式构建索引(见 scripts/build_qdrant_index.py)。
+    # qdrant-local 需要显式构建索引(见 scripts/build_knowledge_index.py)。
     rag_backend: RagBackend = "memory"
     rag_qdrant_path: Path = Path("data/knowledge_index")
 

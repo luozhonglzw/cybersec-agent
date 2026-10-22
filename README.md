@@ -357,7 +357,7 @@ The repository ships two labelled sets and a deterministic evaluator that calls 
 | Set | Queries | Answerable | Role |
 | --- | --- | --- | --- |
 | `knowledge/eval/queries.jsonl` | 20 | 16 | **Frozen baseline** (S2). Never edited afterwards. Four gold documents share **zero** character 3-grams with their question. |
-| `knowledge/eval/queries-s2f2-independent.jsonl` | 13 | 11 | **Supplementary validation set.** Labels were written before any ranking was inspected, but the set was created *after* the BM25 diagnosis and used to validate it — so it is **not** a fully blind test. Targets documents the first set never covers. |
+| `knowledge/eval/queries-s2f2-independent.jsonl` | 13 | 11 | **Supplementary validation set.** Labels were written before any ranking was inspected, but the set was created *after* the BM25 diagnosis and used to validate it — so it is **not** a fully blind test and must never be presented as an unused blind hold-out. Targets documents the first set never covers. |
 
 ```bash
 python scripts/eval_rag.py --include-bm25
@@ -426,9 +426,23 @@ curl -sS -X POST http://127.0.0.1:8000/ask \
 # RAG_BACKEND value — there is no runtime switch and no auto-detection
 ```
 
-Neither demo needs a real LLM provider key to exercise retrieval: the `/ask`
-tests drive the same graph with a scripted model (`tests/test_api/test_ask.py`),
-and `scripts/eval_rag.py` calls no model at all.
+**The two kinds of demo are not interchangeable.** Steps 2–5 above are the *real*
+`/ask` path over HTTP: the API refuses to boot without `LLM_MODEL` / `LLM_API_KEY`,
+and the `curl` calls reach a model, so they need a configured provider.
+With no provider — or with an unreachable one — `/ask` returns **502**
+`{"detail":"LLM service unavailable"}`; retrieval is not what failed.
+Only step 1 (index build) and step 6 (`eval_rag.py`) are provider-free.
+
+What can be exercised **without any provider** is narrower, and it is the part
+that matters for retrieval quality:
+
+- `scripts/eval_rag.py` calls no model at all and reports `Recall@5` / `MRR@5` /
+  `empty_rate` over the labelled sets — this is the offline retrieval demo.
+- `tests/test_api/test_ask.py` drives the same graph with a scripted model, so
+  the endpoint's status, citation and RBAC semantics are covered offline.
+
+Neither of those proves anything about answer text quality; see
+[Known Limitations](#known-limitations).
 
 `/ask` binds exactly one tool, `search_knowledge_tool`, and it takes no resource
 locating parameter — no `path`, `url`, `collection`, or `index_path`. The model
@@ -454,7 +468,7 @@ chooses what to ask, not where to read.
 - **Optional PostgreSQL audit backend** — an explicit opt-in persistence backend behind the same `AuditStore` contract, with a separated migration-owner role and a runtime role limited to `SELECT` / `INSERT`. SQLite stays the default, there is no automatic fallback and no dual-write, and the PostgreSQL backend stores audit / incident / action-request data only — not LangGraph checkpoints.
 - **Static API-key authentication** — every business route requires `Authorization: Bearer <key>`. Configuration stores only SHA-256 digests; authentication is always on and fail-closed (a missing or invalid key configuration stops the process at startup). Role admission (`viewer` / `analyst` / `approver`) is enforced per route as a FastAPI dependency.
 - **Per-thread object authorization** — `POST /triage` records a single immutable ownership row (owner + full approver set) before the graph runs; `POST /resume` and `GET /audit/events` resolve the authenticated principal against that row before touching any graph, checkpointer, or audit content. Self-approval is rejected, and the audit `actor` is the authenticated principal, not a client-supplied string.
-- **Fully offline test suite** — 2,215 tests that require no network access and no API key, plus a PostgreSQL integration suite (373 cases) that the default run deselects and a separate CI job runs against a throwaway server.
+- **Fully offline test suite** — 2,283 tests that require no network access and no API key, plus a PostgreSQL integration suite (373 cases) that the default run deselects and a separate CI job runs against a throwaway server. Those 373 are configured to run, but they have **not** yet been observed green for this release: the last verified remote CI observation predates v0.3.0, so treat them as **pending CI**, not as passed.
 
 ## Security Design
 
@@ -519,6 +533,12 @@ This is a research and engineering prototype. The limitations below are properti
 **The agent path requires a provider.** `/chat`, `/triage`, and `/resume` run through the model, and there is no offline mode for that path. The deterministic and read-only parts of the system — tools, policy, audit, MCP — can be exercised without a provider; the agent cannot.
 
 **`/ask` groundedness is structural, not factual.** `grounded = true` means the citations in the answer all point at documents actually retrieved in this request and no fabricated or malformed citation was found. It does not mean the answer is correct, and it does not mean the retrieved documents were relevant. The offline evaluator measures the retrieval layer only (`Recall@5` / `MRR@5` against the hash-embedding and BM25 baselines, on two separate labelled sets that must not be merged); answer-layer quality is not evaluated in this phase and must not be inferred from the retrieval numbers.
+
+**Answer quality is NOT EVALUATED.** There is no measurement of answer correctness, faithfulness, completeness or hallucination rate for `/ask`. `Recall@5` / `MRR@5` describe the retrieval layer, and the two labelled sets (20 frozen + 13 supplementary) must always be reported separately: they are never merged, never averaged, and the supplementary set is **not** an unused blind hold-out — it was created after the BM25 diagnosis and is easier by construction. Retrieval scores are not evidence about answer text.
+
+**The Qdrant Local index rebuild is not transactionally atomic.** Rebuilding writes points and index identity as two separate steps; a crash between them can leave a partially rebuilt collection. The mitigation is ordering, not atomicity: `create()` writes only a sentinel metadata record, the real six-field identity is committed last via `commit()` after an upsert/count self-check, so a crash anywhere inside the window leaves the sentinel in place and the index is rejected as `index-metadata-invalid` rather than silently serving stale vectors. That guarantees "identity visible last", not all-or-nothing. It also means a collection whose points are complete but whose identity was never committed is now treated as **failed** — rebuild it. See [docs/qdrant-local.md](docs/qdrant-local.md) §5.
+
+**The PostgreSQL integration suite is pending CI, not passed.** The 373 `postgres`-marked cases are deselected by default and run only in the dedicated CI job against a throwaway PostgreSQL 16 container. They were **not** run locally for this release (no local server), and the last verified remote CI observation predates v0.3.0, so no green run exists for the current code. A green offline suite says nothing about them.
 
 **Evaluation scope is narrow.** The real-provider pilot is 108 runs over 8 tasks, one provider and endpoint configuration, one requested model, one execution window, and a single matched injection task with a denominator of 6. It is a bounded observation, not a general result.
 
@@ -632,7 +652,7 @@ Run the test suite — it needs no API key and makes no network calls:
 uv run pytest -q
 ```
 
-CI runs on GitHub-hosted Ubuntu in two independent jobs. The `test` job installs the locked `uv` environment and runs the offline pytest suite. The `test-postgres` job starts a throwaway PostgreSQL 16 service container, provisions the two separated roles, and runs `pytest -m postgres` explicitly — a missing or unreachable database fails that job rather than skipping it. Both jobs have been executed on a remote runner. The suite has grown since the run below (the current local count is 1,737 offline / 366 PostgreSQL; see [Project Structure](#project-structure)). The most recent verified remote observation is run [`37737872748`](https://github.com/luozhonglzw/cybersec-agent/actions/runs/37737872748) at commit `4334b14d`, where the `test` job reported **1,517 passed, 311 deselected, 2 warnings** and the `test-postgres` job reported **311 passed, 1,517 deselected, 7 warnings**, with both jobs succeeding. An earlier observation was the Phase 9.3-F commit `dd295c8`, which passed 1,463 tests on GitHub-hosted Ubuntu 24.04. Each figure records one specific run on one specific commit — it is not a standing guarantee about the current head, and it is not a claim of universal Linux compatibility. Check the Actions tab for the latest result.
+CI runs on GitHub-hosted Ubuntu in two independent jobs. The `test` job installs the locked `uv` environment and runs the offline pytest suite. The `test-postgres` job starts a throwaway PostgreSQL 16 service container, provisions the two separated roles, and runs `pytest -m postgres` explicitly — a missing or unreachable database fails that job rather than skipping it. Both jobs have been executed on a remote runner, but **not** on the current head. The suite has grown since the run below (the current local count is 2,283 offline / 373 PostgreSQL, and those 373 have not been run against a real server for this release; see [Project Structure](#project-structure) and [Known Limitations](#known-limitations)). The most recent verified remote observation is run [`37737872748`](https://github.com/luozhonglzw/cybersec-agent/actions/runs/37737872748) at commit `4334b14d`, where the `test` job reported **1,517 passed, 311 deselected, 2 warnings** and the `test-postgres` job reported **311 passed, 1,517 deselected, 7 warnings**, with both jobs succeeding. An earlier observation was the Phase 9.3-F commit `dd295c8`, which passed 1,463 tests on GitHub-hosted Ubuntu 24.04. Each figure records one specific run on one specific commit — it is not a standing guarantee about the current head, and it is not a claim of universal Linux compatibility. Check the Actions tab for the latest result.
 
 ### Demo Walkthrough
 
@@ -693,12 +713,16 @@ docker compose up --build
 
 The API is then served at <http://localhost:8000>, with interactive documentation at <http://localhost:8000/docs>.
 
-**What is baked into the image.** The image installs the locked runtime dependencies, copies the application, and generates the deterministic demo inputs at build time, so the container starts with its own data:
+**What is baked into the image.** The image installs the locked runtime dependencies, copies the application **and the knowledge corpus**, and generates the deterministic demo inputs at build time, so the container starts with its own data:
 
 ```
+/app/knowledge/corpus.jsonl       40 self-authored documents  (version-controlled, byte-pinned)
+/app/knowledge/manifest.json      corpus version + sha256 of the corpus
 /app/data/security_events.jsonl   144 synthetic events  (image-baked, deterministic)
 /app/data/threat_intel.jsonl       29 IOC records       (image-baked, deterministic)
 ```
+
+`knowledge/` is copied because it is a **runtime input**: `app/rag/corpus.py` resolves the corpus relative to the installed package (`APPLICATION_ROOT / "knowledge"`), which is `/app/knowledge` in this image. Without it the container would boot normally and `/ask` would answer the fixed 503 for every backend, so it is part of the image contract rather than documentation. The same reasoning applies to the wheel, which ships `knowledge/` via Hatch `force-include`.
 
 **What persists.** Compose declares exactly one service and one named volume:
 
@@ -725,19 +749,22 @@ Mutable audit state is the only state that outlives a container. Because the vol
 ```
 app/
   api/          FastAPI application, routes, request/response contracts
-  core/         configuration, model client, LangGraph state graph, agent, triage service
+  core/         configuration, model client, LangGraph state graph, agent, triage service, /ask service
   schemas/      Pydantic models: events, threat intel, risk, response, approval, audit
   security/     policy engine, static API-key authentication and role admission, per-thread object authorization, append-only audit store (SQLite default, PostgreSQL opt-in)
-  tools/        security tools (pure core functions + LangChain wrappers)
+  tools/        security tools (pure core functions + LangChain wrappers), including the read-only knowledge search tool
+  rag/          retrieval layer: corpus loading and integrity checks, chunking, the hash-embedding baseline, the lexical BM25 ranker, citation construction (no network, no model)
+  vectorstore/  Qdrant Local adapter (embedded mode, no server) with index identity and verified rebuild
   evaluation/   offline architecture harness and real-provider evaluation harness
   mcp/          read-only MCP adapters and the local stdio server
-data/           generated seed data and the runtime audit database (not committed)
-docs/           architecture design notes
-scripts/        deterministic seed-data generators; scripts/pg/ holds the role bootstrap SQL
-tests/          1,737 offline tests, plus a PostgreSQL integration suite (deselected by default)
+knowledge/      version-controlled, self-authored threat-intelligence corpus, its manifest, and the two labelled evaluation sets (a runtime input, not test data)
+data/           generated seed data, the runtime audit database, and the Qdrant Local index (not committed)
+docs/           architecture design notes and the Qdrant Local operating guide
+scripts/        deterministic seed-data generators, the index builder, the offline retrieval evaluator; scripts/pg/ holds the role bootstrap SQL
+tests/          2,283 offline tests, plus a PostgreSQL integration suite (deselected by default)
 migrations/     Alembic environment and the hand-written baseline schema
 alembic.ini     Alembic configuration — the connection URL comes from the environment, never from this file
-Dockerfile      minimal container image (Phase 9.3-G)
+Dockerfile      minimal container image (Phase 9.3-G); ships knowledge/ because the corpus is a runtime input
 .dockerignore   build-context exclusions (secrets, host data, agent artifacts)
 compose.yaml    single-service Compose topology with the audit-data volume
 compose.postgres.yaml  opt-in, isolated PostgreSQL test service (outside the default topology)
@@ -764,6 +791,11 @@ compose.postgres.yaml  opt-in, isolated PostgreSQL test service (outside the def
 | Per-thread object authorization and trusted audit actor | Implemented |
 | PostgreSQL audit backend (opt-in) | Implemented |
 | Containerized deployment | Implemented |
+| Knowledge-base Q&A with validated citations (`/ask`) | Experimental (v0.5.0) |
+| Pluggable retrieval backends: `memory` / `bm25` / `qdrant-local` | Experimental (v0.5.0) |
+| Offline retrieval evaluation (`Recall@5` / `MRR@5`) | Experimental (v0.5.0) |
+
+"Experimental" marks a capability that is implemented, tested and shipped, but whose quality claims are deliberately narrow: the retrieval numbers are offline lexical/embedding baselines on two small labelled sets, and answer-layer quality has not been evaluated at all. See [Known Limitations](#known-limitations).
 
 ## License
 

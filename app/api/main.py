@@ -663,7 +663,7 @@ def create_app(
     )
     app = FastAPI(
         title="CyberSec Agent",
-        version="0.4.0",
+        version="0.5.0",
         lifespan=lifespan if use_lifespan else None,
     )
     if agent is not None:

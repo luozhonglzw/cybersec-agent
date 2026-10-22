@@ -27,8 +27,18 @@ COPY pyproject.toml uv.lock .python-version ./
 #    (app/ is not present yet, so the project cannot be built at this point).
 RUN uv sync --locked --no-dev --no-install-project
 
-# 3. Application package plus exactly the two build-time seed scripts.
+# 3. Application package, the version-controlled knowledge corpus, and exactly
+#    the two build-time seed scripts.
+#
+#    `knowledge/` is a RUNTIME input, not build documentation: `app/rag/corpus.py`
+#    derives its location from the package (`APPLICATION_ROOT / "knowledge"`),
+#    which in this image resolves to `/app/knowledge`. The project is installed
+#    in editable mode by `uv sync`, so `app` is read from `/app/app` and the
+#    corpus must sit next to it. Without this COPY the image boots normally but
+#    `load_corpus()` raises `CorpusError` and `/ask` degrades to the fixed 503 —
+#    the v0.5.0 feature would be dead in the only runtime we ship.
 COPY app ./app
+COPY knowledge ./knowledge
 COPY scripts/seed_logs.py scripts/seed_threat_intel.py ./scripts/
 COPY README.md ./
 

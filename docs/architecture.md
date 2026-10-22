@@ -1014,13 +1014,15 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 
 当前基线（**发布前本地实测**，Phase v0.4.0 GATE-2，未提交工作树）：默认运行 **1,838 passed / 373 deselected**（`pytest -q`）；373 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行，本地实测 373 passed / 1,838 deselected；全量收集 2,211 例。最新远端 CI 观测是 run `37737872748`（提交 `4334b14d`）：`test` = 1,517 passed / 311 deselected、`test-postgres` = 311 passed / 1,517 deselected，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测（Phase 9.3-G 文档提交 `b4f9d4e4` 的 1,463 passed）见 §14。
 
+> **v0.5.0-S4 补充说明（计数已过期，务必读）**：上面这一段是 **v0.4.0 GATE-2 当时**的实测记录，保留原样以免篡改历史。当前 HEAD 的实际计数是：默认离线 **2,283 passed / 373 deselected**（全量收集 **2,656**）。那 373 例 `postgres` 用例在 v0.5.0 发布前**没有**在本地运行过（本机无 PostgreSQL 实例），也**没有**任何覆盖当前代码的远端 CI 绿测记录 —— 因此它们是 **pending CI**，不是 passed。任何"373 passed"的表述只能指上面那条 v0.4.0 历史记录。
+
 ### 6. hermetic 约束（Phase 8.5 收口）
 
 **全部 86 个测试模块（`tests/` 下所有 `test_*.py`，其中 10 个是需要真实 PostgreSQL 的集成模块）都不依赖仓库 `data/`。** 判据是可执行的，不是承诺：
 
 ```bash
 cd <任意不含 data/ 的目录>
-<python> -m pytest <repo>/tests -q              # 期望:1,838 passed, 373 deselected
+<python> -m pytest <repo>/tests -q              # 期望:2,283 passed, 373 deselected（v0.5.0-S4 实测）
 <python> -m pytest <repo>/tests -m postgres -q  # 需真实 PostgreSQL;同样不读仓库 data/
 ```
 
