@@ -43,6 +43,29 @@ jobs:
       - name: Run test suite
         run: uv run --no-sync pytest -q --basetemp="${{ runner.temp }}/pytest-${{ github.run_id }}-${{ github.run_attempt }}"
 
+      # Offline security demo (Phase S8). An additive gate on the SAME checkout:
+      # it re-exercises four already-implemented properties without a provider,
+      # without a network and without any credential — RBAC rejection (401/403),
+      # fabricated-citation rejection (`grounded=false`), retrieval fail-closed
+      # (`status="unavailable"`, no silent fallback to `memory`), and a
+      # test-based HITL demonstration.
+      #
+      # Every check in the script is computed from a real return value, and the
+      # script exits non-zero if any scenario fails — so a broken demo fails this
+      # job. It is placed AFTER the pytest step so the primary signal runs first
+      # and so the demo's own nested pytest subprocess cannot contend with the
+      # main suite.
+      #
+      # `--no-sync`: the locked environment was installed by the step above;
+      # re-resolving here would only re-install the same set.
+      #
+      # The timeout is a hard bound, not an expectation: the demo finishes well
+      # inside a minute, so a hang must fail fast instead of consuming the job
+      # budget.
+      - name: Run offline security demo
+        timeout-minutes: 5
+        run: uv run --no-sync python scripts/demo_offline.py
+
   # ---------------------------------------------------------------------------
   # PostgreSQL integration job (Phase v0.2.0-M1d).
   #
