@@ -249,7 +249,8 @@ def test_the_index_directory_is_not_inside_the_repository_by_default():
 
     assert DEFAULT_INDEX_DIR.is_absolute()
     assert DEFAULT_INDEX_DIR.parent.name == "data"
-    assert DEFAULT_INDEX_DIR.parent.parent.name == "chatgpt-wangan"
+    repo_root = Path(__file__).resolve().parents[2]
+    assert DEFAULT_INDEX_DIR.parent.parent == repo_root
 
 
 def test_default_index_dir_is_ignored_by_git():

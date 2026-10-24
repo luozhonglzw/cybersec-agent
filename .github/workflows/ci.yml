@@ -201,3 +201,113 @@ jobs:
             echo "The PostgreSQL suite reported skipped tests; a skip is not a pass." >&2
             exit 1
           fi
+
+  # ---------------------------------------------------------------------------
+  # Docker image build & RAG verification (Phase v0.5.0-S5).
+  #
+  # Verifies that the image builds, that `knowledge/` is correctly included,
+  # and that both `memory` and `bm25` RAG backends work inside the container.
+  # This job is ADDITIVE and does not affect the existing test jobs.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t cybersec-agent:ci .
+
+      # The corpus is a RUNTIME input: `app/rag/corpus.py` resolves it from
+      # `APPLICATION_ROOT / "knowledge"`, which in this image is `/app/knowledge`.
+      # Assert the files exist in the image BEFORE loading them, so a missing
+      # `COPY knowledge` fails with an explicit message instead of a generic
+      # `CorpusError` raised later inside the loader.
+      - name: Assert the corpus is present in the image
+        run: |
+          set -euo pipefail
+          docker run --rm cybersec-agent:ci sh -c '
+            set -e
+            test -f /app/knowledge/corpus.jsonl
+            test -f /app/knowledge/manifest.json
+            echo "corpus files present"
+          '
+
+      # Offline knowledge + retrieval gate. Everything below runs without a
+      # network, without an LLM provider, and without any credential: it proves
+      # the corpus travels with the image and that both retrievers work on it.
+      # A raised assertion exits the container non-zero, which fails the job.
+      - name: Verify corpus load and RAG backends in container
+        run: |
+          set -euo pipefail
+          docker run --rm cybersec-agent:ci uv run --no-sync python -c "
+          from pathlib import Path
+
+          from app.core.config import Settings
+          from app.rag import (
+              DEFAULT_KNOWLEDGE_DIR, load_corpus, chunk_corpus,
+              build_bm25_retriever, build_in_memory_retriever, HashingEmbedder,
+          )
+
+          # The corpus must resolve inside the image, not to a host path.
+          assert DEFAULT_KNOWLEDGE_DIR == Path('/app/knowledge'), DEFAULT_KNOWLEDGE_DIR
+          assert (DEFAULT_KNOWLEDGE_DIR / 'corpus.jsonl').is_file()
+          assert (DEFAULT_KNOWLEDGE_DIR / 'manifest.json').is_file()
+
+          # Default backend must remain 'memory' (no env var set in this step).
+          default_backend = Settings.model_fields['rag_backend'].default
+          assert default_backend == 'memory', f'default rag_backend={default_backend!r}'
+
+          corpus = load_corpus()
+          doc_count = len(corpus.documents)
+          chunk_count = len(chunk_corpus(corpus.documents))
+          assert doc_count == 40, f'expected 40 docs, got {doc_count}'
+          assert chunk_count == 80, f'expected 80 chunks, got {chunk_count}'
+          corpus_doc_ids = {document.doc_id for document in corpus.documents}
+          print(f'corpus ok: {doc_count} docs, {chunk_count} chunks')
+
+          bm25 = build_bm25_retriever(corpus)
+          result = bm25.retrieve('CVE-2021-44228 Log4j', top_k=5)
+          assert result.status == 'ok', f'bm25 status={result.status}'
+          assert len(result.hits) > 0, 'bm25 should return hits'
+          for hit in result.hits:
+              assert hit.citation_id, 'bm25 hit without citation_id'
+              assert hit.citation_id == hit.doc_id, (hit.citation_id, hit.doc_id)
+              assert hit.citation_id in corpus_doc_ids, (
+                  f'citation_id {hit.citation_id!r} not in the shipped corpus'
+              )
+          print(f'bm25 ok: {len(result.hits)} hits, all citations resolve')
+
+          mem = build_in_memory_retriever(corpus, HashingEmbedder())
+          result = mem.retrieve('CVE-2021-44228 Log4j', top_k=5)
+          assert result.status == 'ok', f'memory status={result.status}'
+          assert len(result.hits) > 0, 'memory should return hits'
+          for hit in result.hits:
+              assert hit.citation_id in corpus_doc_ids, hit.citation_id
+          print(f'memory ok: {len(result.hits)} hits, all citations resolve')
+          "
+
+      # Route-surface check WITHOUT starting the server.
+      #
+      # Starting uvicorn would require LLM_MODEL / LLM_API_KEY / AUTH_API_KEYS,
+      # i.e. credentials this job does not have and must not fabricate. It would
+      # also say nothing about the knowledge base. Importing the ASGI module
+      # only builds the app object (the lifespan does not run), so this asserts
+      # the `/ask` route ships in the image without pretending the service is
+      # live or that a real LLM answer is available.
+      - name: Assert /ask route is registered in the shipped app
+        run: |
+          set -euo pipefail
+          docker run --rm cybersec-agent:ci uv run --no-sync python -c "
+          import app.api.main as api_main
+
+          paths = {getattr(route, 'path', None) for route in api_main.app.routes}
+          for expected in ('/chat', '/triage', '/resume', '/audit/events', '/ask'):
+              assert expected in paths, f'{expected} missing from {sorted(p for p in paths if p)}'
+          print('routes ok:', sorted(p for p in paths if p))
+          "

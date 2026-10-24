@@ -701,9 +701,9 @@ def test_plan_failed_is_audited_when_the_audit_store_is_healthy(backend, missing
 
 
 def test_no_new_endpoints_were_added(client):
-    """K:路由集合不变 —— 本阶段不新增任何入口。"""
+    """K:路由集合不变 —— v0.5.0 之前不新增任何入口。"""
     paths = set(client.get("/openapi.json").json()["paths"])
-    assert paths == {"/chat", "/triage", "/resume", "/audit/events"}
+    assert paths == {"/chat", "/triage", "/resume", "/audit/events", "/ask"}
 
 
 def test_high_risk_still_requires_approval_and_does_not_auto_execute(client):
