@@ -1,5 +1,7 @@
 # CyberSec Agent
 
+**Current release:** [v0.5.0](https://github.com/luozhonglzw/cybersec-agent/releases/tag/v0.5.0) (2026-10-24) — knowledge-base Q&A over a version-controlled corpus, with three explicitly selected retrieval backends and structural citation validation.
+
 A security-operations agent prototype built on LangGraph, with a deliberate boundary between untrusted model output and authoritative planning, policy, and audit behavior.
 
 ## Overview
@@ -97,8 +99,8 @@ LangGraph supplies the state machine and the interrupt/resume mechanism — **no
 
 ## Authentication and Authorization
 
-Every business route (`/chat`, `/triage`, `/resume`, `/audit/events`) requires an
-`Authorization: Bearer <key>` header. Authentication is **always on**: there is no
+Every business route (`/chat`, `/ask`, `/triage`, `/resume`, `/audit/events`) requires
+an `Authorization: Bearer <key>` header. Authentication is **always on**: there is no
 `AUTH_ENABLED=false` switch, and a missing or invalid `AUTH_API_KEYS` configuration
 makes the process **refuse to start** rather than serve an open API.
 
@@ -305,10 +307,27 @@ Client-visible MCP schemas do not expose `data_path`, `logs_path`, or `intel_pat
 
 ```bash
 curl -X POST http://127.0.0.1:8000/ask \
-  -H "Authorization: Bearer $ANALYST_KEY" \
+  -H "Authorization: Bearer $ALICE_KEY" \
   -H "Content-Type: application/json" \
   -d '{"question": "Log4j 的 JNDI 查找为什么能被用来执行代码?"}'
 ```
+
+The request body has exactly one field, `question`. There is deliberately no `top_k`, no `path` / `url` / `collection` / `index_path`, and no `corpus_version`: the client chooses *what to ask*, never *where to read*.
+
+The response is a single object with five fields — the shape is frozen by
+`tests/test_api/test_ask.py::test_response_has_exactly_the_frozen_fields`, and the
+field semantics are declared in `app/api/schemas.py`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `answer` | `string` | The model's answer text. |
+| `grounded` | `bool` | Structural verdict, not a correctness claim (see [below](#what-the-response-does-and-does-not-claim)). |
+| `citations` | `array` | Valid citations only, each `{citation_id, source_id, source_type, title, url, score}`; ordered by `score` desc, then `citation_id` asc. `citation_id` **is** the document id. |
+| `invalid_citations` | `array of string` | Citation ids that appear in the answer but were never retrieved in this request. |
+| `retrieval` | `object` | `{status, hit_count, top_k}`; `status` ∈ `ok` / `empty` / `unavailable` / `not_used`. `top_k` is server-side and not client-controllable. |
+
+No captured response body is shown here on purpose: producing one requires a live
+provider, and pasting a scripted-model output would misrepresent it as a real answer.
 
 ### The retrieval backend is explicit, and never silently falls back
 
@@ -378,6 +397,16 @@ Current numbers (descriptive, not a target to tune against):
 
 The full backend selection, failure semantics, and Qdrant Local's reconstruction constraints are documented in [docs/qdrant-local.md](docs/qdrant-local.md); the corpus provenance rules are in [knowledge/README.md](knowledge/README.md).
 
+### Offline demo (no provider required)
+
+`scripts/demo_offline.py` exercises four already-implemented properties with **no API key, no network and no Docker**: RBAC rejection (401 / 403), fabricated-citation rejection (`grounded=false`), retrieval fail-closed (`status="unavailable"`, no fallback to `memory`), and a **test-based** HITL demonstration (pause / resume / thread isolation / approver constraints). Every check is computed from a real return value, and the script exits non-zero if any scenario fails.
+
+```bash
+uv run python scripts/demo_offline.py
+```
+
+Which outputs are real API behaviour, which are scripted, and which capabilities still require a live provider is spelled out in [docs/demo.md](docs/demo.md) — including the two Mermaid diagrams for citation validation and the HITL approval/resume sequence.
+
 ### Reproducible demo
 
 ```bash
@@ -390,16 +419,24 @@ RAG_BACKEND=qdrant-local uv run --no-sync uvicorn app.api.main:app --port 8000
 
 # 3. ask an answerable question — expect 200, grounded=true, valid citations
 curl -sS -X POST http://127.0.0.1:8000/ask \
-  -H "Authorization: Bearer $ANALYST_KEY" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ALICE_KEY" -H "Content-Type: application/json" \
   -d '{"question": "Log4j 的 JNDI 查找为什么能被用来执行代码?"}' | python -m json.tool
 
 # 4. point the backend at a nonexistent index and ask again —
 #    expect 200, grounded=false, citations=[], retrieval.status="unavailable"
 #    (no silent fallback to the memory backend)
+RAG_BACKEND=qdrant-local RAG_QDRANT_PATH=/tmp/no-such-index \
+  uv run --no-sync uvicorn app.api.main:app --port 8001
+curl -sS -X POST http://127.0.0.1:8001/ask \
+  -H "Authorization: Bearer $ALICE_KEY" -H "Content-Type: application/json" \
+  -d '{"question": "Log4j 的 JNDI 查找为什么能被用来执行代码?"}' | python -m json.tool
 
 # 5. ask an unanswerable question — the corpus has no support for it
 #    (e.g. 蓝牙配对密钥协商缺陷); the endpoint reports no usable citation
 #    rather than inventing one
+curl -sS -X POST http://127.0.0.1:8000/ask \
+  -H "Authorization: Bearer $ALICE_KEY" -H "Content-Type: application/json" \
+  -d '{"question": "蓝牙配对密钥协商缺陷"}' | python -m json.tool
 
 # 6. offline retrieval evaluation over the frozen 20-query set
 uv run --no-sync python scripts/eval_rag.py --qdrant-index-dir data/knowledge_index
@@ -412,12 +449,12 @@ The lexical backend needs no build step and no index directory:
 RAG_BACKEND=bm25 uv run --no-sync uvicorn app.api.main:app --port 8000
 
 curl -sS -X POST http://127.0.0.1:8000/ask \
-  -H "Authorization: Bearer $ANALYST_KEY" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ALICE_KEY" -H "Content-Type: application/json" \
   -d '{"question": "日志组件为什么会在记录字符串时发起对外连接?"}' | python -m json.tool
 # → 200, grounded=true when the model cites a real hit
 
 curl -sS -X POST http://127.0.0.1:8000/ask \
-  -H "Authorization: Bearer $ANALYST_KEY" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ALICE_KEY" -H "Content-Type: application/json" \
   -d '{"question": "zzzzz qqqqq"}' | python -m json.tool
 # → 200, retrieval.status="empty", grounded=false, citations=[]
 #   (no shared character 3-gram; this is not "the corpus has no answer")
@@ -468,7 +505,7 @@ chooses what to ask, not where to read.
 - **Optional PostgreSQL audit backend** — an explicit opt-in persistence backend behind the same `AuditStore` contract, with a separated migration-owner role and a runtime role limited to `SELECT` / `INSERT`. SQLite stays the default, there is no automatic fallback and no dual-write, and the PostgreSQL backend stores audit / incident / action-request data only — not LangGraph checkpoints.
 - **Static API-key authentication** — every business route requires `Authorization: Bearer <key>`. Configuration stores only SHA-256 digests; authentication is always on and fail-closed (a missing or invalid key configuration stops the process at startup). Role admission (`viewer` / `analyst` / `approver`) is enforced per route as a FastAPI dependency.
 - **Per-thread object authorization** — `POST /triage` records a single immutable ownership row (owner + full approver set) before the graph runs; `POST /resume` and `GET /audit/events` resolve the authenticated principal against that row before touching any graph, checkpointer, or audit content. Self-approval is rejected, and the audit `actor` is the authenticated principal, not a client-supplied string.
-- **Fully offline test suite** — 2,283 tests that require no network access and no API key, plus a PostgreSQL integration suite (373 cases) that the default run deselects and a separate CI job runs against a throwaway server. Those 373 are configured to run, but they have **not** yet been observed green for this release: the last verified remote CI observation predates v0.3.0, so treat them as **pending CI**, not as passed.
+- **Fully offline test suite** — 2,283 tests that require no network access and no API key, plus a PostgreSQL integration suite (373 cases) that the default run deselects and a separate CI job runs against a throwaway server. All 373 were observed green at the released commit: GitHub Actions run [`40068176848`](https://github.com/luozhonglzw/cybersec-agent/actions/runs/40068176848) reported **373 passed, 0 skipped**. That is one CI run on one commit against one throwaway server — not a standing guarantee for later commits (see [Known Limitations](#known-limitations)).
 
 ## Security Design
 
@@ -538,7 +575,7 @@ This is a research and engineering prototype. The limitations below are properti
 
 **The Qdrant Local index rebuild is not transactionally atomic.** Rebuilding writes points and index identity as two separate steps; a crash between them can leave a partially rebuilt collection. The mitigation is ordering, not atomicity: `create()` writes only a sentinel metadata record, the real six-field identity is committed last via `commit()` after an upsert/count self-check, so a crash anywhere inside the window leaves the sentinel in place and the index is rejected as `index-metadata-invalid` rather than silently serving stale vectors. That guarantees "identity visible last", not all-or-nothing. It also means a collection whose points are complete but whose identity was never committed is now treated as **failed** — rebuild it. See [docs/qdrant-local.md](docs/qdrant-local.md) §5.
 
-**The PostgreSQL integration suite is pending CI, not passed.** The 373 `postgres`-marked cases are deselected by default and run only in the dedicated CI job against a throwaway PostgreSQL 16 container. They were **not** run locally for this release (no local server), and the last verified remote CI observation predates v0.3.0, so no green run exists for the current code. A green offline suite says nothing about them.
+**The PostgreSQL integration suite was verified in CI, not locally.** The 373 `postgres`-marked cases are deselected by default and run only in the dedicated CI job against a throwaway PostgreSQL 16 service container. At the released commit `9f93940`, GitHub Actions run [`40068176848`](https://github.com/luozhonglzw/cybersec-agent/actions/runs/40068176848) executed all 373 with **373 passed, 0 skipped** (the job fails if any case reports as skipped). They were **not** run against a local server for this release, because the development machine has no PostgreSQL instance. The evidence is therefore one CI run on one commit against one throwaway server: it is not a standing guarantee about later commits, and it says nothing about performance, capacity, or scale.
 
 **Evaluation scope is narrow.** The real-provider pilot is 108 runs over 8 tasks, one provider and endpoint configuration, one requested model, one execution window, and a single matched injection task with a denominator of 6. It is a bounded observation, not a general result.
 
@@ -564,7 +601,9 @@ uv run uvicorn app.api.main:app --reload
 The application validates its configuration at startup and **refuses to boot** if a
 required value is missing or malformed. Two groups are required:
 
-- **LLM access** — `LLM_MODEL`, `LLM_BASE_URL`, `LLM_API_KEY`.
+- **LLM access** — `LLM_MODEL` and `LLM_API_KEY`, both non-empty. `LLM_BASE_URL` is
+  **optional**: leaving it unset falls back to the OpenAI SDK's default endpoint, so
+  set it whenever your provider is not that default.
 - **API authentication** — `AUTH_API_KEYS`. Without it the process stops with a
   validation error (`auth_api_keys: Field required`).
 
@@ -611,6 +650,14 @@ curl -X POST http://127.0.0.1:8000/chat \
   -H "Authorization: Bearer $ALICE_KEY" \
   -d '{"message": "分析一下 203.0.113.66 最近的登录活动"}'
 
+# Knowledge-base Q&A over the shipped corpus (analyst / approver).
+# This route calls the model: with no reachable provider it returns 502
+# {"detail":"LLM service unavailable"} and retrieval never runs.
+curl -X POST http://127.0.0.1:8000/ask \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ALICE_KEY" \
+  -d '{"question": "Log4j 的 JNDI 查找为什么能被用来执行代码?"}'
+
 # Start a triage run (analyst / approver). `approvers` is required and must list
 # configured approver subjects other than the caller.
 curl -X POST http://127.0.0.1:8000/triage \
@@ -652,7 +699,9 @@ Run the test suite — it needs no API key and makes no network calls:
 uv run pytest -q
 ```
 
-CI runs on GitHub-hosted Ubuntu in two independent jobs. The `test` job installs the locked `uv` environment and runs the offline pytest suite. The `test-postgres` job starts a throwaway PostgreSQL 16 service container, provisions the two separated roles, and runs `pytest -m postgres` explicitly — a missing or unreachable database fails that job rather than skipping it. Both jobs have been executed on a remote runner, but **not** on the current head. The suite has grown since the run below (the current local count is 2,283 offline / 373 PostgreSQL, and those 373 have not been run against a real server for this release; see [Project Structure](#project-structure) and [Known Limitations](#known-limitations)). The most recent verified remote observation is run [`37737872748`](https://github.com/luozhonglzw/cybersec-agent/actions/runs/37737872748) at commit `4334b14d`, where the `test` job reported **1,517 passed, 311 deselected, 2 warnings** and the `test-postgres` job reported **311 passed, 1,517 deselected, 7 warnings**, with both jobs succeeding. An earlier observation was the Phase 9.3-F commit `dd295c8`, which passed 1,463 tests on GitHub-hosted Ubuntu 24.04. Each figure records one specific run on one specific commit — it is not a standing guarantee about the current head, and it is not a claim of universal Linux compatibility. Check the Actions tab for the latest result.
+CI runs on GitHub-hosted Ubuntu in three independent jobs. The `test` job installs the locked `uv` environment and runs the offline pytest suite. The `test-postgres` job starts a throwaway PostgreSQL 16 service container, provisions the two separated roles, and runs `pytest -m postgres` explicitly — a missing or unreachable database fails that job rather than skipping it, and the job also fails if any case reports as skipped. The `docker` job builds the image and verifies the shipped corpus inside a real container: `load_corpus()` reads 40 documents / 80 chunks, `bm25` and `memory` retrieval each return hits whose `citation_id` resolves to that corpus, the default `RAG_BACKEND` is asserted to be `memory`, and the `/ask` route is registered. It performs **no** LLM call, so it is a packaging and retrieval check, not an end-to-end Q&A test.
+
+All three jobs were observed green at the released commit: run [`40068176848`](https://github.com/luozhonglzw/cybersec-agent/actions/runs/40068176848) at `9f93940`, where `test` reported **2,283 passed, 373 deselected**, `test-postgres` reported **373 passed, 2,283 deselected** with 0 skipped, and `docker` succeeded. Each figure records one specific run on one specific commit — it is not a standing guarantee about the current head, and it is not a claim of universal Linux compatibility. Check the Actions tab for the latest result.
 
 ### Demo Walkthrough
 

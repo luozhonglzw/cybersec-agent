@@ -2,7 +2,13 @@
 
 > 状态：已确认 | 日期：2026-09-11
 > 对应里程碑：`chore: initialize CyberSec Agent project`
-> 本文档是全部 10 个 Phase 的设计蓝图。实现细节随 Phase 推进沉淀到 `docs/learning/`，面试问答沉淀到 `docs/interview/`。
+> 本文档是全部 10 个 Phase 的设计蓝图。实现细节随 Phase 推进沉淀到 `docs/learning/`，面试问答沉淀到 `docs/interview/`（两者**尚未创建**，仓库当前只有 `docs/architecture.md` 与 `docs/qdrant-local.md`）。
+
+> **v0.5.0 更新说明（2026-10-24，当前维护）**：§5 / §6 / §7 / §8 / §14 的部分文字写于 RAG 尚未落地的阶段，原样保留以记录当时的设计判断。**以下三条已被实现推翻，阅读时以本说明为准**：
+>
+> 1. **RAG 已落地（v0.5.0）**，但**不是**用 ChromaDB：检索层是 `app/rag/`（语料加载与完整性校验、分块、256 维哈希向量基线、字符 3-gram BM25、引用构造），向量库是 `app/vectorstore/` 的 **Qdrant Local** 适配器，语料在仓库顶层 `knowledge/`（40 文档 / 80 块，manifest 钉住 sha256）。**ChromaDB 从未引入**——本文档里"ChromaDB 未引入"这一句本身仍然成立，但它旁边的"RAG 顺延"已不成立。
+> 2. **业务路由是五条**，不是四条：`/chat` / `/ask` / `/triage` / `/resume` / `/audit/events`，全部要求 Bearer 认证。`/ask` 是 v0.5.0 新增的只读知识库问答入口（单一只读检索工具 + 结构性引用校验，无写能力）。
+> 3. **测试与 CI 基线已更新**：当前默认离线 **2,283 passed / 373 deselected**（全量收集 **2,656**）。373 例 `postgres` 用例已在 GitHub Actions run `40068176848`（提交 `9f93940`，即 v0.5.0 发布提交）中真实执行并通过（**373 passed / 0 skipped**）；同一 run 还有 `docker` job 校验镜像内语料与检索。§14 里"pending CI"的表述已被该 run 推翻，见 §14 的 v0.5.0 补充说明。
 
 ---
 
@@ -131,13 +137,13 @@ LLM 只能产生：
 
 > 注：上图与 §7 目录描述的是**终态蓝图**（历史设计快照，不随实现更新）。**蓝图与实现之间的差异，以 §7.1「当前实际结构」为准** —— 该小节维护的是**当前**事实。
 >
-> 蓝图里画出但**至今未创建**的：`app/graph/`（编排层实现为单文件 `app/core/graph.py`）、`app/rag/`、`app/knowledge/`、`docker/`（容器化刻意**不**建该目录，实现是仓库根的 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E）。
+> 蓝图里画出但**至今未创建**的：`app/graph/`（编排层实现为单文件 `app/core/graph.py`）、`app/knowledge/`（v0.5.0 的知识层实现为 `app/rag/` + `app/vectorstore/`，语料在仓库顶层 `knowledge/`）、`docker/`（容器化刻意**不**建该目录，实现是仓库根的 `Dockerfile` / `.dockerignore` / `compose.yaml`，见 §8 Flow E）。
 >
 > 蓝图里画出且**已落地**的：`app/api/`、`app/schemas/`、`app/tools/`、`app/security/`（policy / audit / store）、`app/evaluation/`（离线架构 harness + 真实 provider 评估 harness，见 §6 / §14）、`app/mcp/`（Phase 9.3-E，见 §8 Flow C）。
 >
 > **路由命名的实现偏离**：蓝图写 `/chat /approve /audit`，实际实现为 `/chat /triage /resume`。审批不是独立端点——审批决定（`status` + `operator`）是 `/resume` 的请求载荷，与恢复句柄 `thread_id` 一起构成一次完整的恢复请求，拆成两个端点会引入"审批了但没恢复"的中间态。审计写入走 `app/security/store.py`；审计**读接口**已于 Phase 9.3-F 落地为只读的 `GET /audit/events`（蓝图里的 `/audit` 这个具体路径名未采用，见 §8 Flow D）。
 >
-> **认证与授权（Phase v0.3.0-A3-1 / A3-3）**：四条业务路由（`/chat` / `/triage` / `/resume` / `/audit/events`）都要求 `Authorization: Bearer <key>`；文档路由（`/openapi.json` / `/docs` / `/docs/oauth2-redirect` / `/redoc`）按设计保持公开。角色准入（viewer / analyst / approver）与逐线程对象授权见 §11.7。
+> **认证与授权（Phase v0.3.0-A3-1 / A3-3；路由数于 v0.5.0 更新）**：五条业务路由（`/chat` / `/ask` / `/triage` / `/resume` / `/audit/events`）都要求 `Authorization: Bearer <key>`；文档路由（`/openapi.json` / `/docs` / `/docs/oauth2-redirect` / `/redoc`）按设计保持公开。角色准入（viewer / analyst / approver）与逐线程对象授权见 §11.7。
 
 ### 为什么是单进程 + FastAPI + SQLite + ChromaDB？
 
@@ -888,7 +894,7 @@ OpenAI-compatible LLM
 - LangGraph 实际形态比 §9.1 蓝图更小：蓝图是 7 节点（含 `analyze_request` / `tool_router` / `tool_execute` / `risk_analyze` / `response_plan` / `execute_or_reject`），实际是 5 节点（`agent ⇄ tools` + `plan → policy_gate → human_approval`）。工具路由用 `tool_map` 泛型路由替代 `tool_router` 节点，风险分析与计划生成合并在 `plan` 节点内（规则引擎是纯函数，不需要单独节点）。`AgentState` 为 8 字段而非 §10.1 蓝图的 7 字段（差异原因见 §10.2）。蓝图描述终态，实现按最小必要演进。
 - **Response Planner 采用 Tool 而非 Node（Phase 7）→ 节点化在 Phase 8 落地**：§9.1 蓝图把它画成 `response_plan` 节点，Phase 7 先实现为第 4 个工具（Node 需要从 messages 反解 `RiskAssessment` 或在 tools 节点特判风险工具，两者都会侵蚀 graph 的通用性）。Phase 8.3 按计划把 `plan_response()` 提升为 `plan` 节点 —— **直接复用同一个纯函数，零返工**，验证了当初"等 HITL 一起做"的判断。
 - **incident 持久化延后（Phase 7 → Phase 8）**：见 §11.5。Phase 7 不引入数据库，`ResponsePlan` 仅作为结构化输出契约存在，随 ToolMessage 流转；落库与 HITL / checkpoint / audit lifecycle 一起在 Phase 8 实现（已完成）。
-- **MCP Server 与 RAG 顺延（Phase 5 / 6）**：§12 把 Phase 5 定为"威胁情报 + RAG"、Phase 6 定为"MCP Server"，实际 Phase 5 只交付 IOC Exact Match（理由见上一条），Phase 6 则交付了提前实现的 Rule-based Risk Analyzer。结果是 **RAG 与 MCP Server 两项能力整体顺延**，`ChromaDB` 至今未引入。这不是"砍掉"，是排序调整：先做能用规则确定性验证的部分（风险分级 / 响应规划 / HITL 安全层），把依赖外部组件的能力留到后面。（后续进展：**MCP Server 已于 Phase 9.3-E 以只读形态落地为 `app/mcp/`**，`mcp` 依赖引入 2.3.0；RAG 仍顺延。）
+- **MCP Server 与 RAG 顺延（Phase 5 / 6）**：§12 把 Phase 5 定为"威胁情报 + RAG"、Phase 6 定为"MCP Server"，实际 Phase 5 只交付 IOC Exact Match（理由见上一条），Phase 6 则交付了提前实现的 Rule-based Risk Analyzer。结果是 **RAG 与 MCP Server 两项能力整体顺延**，`ChromaDB` 至今未引入。这不是"砍掉"，是排序调整：先做能用规则确定性验证的部分（风险分级 / 响应规划 / HITL 安全层），把依赖外部组件的能力留到后面。（后续进展：**MCP Server 已于 Phase 9.3-E 以只读形态落地为 `app/mcp/`**，`mcp` 依赖引入 2.3.0；**RAG 已于 v0.5.0 落地**为 `app/rag/` + `app/vectorstore/`——哈希向量基线 / BM25 / Qdrant Local 三个显式后端，语料在仓库顶层 `knowledge/`，**未**使用 ChromaDB。）
 - **`/approve` 未实现，审批并入 `/resume`**：见 §5 注。审计写入走 store；审计**读接口**于 Phase 9.3-F 落地为只读的 `GET /audit/events`（复用既有 `list_audit()`，蓝图里的 `/audit` 路径名未采用，见 §8 Flow D）。
 
 ## 当前架构快照（**当前维护**；小节初版 2026-09-19，之后随 Phase 持续更新）
@@ -955,11 +961,11 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 - **HITL 工具集 = `DEFAULT_TOOLS` 去掉规划工具**：`HITL_TOOLS = [t for t in DEFAULT_TOOLS if t.name != PLANNER_TOOL_NAME]`，其中 `PLANNER_TOOL_NAME` 从**工具对象**派生（不手写字符串）。规划工具不进 HITL 工具集，保证"单计划源"（D2）—— `policy_gate` 只消费 state 里的 `plan`。
 - 审计事件：`plan.created` / `plan.failed` / `policy.evaluated` / `approval.requested` / `approval.decided` / `approval.timeout` —— 6 个全部有生产写入路径（`approval.timeout` 由 Phase 9.1-A 的惰性超时补齐）
 - **部署面（Phase 9.3-G）**：容器化只增加部署文件（仓库根 `Dockerfile` / `.dockerignore` / `compose.yaml`），**不改变**上面任何一条运行时语义 —— 图结构、工具集、审计写入路径、HITL 行为全部不变。当前是单服务 + SQLite 的本地 / 演示 / 单实例边界（见 §8 Flow E）。
-- 测试基线（**发布前本地实测**，Phase v0.4.0 GATE-2，未提交工作树）：默认离线运行 **1,838 passed / 373 deselected**（`pytest -q`）。被取消收集的 373 例是 `postgres` 标记的集成用例，需要真实 PostgreSQL，由独立的 CI job 显式运行（`pytest -m postgres`），本地实测 **373 passed / 1,838 deselected**。全量收集 **2,211** 例（= 1,838 + 373）。以上是**本地验证值**，不是对当前 HEAD 的长期保证，也不表示远端 CI 已运行过这个工作树。**远端 CI 已执行**：最新一次经验证的观测是 run `37737872748`（提交 `4334b14d`），其中 `test` = **1,517 passed / 311 deselected / 2 warnings**、`test-postgres` = **311 passed / 1,517 deselected / 7 warnings**，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`（GitHub-hosted Ubuntu 24.04，见 §14）。以上均为**某一次特定 run 的记录**，不是对当前 HEAD 的长期保证 —— 最新结果以 Actions 页为准。
+- 测试基线（**发布前本地实测**，Phase v0.4.0 GATE-2，未提交工作树）：默认离线运行 **1,838 passed / 373 deselected**（`pytest -q`）。被取消收集的 373 例是 `postgres` 标记的集成用例，需要真实 PostgreSQL，由独立的 CI job 显式运行（`pytest -m postgres`），本地实测 **373 passed / 1,838 deselected**。全量收集 **2,211** 例（= 1,838 + 373）。以上是**本地验证值**，不是对当前 HEAD 的长期保证，也不表示远端 CI 已运行过这个工作树。**远端 CI 已执行**：（历史）一次经验证的观测是 run `37737872748`（提交 `4334b14d`），其中 `test` = **1,517 passed / 311 deselected / 2 warnings**、`test-postgres` = **311 passed / 1,517 deselected / 7 warnings**，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测是 Phase 9.3-G 文档提交 `b4f9d4e4` 的 `1,463 passed`（GitHub-hosted Ubuntu 24.04，见 §14）。以上均为**某一次特定 run 的记录**，不是对当前 HEAD 的长期保证 —— 最新结果以 Actions 页为准。**当前计数与最新 CI 结果（run `40068176848`）见文首 v0.5.0 更新说明。**
 
 ## 尚未实现（按 §12 Roadmap）
 
-- RAG / 知识库（CVE、ATT&CK）——Phase 5 剩余部分，检索对象是自然语言文档，与 IOC Exact Match 不冲突（ChromaDB 未引入）
+- ~~RAG / 知识库（CVE、ATT&CK）~~ —— **已由 v0.5.0 交付**（`app/rag/` + `app/vectorstore/` + 顶层 `knowledge/`，见文首 v0.5.0 更新说明）。条目保留以记录当时的排期；`ChromaDB` 至今未引入，且不再计划引入。
 - LLM 风险复核层——Phase 8 只做了规则侧；LLM 复核未实现
 - 超时的**主动**触发——9.1-A 只做惰性判定（挂在请求入口），没有后台调度器；长时间无请求时过期 pending 不会被及时收掉
 - 超时的**观测面**——`TriageOutcome.status` 不新增 `timed_out`，也没有"查询 thread 状态"的端点，所以超时在 API 响应里只以 409 的形式出现，终态事实只能从 `audit_logs` 读
@@ -1012,9 +1018,9 @@ LLM explanation（Hybrid 叙事侧：综合证据，说明来源，输出最终�
 | `tests/test_evaluation_llm/` | 真实 provider 评估 harness：budget / confinement / offline_guard / runner / pilot 等（全部离线，不触网） |
 | `tests/test_postgres/` | 真实 PostgreSQL 集成：连接 / schema / 迁移 / 角色与触发器 / 排序 / 存储契约（双后端参数化）/ 并发 / 应用集成（**默认不收集**，需要真实实例） |
 
-当前基线（**发布前本地实测**，Phase v0.4.0 GATE-2，未提交工作树）：默认运行 **1,838 passed / 373 deselected**（`pytest -q`）；373 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行，本地实测 373 passed / 1,838 deselected；全量收集 2,211 例。最新远端 CI 观测是 run `37737872748`（提交 `4334b14d`）：`test` = 1,517 passed / 311 deselected、`test-postgres` = 311 passed / 1,517 deselected，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测（Phase 9.3-G 文档提交 `b4f9d4e4` 的 1,463 passed）见 §14。
+当前基线（**发布前本地实测**，Phase v0.4.0 GATE-2，未提交工作树）：默认运行 **1,838 passed / 373 deselected**（`pytest -q`）；373 例 `postgres` 标记的用例由独立的 CI job 用 `pytest -m postgres` 显式运行，本地实测 373 passed / 1,838 deselected；全量收集 2,211 例。（历史）一次远端 CI 观测是 run `37737872748`（提交 `4334b14d`）：`test` = 1,517 passed / 311 deselected、`test-postgres` = 311 passed / 1,517 deselected，两个 job 均成功（该 run 早于 v0.3.0 的认证 / 授权改动，故计数小于当前本地值）；更早的历史观测（Phase 9.3-G 文档提交 `b4f9d4e4` 的 1,463 passed）见 §14。
 
-> **v0.5.0-S4 补充说明（计数已过期，务必读）**：上面这一段是 **v0.4.0 GATE-2 当时**的实测记录，保留原样以免篡改历史。当前 HEAD 的实际计数是：默认离线 **2,283 passed / 373 deselected**（全量收集 **2,656**）。那 373 例 `postgres` 用例在 v0.5.0 发布前**没有**在本地运行过（本机无 PostgreSQL 实例），也**没有**任何覆盖当前代码的远端 CI 绿测记录 —— 因此它们是 **pending CI**，不是 passed。任何"373 passed"的表述只能指上面那条 v0.4.0 历史记录。
+> **v0.5.0 补充说明（当前计数，务必读）**：上面那一段是 **v0.4.0 GATE-2 当时**的实测记录，保留原样以免篡改历史。当前 HEAD 的计数是：默认离线 **2,283 passed / 373 deselected**（全量收集 **2,656**）。那 373 例 `postgres` 用例**已在远端 CI 真实执行并通过**：GitHub Actions run `40068176848`（提交 `9f93940`，v0.5.0 发布提交）中 `test` = **2,283 passed / 373 deselected**、`test-postgres` = **373 passed / 2,283 deselected / 0 skipped**，另有 `docker` job 真实构建镜像并校验容器内 `load_corpus()` = 40 文档 / 80 块、BM25 与 memory 检索均返回可解析引用、默认 `RAG_BACKEND` 为 `memory`、`/ask` 路由已注册。本机（Windows）仍无 PostgreSQL 实例，故 373 例**只在 CI 通过，未在本地跑过**；该结论只覆盖 `9f93940` 这一次 run，不是对后续提交的长期保证。
 
 ### 6. hermetic 约束（Phase 8.5 收口）
 
