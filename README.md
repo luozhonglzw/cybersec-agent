@@ -1,8 +1,77 @@
 # CyberSec Agent
 
-**Current release:** [v0.5.0](https://github.com/luozhonglzw/cybersec-agent/releases/tag/v0.5.0) (2026-10-24) — knowledge-base Q&A over a version-controlled corpus, with three explicitly selected retrieval backends and structural citation validation.
+[![CI](https://github.com/luozhonglzw/cybersec-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/luozhonglzw/cybersec-agent/actions/workflows/ci.yml)
+[**Release v0.5.0**](https://github.com/luozhonglzw/cybersec-agent/releases/tag/v0.5.0) · [MIT License](LICENSE) · Python 3.12+ · LangGraph · FastAPI
 
 A security-operations agent prototype built on LangGraph, with a deliberate boundary between untrusted model output and authoritative planning, policy, and audit behavior.
+
+**Current release:** v0.5.0 (2026-10-24) — knowledge-base Q&A over a version-controlled corpus, with three explicitly selected retrieval backends and structural citation validation.
+
+## Run the offline demo (no LLM provider required)
+
+```bash
+uv run python scripts/demo_offline.py
+```
+
+Four scenarios, each computed from a real return value — no API key, no network, no Docker. First time here? [Quick Start](#quick-start) covers environment setup; this section deliberately does not repeat it.
+
+| Scenario | Kind | What it demonstrates |
+| --- | --- | --- |
+| `DEMO 1` RBAC | real HTTP through the real FastAPI app | 401 / 403; unknown and missing credentials are byte-identical |
+| `DEMO 2` Citation validation | real corpus, real retrieval, real validator | fabricated citations → `grounded=false` |
+| `DEMO 3` Retrieval fail-closed | real Qdrant Local assembly path | broken index → `status="unavailable"`, no fallback |
+| `DEMO 4` HITL | **test-based** (real pytest subprocess) | pause / resume / thread isolation / approver constraints |
+
+`DEMO 2`'s answer text is **scripted** — there is no provider in this run — but the retrieval, the evidence envelope and the citation validator are real code. `DEMO 4` is a **test-based** demonstration, not a live `/triage → /resume` round trip: that path enters the graph at the agent node, so it needs a reachable provider. The script exits non-zero if any scenario fails.
+
+Output of a real local run at `b3e7950`:
+
+```text
+  PASS  DEMO 1  RBAC — authentication and role admission
+  PASS  DEMO 2  Citation validation — fabricated citations are rejected
+  PASS  DEMO 3  Retrieval fail-closed — a broken index is refused, not replaced
+  PASS  DEMO 4  HITL approval and resume — TEST-BASED DEMONSTRATION
+
+DEMO PASSED: 4/4 scenarios
+```
+
+## Verified by CI
+
+| Job | Scope | Observed at `b3e7950` |
+| --- | --- | --- |
+| `test` | offline suite — no network, no API key | **2,283 passed**, then the 4/4 demo |
+| `test-postgres` | PostgreSQL integration against a throwaway server | **373 passed, 0 skipped** |
+| `docker` | real image build + corpus load + route check | image built; 40 docs / 80 chunks in-container |
+
+Run [`40114943132`](https://github.com/luozhonglzw/cybersec-agent/actions/runs/40114943132), commit `b3e7950`. That is one run on one commit against one throwaway server — not a standing guarantee for later commits (see [Known Limitations](#known-limitations)).
+
+## Core design highlights
+
+1. **The model cannot reach the safety path — structurally, not by convention.** The `plan` and `policy_gate` nodes read only the caller-supplied indicator and the deterministic plan; neither reads the message history. A CI assertion parses `app/core/graph.py` and fails if the identifier `messages` appears in either function body. This is a regression constraint over one syntactic property, not a formal proof of security.
+2. **The policy gate is a graph node, not a tool.** A tool is optional for the model to call, which would make policy advisory; a node sits on the only path.
+3. **Append-only is enforced by the database, not by application discipline.** 8 anti-mutation triggers on SQLite and 12 on PostgreSQL; on PostgreSQL the runtime role holds no DDL and cannot disable the triggers, because that requires table ownership. Pending approval state is derived by querying for the absence of a terminal event — there is no mutable status column.
+4. **Citations are validated structurally.** Evidence is collected only from messages of type `tool` whose content is a valid `rag_hits` envelope, and the model can only produce `ai` messages — so a forged tool result is not reachable. Conflicting metadata for the same citation id fails closed for the whole registry.
+5. **Three retrieval backends, explicitly selected, never auto-switched.** `memory` / `qdrant-local` / `bm25` are chosen once in the composition root. A missing index returns `200` with `status="unavailable"` instead of silently answering from a different retriever.
+
+## Contents
+
+- [Run the offline demo](#run-the-offline-demo-no-llm-provider-required)
+- [Verified by CI](#verified-by-ci)
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Authentication and Authorization](#authentication-and-authorization)
+- [Audit Query API (read-only)](#audit-query-api-read-only)
+- [PostgreSQL audit backend (opt-in)](#postgresql-audit-backend-opt-in)
+- [MCP Interface (read-only)](#mcp-interface-read-only)
+- [Knowledge-base Q&A (`/ask`)](#knowledge-base-qa-ask)
+- [Key Features](#key-features)
+- [Security Design](#security-design)
+- [Evaluation](#evaluation)
+- [Known Limitations](#known-limitations)
+- [Quick Start](#quick-start)
+- [Project Structure](#project-structure)
+- [Roadmap](#roadmap)
+- [License](#license)
 
 ## Overview
 
@@ -399,11 +468,7 @@ The full backend selection, failure semantics, and Qdrant Local's reconstruction
 
 ### Offline demo (no provider required)
 
-`scripts/demo_offline.py` exercises four already-implemented properties with **no API key, no network and no Docker**: RBAC rejection (401 / 403), fabricated-citation rejection (`grounded=false`), retrieval fail-closed (`status="unavailable"`, no fallback to `memory`), and a **test-based** HITL demonstration (pause / resume / thread isolation / approver constraints). Every check is computed from a real return value, and the script exits non-zero if any scenario fails.
-
-```bash
-uv run python scripts/demo_offline.py
-```
+The demo is introduced at the top of this README under [Run the offline demo](#run-the-offline-demo-no-llm-provider-required) — it is not restated here, so there is a single description to maintain.
 
 Which outputs are real API behaviour, which are scripted, and which capabilities still require a live provider is spelled out in [docs/demo.md](docs/demo.md) — including the two Mermaid diagrams for citation validation and the HITL approval/resume sequence.
 
