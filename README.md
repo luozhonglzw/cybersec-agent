@@ -5,6 +5,8 @@
 
 A security-operations agent prototype built on LangGraph, with a deliberate boundary between untrusted model output and authoritative planning, policy, and audit behavior.
 
+[中文项目介绍与面试材料](docs/portfolio-zh.md) — 项目定位、技术栈、技术贡献、限制与面试问答（简体中文）。
+
 **Current release:** v0.5.0 (2026-10-24) — knowledge-base Q&A over a version-controlled corpus, with three explicitly selected retrieval backends and structural citation validation.
 
 ## Run the offline demo (no LLM provider required)
